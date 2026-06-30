@@ -1,0 +1,107 @@
+[
+  {
+    "kind": "box",
+    "dims_mm": [
+      10,
+      10,
+      10
+    ],
+    "cylinders": [],
+    "file": "cube.stl",
+    "triangles": 12
+  },
+  {
+    "kind": "plate_with_holes",
+    "dims_mm": [
+      60,
+      40,
+      10
+    ],
+    "cylinders": [
+      {
+        "radius": 5.0,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "through": true
+      },
+      {
+        "radius": 3.0,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "through": true
+      }
+    ],
+    "file": "plate_with_holes.stl",
+    "triangles": 1028
+  },
+  {
+    "kind": "cylinder",
+    "dims_mm": [
+      16,
+      16,
+      20
+    ],
+    "cylinders": [
+      {
+        "radius": 8.0,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "through": false
+      }
+    ],
+    "file": "cylinder.stl",
+    "triangles": 500
+  },
+  {
+    "kind": "l_bracket",
+    "dims_mm": [
+      40,
+      30,
+      15
+    ],
+    "cylinders": [],
+    "file": "l_bracket.stl",
+    "triangles": 20
+  },
+  {
+    "kind": "flanged_pipe",
+    "dims_mm": [
+      30,
+      30,
+      25
+    ],
+    "cylinders": [
+      {
+        "radius": 15.0,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "through": false,
+        "role": "outer"
+      },
+      {
+        "radius": 9.0,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "through": true,
+        "role": "bore"
+      }
+    ],
+    "file": "flanged_pipe.stl",
+    "triangles": 1008
+  }
+]

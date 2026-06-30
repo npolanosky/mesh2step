@@ -38,9 +38,14 @@ def convert(
     ensure_freecad(config.freecad_bin)
     from . import builder
 
+    # Weld in raw units, then scale to millimetres (STEP is always mm). Welding
+    # first keeps weld_tol meaningful regardless of the source unit scale.
     vertices, faces = load_stl(input_path, weld_tol=config.weld_tol)
     if faces.size == 0:
         raise ValueError(f"{input_path} contained no usable triangles")
+    scale = config.scale_to_mm
+    if scale != 1.0:
+        vertices = vertices * scale
 
     method = "faceted"
     stats: dict = {"faces_in": int(len(faces))}
