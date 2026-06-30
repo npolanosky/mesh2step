@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesh2step"
+version = "0.1.0"
+description = "Convert STL meshes to STEP solids with surface reconstruction (coplanar-facet merging) via FreeCAD."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Nick Polanosky" }]
+requires-python = ">=3.9"
+keywords = ["stl", "step", "freecad", "cad", "mesh", "reverse-engineering", "opencascade"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+# numpy drives the segmentation core. FreeCAD is NOT a pip dependency — it is
+# provided by a system FreeCAD install and located at runtime (see freecad_env).
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/npolanosky/mesh2step"
+Issues = "https://github.com/npolanosky/mesh2step/issues"
+
+[project.scripts]
+mesh2step = "mesh2step.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
