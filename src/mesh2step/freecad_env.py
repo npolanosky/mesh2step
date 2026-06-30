@@ -79,3 +79,49 @@ def ensure_freecad(explicit: str | None = None):
         "to its bin/ (Windows) or lib/ (macOS/Linux) directory.\n"
         f"Searched: {tried or '[no candidates]'}"
     )
+
+
+# Glob patterns for FreeCAD's bundled Python *executable* (used by the GUI to
+# launch the conversion worker out-of-process).
+_PYTHON_GLOBS = {
+    "win32": [
+        r"C:\Program Files\FreeCAD*\bin\python.exe",
+        r"C:\Program Files (x86)\FreeCAD*\bin\python.exe",
+    ],
+    "darwin": [
+        "/Applications/FreeCAD.app/Contents/Resources/bin/python*",
+        "/Applications/FreeCAD*.app/Contents/Resources/bin/python*",
+    ],
+    "linux": [
+        "/usr/bin/freecadcmd",
+        "/usr/bin/freecad-python3",
+        "/opt/freecad*/bin/python*",
+        str(Path.home() / "squashfs-root/usr/bin/python*"),
+    ],
+}
+
+
+def find_freecad_python(explicit: str | None = None) -> str | None:
+    """Locate FreeCAD's bundled Python executable, or ``None`` if not found.
+
+    ``explicit`` may point at FreeCAD's bin/ dir or directly at the executable.
+    """
+    candidates: list[Path] = []
+    if explicit:
+        p = Path(explicit)
+        candidates += [p, p / "python.exe", p / "python", p / "bin" / "python.exe"]
+    env = os.environ.get("FREECAD_PYTHON")
+    if env:
+        candidates.append(Path(env))
+    for pattern in _PYTHON_GLOBS.get(sys.platform, _PYTHON_GLOBS["linux"]):
+        pat = Path(pattern)
+        base = pat.anchor or "/"
+        rel = pat.relative_to(base) if pat.is_absolute() else pat
+        try:
+            candidates += sorted(Path(base).glob(str(rel)), reverse=True)
+        except (OSError, ValueError):
+            continue
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return None

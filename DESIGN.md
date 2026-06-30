@@ -85,11 +85,17 @@ so the tool never fails to produce *a* watertight result.
 - [x] STL load + vertex welding
 - [x] Planar region growing (numpy)
 - [x] Boundary loop extraction + collinear simplification
-- [ ] FreeCAD builder validated on real prismatic parts
-- [ ] Cylinder / cone / sphere RANSAC fitting (`fitting.py`)
+- [x] FreeCAD builder validated on ground-truth prismatic + cylindrical parts
+- [x] Cylinder detection + best-fit radius, rebuilt as analytic faces
+- [x] Hole vs boss classification + correct face orientation
+- [x] Unit scaling (mm/cm/m/in) and bounding-box inspection
+- [x] GUI (drag-and-drop) + worker bridge + Windows executable
+- [ ] Validation on real-world STLs (only synthetic ground-truth so far)
+- [ ] Cone / sphere RANSAC fitting (`fitting.py`)
 - [ ] Curved-surface face rebuild (B-spline fallback for free-form regions)
+- [ ] Cylinders whose axis is not perpendicular to the end faces (blind/angled)
 - [ ] Multi-body STL → multiple solids / compound
-- [ ] Conversion report (faces in/out, % reconstructed, validity)
+- [ ] macOS app bundle (deferred until Windows is confirmed in real use)
 - [ ] CI matrix that runs the FreeCAD stage in a container
 
 ## Open questions

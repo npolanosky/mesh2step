@@ -32,6 +32,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="coincident-vertex welding tolerance (default: 1e-5)",
     )
     p.add_argument(
+        "--units", choices=["mm", "cm", "m", "in"], default="mm",
+        help="source units of the STL; scaled to mm for STEP (default: mm)",
+    )
+    p.add_argument(
+        "--no-cylinders", action="store_true",
+        help="disable cylindrical hole/boss detection",
+    )
+    p.add_argument(
         "--faceted", action="store_true",
         help="skip reconstruction; emit the classic faceted solid",
     )
@@ -55,6 +63,8 @@ def main(argv: list[str] | None = None) -> int:
         weld_tol=args.weld_tol,
         angle_tol_deg=args.angle_tol,
         dist_tol=args.dist_tol,
+        source_units=args.units,
+        detect_cylinders=not args.no_cylinders,
         faceted=args.faceted,
         freecad_bin=args.freecad_bin,
     )

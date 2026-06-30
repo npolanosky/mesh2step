@@ -1,27 +1,39 @@
 """mesh2step — STL mesh to STEP solid conversion with surface reconstruction.
 
-Public surface:
+Public surface (lazily imported so ``import mesh2step`` never pulls in numpy or
+FreeCAD — the GUI imports this package under a plain Python that has neither):
+
     ConversionConfig   tolerances and flags
     convert            run the full pipeline (requires FreeCAD at runtime)
     load_stl           parse + weld an STL into numpy arrays (no FreeCAD)
     segment_planar     planar region growing over a welded mesh (no FreeCAD)
 """
 
-from .config import ConversionConfig
-from .mesh_io import load_stl
-from .segmentation import segment_planar
+from __future__ import annotations
 
 __all__ = ["ConversionConfig", "load_stl", "segment_planar", "convert"]
 
 __version__ = "0.1.0"
 
+# Map public name -> (submodule, attribute). Imports happen on first access so
+# that e.g. ConversionConfig (pure stdlib) is usable without importing numpy.
+_LAZY = {
+    "ConversionConfig": ("config", "ConversionConfig"),
+    "load_stl": ("mesh_io", "load_stl"),
+    "segment_planar": ("segmentation", "segment_planar"),
+    "convert": ("pipeline", "convert"),
+}
 
-def convert(*args, **kwargs):
-    """Lazy wrapper so importing the package never pulls in FreeCAD.
 
-    The pipeline imports the FreeCAD-backed builder; we defer that import to
-    call time so that ``import mesh2step`` works under any interpreter.
-    """
-    from .pipeline import convert as _convert
+def __getattr__(name: str):
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
 
-    return _convert(*args, **kwargs)
+    module = importlib.import_module(f".{target[0]}", __name__)
+    return getattr(module, target[1])
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

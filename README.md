@@ -15,25 +15,38 @@ face**. A simple cube ends up with dozens of faces instead of six; a part with
 
 `mesh2step` instead **reconstructs surfaces** before exporting:
 
-1. **Coplanar-facet merging** (implemented) — triangles lying in a common
-   plane are grouped into regions and rebuilt as a *single* planar STEP face
-   with proper boundary loops (including holes). A meshed cube comes out with
-   6 faces, not 12+.
-2. **Analytic surface fitting** (roadmap) — cylindrical, conical and spherical
-   regions are detected and rebuilt as true analytic surfaces instead of
-   facets.
+1. **Coplanar-facet merging** — triangles lying in a common plane are grouped
+   into regions and rebuilt as a *single* planar STEP face with proper boundary
+   loops (including holes). A meshed cube comes out with 6 faces, not 12+.
+2. **Cylinder/hole detection** — cylindrical holes, bores and bosses are
+   detected, fitted to a best-fit radius, and rebuilt as a single **analytic
+   cylindrical face** with true circular edges. This is the big one: faceted
+   holes are hard to use as holes and choke most CAD kernels with thousands of
+   triangles. A 1028-triangle plate with two holes becomes an 8-face solid.
+3. **Conical / spherical fitting** (roadmap) — same idea, extended to more
+   surface types.
 
 The faceted pipeline is kept as an automatic fallback for regions that can't be
 reconstructed, so you always get a watertight solid.
+
+### Other features
+
+- **Unit scaling** — STL is unit-less; tell mesh2step the source units
+  (mm / cm / m / inch) and it scales to millimetres (STEP is always mm).
+- **Bounding-box inspection** — on import, reports the axis-aligned and
+  oriented (PCA) bounding-box dimensions so you can sanity-check size and units.
+- **GUI** with drag-and-drop, plus a packaged Windows executable.
 
 [m2s]: https://github.com/Charles-Garrison/mesh2solid
 [sre]: https://github.com/tsebukas/stl_reverse_engineering
 
 ## Status
 
-> ⚠️ Early scaffold. The numpy segmentation core is implemented and tested; the
-> FreeCAD geometry builder is implemented against the FreeCAD 1.x API but needs
-> validation on real parts. See [DESIGN.md](DESIGN.md) for the roadmap.
+> Working end-to-end on FreeCAD 1.1. Planar reconstruction and cylinder/hole
+> detection are validated against ground-truth sample parts (exact radii, valid
+> watertight solids). GUI and Windows executable build and run. Next up:
+> validation on real-world STLs and conical/spherical fitting. See
+> [DESIGN.md](DESIGN.md) for the roadmap.
 
 ## Requirements
 
@@ -47,8 +60,19 @@ need FreeCAD.
 
 ## Usage
 
-Two ways to run, depending on whether you want to use your own Python or
-FreeCAD's:
+### GUI
+
+```bash
+pip install -e ".[gui]"
+mesh2step-gui            # or: python -m mesh2step.gui
+```
+
+Drag in an STL (or Browse), confirm the bounding-box dimensions and pick the
+source units, choose an output path, and convert. The GUI runs under any Python
+with tkinter and shells out to FreeCAD's Python for the conversion — see
+[packaging/](packaging/) for the prebuilt Windows executable.
+
+### Command line
 
 ```bash
 # 1. Let mesh2step find FreeCAD and inject it (uses your own venv + numpy):
@@ -65,6 +89,8 @@ Common options:
 --dist-tol MM       Max point-to-plane distance within a region   (default 0.01)
 --weld-tol MM       Coincident-vertex welding tolerance            (default 1e-5)
 --faceted           Skip reconstruction; emit the classic faceted solid
+--units {mm,cm,m,in} Source units of the STL; scaled to mm (default: mm)
+--no-cylinders      Disable cylindrical hole/boss detection
 --freecad-bin PATH  Explicit path to FreeCAD bin/ (overrides auto-detect)
 ```
 
