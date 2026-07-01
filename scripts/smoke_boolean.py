@@ -27,7 +27,10 @@ truths = {t["file"]: t for t in json.loads((DATA / "samples.json").read_text())}
 
 # Angled-axis holes aren't detected yet (tracked elsewhere), so boolean clean-up
 # correctly finds nothing to clean — not a boolean-builder failure.
-KNOWN_PARTIAL = {"angled_hole_plate"}
+# The boolean/watertight path rebuilds every ground-truth sample cleanly,
+# including the angled hole; nothing is known-partial here. (The reconstruction-
+# only path in smoke_convert still can't close the angled hole — see there.)
+KNOWN_PARTIAL: set[str] = set()
 
 failures = 0
 for stl in sorted(DATA.glob("*.stl")):
