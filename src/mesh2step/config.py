@@ -75,8 +75,18 @@ class ConversionConfig:
     min_cylinder_coverage: float = 0.5
 
     # Reject fitted radii larger than this (mm). None -> the mesh's largest
-    # bounding-box dimension (a hole/boss can't be bigger than the part).
+    # bounding-box dimension. A full cylinder of radius r spans 2r across, so
+    # 2r <= (a part dimension) <= largest dimension; using the largest dimension
+    # as the cap still admits round parts whose outside diameter equals the part
+    # size (radius = size/2), while rejecting shallow-arc mega-circles.
     max_cylinder_radius: float | None = None
+
+    # Mesh preparation (uses FreeCAD's mesh kernel). Repair fixes duplicate
+    # points/facets, degenerate facets, normals and non-manifold edges. Decimate
+    # reduces triangle count (reduction fraction 0..1) to speed up heavy meshes.
+    repair_mesh: bool = False
+    decimate: float | None = None      # e.g. 0.5 => reduce by up to 50%
+    decimate_tol: float = 0.1          # max geometric error (mm) when decimating
 
     # Snap near-equal detected radii to a shared rounded value, so triangulation
     # noise doesn't yield 6.04/6.05/6.06 for what is really one 6.05 hole.

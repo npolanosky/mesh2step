@@ -90,8 +90,17 @@ so the tool never fails to produce *a* watertight result.
 - [x] Hole vs boss classification + correct face orientation
 - [x] Unit scaling (mm/cm/m/in) and bounding-box inspection
 - [x] GUI (drag-and-drop) + worker bridge + Windows executable
-- [ ] Validation on real-world STLs (only synthetic ground-truth so far)
+- [x] Real-world STL validation (organic drilled part)
+- [x] Mesh health read (non-manifold / self-intersection) + repair; repair
+      recovers holes lost to self-intersections (e.g. intersecting corner holes)
+- [x] Post-conversion quality report (watertight, faceted fallbacks, skipped
+      facets, bbox delta, features that failed) surfaced in the GUI
+- [ ] Effective decimation — FreeCAD's scripted `Mesh.decimate` barely reduces
+      these meshes; needs pymeshlab/open3d or a numpy vertex-clustering pass
+- [ ] Intersecting / partial-arc holes (repair recovers some; coverage guard
+      still rejects heavily-clipped walls) and cone/countersink fitting
 - [ ] Cone / sphere RANSAC fitting (`fitting.py`)
+- [ ] Viewer + deviation heatmap (see docs/VIEWER.md) — also a dev/QA tool
 - [ ] Curved-surface face rebuild (B-spline fallback for free-form regions)
 - [ ] Cylinders whose axis is not perpendicular to the end faces (blind/angled)
 - [ ] Multi-body STL → multiple solids / compound

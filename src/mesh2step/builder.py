@@ -169,6 +169,7 @@ def build_reconstructed_solid(
         "faces_in": int(len(faces)),
         "planar_faces": reconstructed,
         "cylinder_faces": cyl_faces_ok,
+        "cylinders_detected": len(cylinders),
         "faces_out": reconstructed + cyl_faces_ok,
         "cylinders": [c.as_dict() for c in cylinders],
         "skipped_facets": skipped,

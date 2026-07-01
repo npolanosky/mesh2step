@@ -100,6 +100,7 @@ class App:
         self.units_var = tk.StringVar(value="mm")
         self.detect_var = tk.BooleanVar(value=True)
         self.faceted_var = tk.BooleanVar(value=False)
+        self.repair_var = tk.BooleanVar(value=False)
         self.freecad_var = tk.StringVar(value=find_freecad_python() or "")
         self._longest_mm = None
 
@@ -174,7 +175,7 @@ class App:
         # mesh info grid
         self.info = ttk.Frame(c1, style="Card.TFrame"); self.info.pack(fill="x", pady=(10, 0))
         self._info_labels = {}
-        for i, key in enumerate(["Triangles", "AABB (mm-units)", "OBB (oriented)"]):
+        for i, key in enumerate(["Triangles", "AABB (mm-units)", "OBB (oriented)", "Mesh health"]):
             ttk.Label(self.info, text=key, style="Muted.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 10))
             v = ttk.Label(self.info, text="—", style="Value.TLabel")
             v.grid(row=i, column=1, sticky="w")
@@ -192,6 +193,9 @@ class App:
         self.units_preview.pack(side="left", padx=8)
         ttk.Checkbutton(c2, text="Detect cylindrical holes / bosses (best-fit radius)",
                         variable=self.detect_var).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(c2, text="Repair mesh (fix self-intersections, duplicates, normals) — "
+                                 "recovers holes on defective meshes",
+                        variable=self.repair_var).pack(anchor="w")
         ttk.Checkbutton(c2, text="Faceted only (skip reconstruction)",
                         variable=self.faceted_var).pack(anchor="w")
 
@@ -215,6 +219,9 @@ class App:
         self.status = tk.Label(body, text="Ready", bg=BG, fg=MUTED, anchor="w",
                                font=("Segoe UI", 9))
         self.status.pack(fill="x")
+        self.quality = tk.Label(body, text="", bg=BG, fg=MUTED, anchor="w",
+                                font=("Segoe UI Semibold", 11))
+        self.quality.pack(fill="x", pady=(2, 6))
 
         # --- Log ---
         logcard = self._card(body, "Log")
@@ -294,6 +301,7 @@ class App:
                 "source_units": self.units_var.get(),
                 "detect_cylinders": self.detect_var.get(),
                 "faceted": self.faceted_var.get(),
+                "repair_mesh": self.repair_var.get(),
             },
         }
         self._run(job, fc, "convert")
@@ -346,6 +354,24 @@ class App:
             text=f"{aabb[0]:.2f} × {aabb[1]:.2f} × {aabb[2]:.2f}")
         self._info_labels["OBB (oriented)"].config(
             text=f"{obb[0]:.2f} × {obb[1]:.2f} × {obb[2]:.2f}")
+
+        health = result.get("health", {})
+        issues = []
+        if health.get("non_manifold"):
+            issues.append("non-manifold")
+        if health.get("self_intersections"):
+            issues.append("self-intersections")
+        if health.get("watertight") is False:
+            issues.append("not watertight")
+        if "error" in health:
+            self._info_labels["Mesh health"].config(text="(unavailable)")
+        elif issues:
+            self._info_labels["Mesh health"].config(text="⚠ " + ", ".join(issues))
+            self.repair_var.set(True)  # auto-recommend repair
+            self._log(f"⚠  Mesh defects: {', '.join(issues)} — "
+                      f"'Repair mesh' enabled (recovers holes lost to these defects).", "err")
+        else:
+            self._info_labels["Mesh health"].config(text="✔ clean")
         self.status.config(text="Mesh inspected — set units and convert.")
 
     def _on_convert(self, result: dict):
@@ -358,15 +384,24 @@ class App:
         cyls = s.get("cylinders", [])
         holes = sum(1 for c in cyls if c.get("role") == "hole")
         radii = sorted({round(c["radius"] * 2, 3) for c in cyls})
+
+        quality = s.get("quality", "good")
+        badge = {"good": ("✔  GOOD", OK_GREEN),
+                 "warnings": ("⚠  OK — with warnings", "#b45309"),
+                 "problems": ("✖  PROBLEMS", ERR_RED)}.get(quality, ("done", MUTED))
         self._log(f"✔  Wrote {result['output']}", "ok")
         self._log(f"   method={result['method']}  faces {s.get('faces_in')}→{s.get('faces_out')} "
                   f"({s.get('planar_faces',0)} planar, {s.get('cylinder_faces',0)} cyl)", "muted")
-        self._log(f"   holes={holes}  bosses={len(cyls)-holes}  "
-                  f"diameters(mm)={radii}  watertight={s.get('is_solid')}", "muted")
-        if not s.get("is_solid", True):
-            self._log("   note: not a single closed solid (see log/README for organic meshes)", "muted")
-        self.status.config(text=f"Done → {Path(result['output']).name}",
-                           fg=OK_GREEN if s.get("is_solid") else MUTED)
+        self._log(f"   holes={holes}  bosses={len(cyls)-holes}  diameters(mm)={radii}", "muted")
+        bi, bo = s.get("bbox_input_mm"), s.get("bbox_output_mm")
+        if bi and bo:
+            self._log(f"   bbox in {bi} → out {bo}  (Δ{s.get('bbox_delta_pct',0)}%)", "muted")
+        for w in s.get("warnings", []):
+            self._log(f"   ⚠ {w}", "err")
+        # Prominent quality verdict.
+        self.quality.config(text=f"{badge[0]}   ·   {result['method']}, {len(cyls)} cylinders, "
+                                 f"watertight={s.get('is_solid')}", fg=badge[1])
+        self.status.config(text=f"Done → {Path(result['output']).name}", fg=badge[1])
 
     # ---- ui helpers -------------------------------------------------------
     def _start(self, text: str):

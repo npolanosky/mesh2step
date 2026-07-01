@@ -40,6 +40,14 @@ def run_inspect(job: dict) -> dict:
     info = measure(vertices)
     info["triangle_count"] = int(len(faces))
 
+    # Input mesh health (non-manifold / self-intersections) via FreeCAD.
+    try:
+        from .meshprep import mesh_health
+
+        info["health"] = mesh_health(job["input"])
+    except Exception as exc:  # noqa: BLE001 - health check is best-effort
+        info["health"] = {"error": str(exc)}
+
     # What the longest dimension becomes under each unit preset, so the GUI can
     # help the user pick the source units.
     longest = float(info["aabb"]["dimensions"][0]) if info["aabb"]["dimensions"] else 0.0
