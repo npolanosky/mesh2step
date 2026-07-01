@@ -6,8 +6,15 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv-build/
 venv/
 env/
+
+# Versioned release artifacts (large exe/app bundles kept locally, not in git)
+releases/
+
+# Community/downloaded test meshes (large; kept local)
+tests/data/community/
 
 # Test / tooling
 .pytest_cache/

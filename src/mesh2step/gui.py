@@ -214,7 +214,8 @@ class App:
         # Header band
         header = tk.Frame(self.root, bg=ACCENT)
         header.pack(fill="x")
-        tk.Label(header, text="mesh2step", bg=ACCENT, fg="white",
+        from . import DISPLAY_VERSION
+        tk.Label(header, text=f"mesh2step  {DISPLAY_VERSION}", bg=ACCENT, fg="white",
                  font=("Segoe UI Semibold", 18)).pack(anchor="w", padx=18, pady=(12, 0))
         tk.Label(header, text="STL mesh → STEP solid  ·  surface & hole reconstruction",
                  bg=ACCENT, fg="#dbeafe", font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(0, 12))
