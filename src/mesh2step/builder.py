@@ -588,6 +588,22 @@ def build_boolean_clean_solid(
         rv, rf = _repair_nonmanifold(vertices, faces)
         solid = build_faceted_solid(rv, rf)
     if not _is_valid_solid(solid):
+        # Self-intersecting / overlapping-body mesh (exported without a final
+        # boolean union): re-solve the true outer surface with manifold3d's
+        # winding-number boolean. Detection already ran on the original mesh and
+        # the cut tools are purely geometric, so they apply to the resolved base.
+        progress("  still invalid; resolving self-intersections (boolean union)")
+        from .meshprep import resolve_self_intersections
+
+        resolved = resolve_self_intersections(vertices, faces)
+        if resolved is not None:
+            rv, rf, rep = resolved
+            candidate = build_faceted_solid(rv, rf)
+            if _is_valid_solid(candidate):
+                solid = candidate
+                progress(f"  resolved: {rep['bodies']} overlapping bodies unioned "
+                         f"({rep['faces_in']:,} -> {rep['faces_out']:,} facets)")
+    if not _is_valid_solid(solid):
         # Last resort: OCC shape healing (ShapeFix) can close a shell that is
         # topologically closed but geometrically invalid (small self-touches).
         progress("  still invalid; attempting OCC shape healing")

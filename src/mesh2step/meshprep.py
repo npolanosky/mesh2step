@@ -45,6 +45,74 @@ def mesh_health(path: str) -> dict:
     return info
 
 
+def has_self_intersections(vertices: np.ndarray, faces: np.ndarray) -> bool:
+    """True if the mesh's facets geometrically intersect each other."""
+    import FreeCAD  # type: ignore  # noqa: F401  (must precede `import Mesh`)
+    import Mesh  # type: ignore
+
+    m = Mesh.Mesh()
+    m.addFacets([(tuple(vertices[a]), tuple(vertices[b]), tuple(vertices[c]))
+                 for a, b, c in faces])
+    try:
+        return bool(m.hasSelfIntersections())
+    except Exception:  # noqa: BLE001 - if the check itself fails, assume clean
+        return False
+
+
+def resolve_self_intersections(
+    vertices: np.ndarray, faces: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, dict] | None:
+    """Rebuild a self-intersecting / overlapping-body mesh as one clean solid.
+
+    Meshes exported without a final boolean union — a clip modelled through the
+    panel it snaps onto, mounting tabs interpenetrating a base — are closed but
+    geometrically self-intersecting, which OpenCASCADE rejects outright
+    ("Self-intersecting wire"), and no surface-level repair can fix: deleting
+    the offending facets and re-closing the hole just re-creates the overlap.
+
+    manifold3d (the winding-number boolean engine OpenSCAD uses) solves exactly
+    this: construct a Manifold from the mesh, split it into its disjoint bodies
+    (``decompose``), and boolean-union them back together. The union re-computes
+    the true outer surface, eliminating the interpenetrations while leaving all
+    other geometry bit-identical — no voxelising, no rounded edges.
+
+    Returns ``(vertices, faces, report)`` on success, or None if manifold3d is
+    unavailable or the result looks degenerate (callers keep the original mesh).
+    """
+    try:
+        import manifold3d as m3
+    except ImportError:
+        return None
+    try:
+        mesh = m3.Mesh(vert_properties=vertices.astype(np.float32),
+                       tri_verts=faces.astype(np.uint32))
+        mesh.merge()  # weld near-duplicate vertices so construction succeeds
+        man = m3.Manifold(mesh)
+        if man.is_empty():
+            return None
+        parts = man.decompose()
+        if len(parts) > 1:
+            man = m3.Manifold.batch_boolean(parts, m3.OpType.Add)
+        out = man.to_mesh()
+        v2 = np.array(out.vert_properties, dtype=np.float64)[:, :3]
+        f2 = np.array(out.tri_verts, dtype=np.int64)
+        if len(f2) == 0:
+            return None
+        # Sanity: the union must not have moved the part (bbox within 1%).
+        ext_in = vertices.max(axis=0) - vertices.min(axis=0)
+        ext_out = v2.max(axis=0) - v2.min(axis=0)
+        if np.any(np.abs(ext_out - ext_in) > 0.01 * np.maximum(ext_in, 1.0)):
+            return None
+        report = {
+            "bodies": int(len(parts)),
+            "faces_in": int(len(faces)),
+            "faces_out": int(len(f2)),
+        }
+        return v2, f2, report
+    except Exception:  # noqa: BLE001 - resolution is best-effort
+        return None
+
+
 def problem_points(path: str, cap: int = 4000) -> list[list[float]]:
     """3D points marking mesh defects, for highlighting in the preview.
 

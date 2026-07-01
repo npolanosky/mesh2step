@@ -141,20 +141,54 @@ def convert(
         bverts, bfaces = load_stl(input_path, weld_tol=config.weld_tol)
         if scale != 1.0:
             bverts = bverts * scale
-        target = config.decimate_target_faces or DEFAULT_BOOLEAN_TARGET
-        if len(bfaces) > target * 1.2:
-            from . import meshprep
+        from . import meshprep
 
-            progress(f"Decimating boolean base {len(bfaces):,} -> ~{target:,} faces")
-            bverts, bfaces, _ = meshprep.decimate_planar(bverts, bfaces, target)
-            progress(f"Boolean base: {len(bfaces):,} faces")
+        # Overlapping-body resolution MUST come before decimation: manifold3d
+        # needs the raw (still-manifold) topology, and decimating a self-
+        # intersecting mesh produces defects it can't digest. Without this, a
+        # mesh exported without a final boolean union (a clip modelled through
+        # its panel, tabs interpenetrating a base) can never form a valid base.
+        if meshprep.has_self_intersections(bverts, bfaces):
+            progress("Base mesh self-intersects; unioning overlapping bodies (manifold)")
+            resolved = meshprep.resolve_self_intersections(bverts, bfaces)
+            if resolved is not None:
+                bverts, bfaces, resolve_report = resolved
+                stats["self_intersection_resolve"] = resolve_report
+                progress(f"  unioned {resolve_report['bodies']} bodies "
+                         f"({resolve_report['faces_in']:,} -> "
+                         f"{resolve_report['faces_out']:,} facets)")
+            else:
+                progress("  union unavailable/failed; continuing with raw mesh")
+        target = config.decimate_target_faces or DEFAULT_BOOLEAN_TARGET
+        # Decimation back-off ladder: quadric collapse can break watertightness
+        # on some meshes, so if the boolean base won't validate at the target,
+        # retry at twice the target and finally with the undecimated mesh —
+        # slower cuts beat losing the watertight result altogether.
+        rungs = [t for t in (target, 2 * target) if len(bfaces) > t * 1.2] + [None]
         try:
             import dataclasses
 
             bcfg = dataclasses.replace(config, boolean_max_base_faces=None)
-            bshape, built2 = builder.build_boolean_clean_solid(
-                bverts, bfaces, bcfg, on_progress=progress
-            )
+            bshape, built2 = None, None
+            for i, tgt in enumerate(rungs):
+                if tgt is not None:
+                    progress(f"Decimating boolean base {len(bfaces):,} -> ~{tgt:,} faces")
+                    dv, df, _ = meshprep.decimate_planar(bverts, bfaces, tgt)
+                    progress(f"Boolean base: {len(df):,} faces")
+                else:
+                    dv, df = bverts, bfaces
+                    if i > 0:
+                        progress(f"Using undecimated base ({len(df):,} faces)")
+                try:
+                    bshape, built2 = builder.build_boolean_clean_solid(
+                        dv, df, bcfg, on_progress=progress
+                    )
+                    break
+                except Exception:
+                    if tgt is None:
+                        raise
+                    progress(f"  base not watertight at ~{tgt:,} faces; "
+                             f"backing off decimation")
             if _is_solid(bshape):
                 shape, method = bshape, "boolean-clean"
                 stats.update(built2)

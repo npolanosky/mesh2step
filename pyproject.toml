@@ -26,10 +26,12 @@ dev = ["pytest>=7", "ruff>=0.4"]
 gui = ["tkinterdnd2>=0.4"]          # optional drag-and-drop in the GUI
 build = ["pyinstaller>=6"]          # to produce the standalone executable
 viewer = ["pyvista>=0.43"]          # STL/STEP overlay + deviation heatmap
-# Planar-preserving decimation (shrinks files, enables watertight boolean).
+# Mesh preparation: planar-preserving decimation (shrinks files, enables the
+# watertight boolean) and manifold3d (resolves self-intersecting/overlapping-
+# body meshes into one clean solid via winding-number boolean union).
 # Install into *FreeCAD's* Python (that's where the conversion worker runs):
-#   & "C:/Program Files/FreeCAD 1.1/bin/python.exe" -m pip install pymeshlab
-prep = ["pymeshlab>=2023.12"]
+#   & "C:/Program Files/FreeCAD 1.1/bin/python.exe" -m pip install pymeshlab manifold3d
+prep = ["pymeshlab>=2023.12", "manifold3d>=3.0"]
 
 [project.urls]
 Homepage = "https://github.com/npolanosky/mesh2step"
