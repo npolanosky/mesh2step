@@ -486,6 +486,23 @@ def _is_valid_solid(shape) -> bool:
     return bool(solids) and solids[0].isValid()
 
 
+def _heal_solid(shape, Part):
+    """Try OCC ShapeFix (``Shape.fix``) at a couple of tolerances to turn a
+    geometrically-invalid-but-closed shell into a valid solid. Returns the
+    healed solid, or None if it can't be made valid. Only ever adopted when the
+    result validates, so it can't make things worse."""
+    for tol in (1e-3, 1e-2, 1e-1):
+        try:
+            s = shape.copy()
+            s.fix(tol, tol, tol)
+            sol = s if getattr(s, "Solids", []) else Part.Solid(s)
+            if _is_valid_solid(sol):
+                return sol
+        except Exception:  # noqa: BLE001 - healing is best-effort
+            pass
+    return None
+
+
 def _repair_nonmanifold(vertices: np.ndarray, faces: np.ndarray):
     """Repair non-manifold/duplicate mesh defects via FreeCAD's Mesh kernel.
 
@@ -570,6 +587,13 @@ def build_boolean_clean_solid(
         progress("  base not watertight; repairing non-manifold edges")
         rv, rf = _repair_nonmanifold(vertices, faces)
         solid = build_faceted_solid(rv, rf)
+    if not _is_valid_solid(solid):
+        # Last resort: OCC shape healing (ShapeFix) can close a shell that is
+        # topologically closed but geometrically invalid (small self-touches).
+        progress("  still invalid; attempting OCC shape healing")
+        healed = _heal_solid(solid, Part)
+        if healed is not None:
+            solid = healed
     if not _is_valid_solid(solid):
         raise RuntimeError("base faceted solid is not watertight; cannot boolean-clean")
 

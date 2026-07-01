@@ -283,6 +283,11 @@ def _fit_circle_for_facets(
     center2d, radius, rms = _fit_circle_2d(pts2d)
     if radius <= 0 or rms > config.cylinder_tol:
         return None
+    # Reject sub-millimetre "cylinders": tiny curved facet clusters on an organic
+    # surface algebraically fit a near-zero-radius circle, producing dozens of
+    # bogus micro-holes. Real holes/bosses are well above this.
+    if radius < config.min_cylinder_radius:
+        return None
     # A hole/boss can't be larger than the part (kills shallow-arc mega-circles).
     if radius > max_radius:
         return None

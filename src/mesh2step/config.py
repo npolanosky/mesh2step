@@ -93,6 +93,11 @@ class ConversionConfig:
     # Minimum facets a curved region must have to attempt a cylinder fit.
     min_cylinder_facets: int = 8
 
+    # Reject fitted cylinders/bosses smaller than this radius (mm). Tiny curved
+    # facet clusters on organic surfaces fit near-zero-radius circles and would
+    # otherwise appear as dozens of spurious micro-holes; real holes are larger.
+    min_cylinder_radius: float = 0.4
+
     # How many flat-face-normal directions to try as cylinder axes (by area).
     # More axes catch holes drilled perpendicular to small faces (e.g. pocket
     # floors) at the cost of some speed.
