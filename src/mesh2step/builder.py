@@ -365,70 +365,107 @@ def _boolean_cut_tool_cylinder(center, axis, radius: float, z0: float, z1: float
     return Part.makeCylinder(float(radius), float(height), _vec(base), _vec(axis))
 
 
-def _cyl_cut_and_fill(cyl: Cylinder, Part, margin_frac: float = 0.15, margin_abs: float = 0.3):
-    """Return (oversized cut tool, fill-back solid) for one cylinder — the tools
-    used by both the batched and per-feature boolean clean-up (see
-    :func:`_boolean_clean_cylinder` for the geometry rationale)."""
-    R = float(cyl.radius)
-    R_cut = R + max(margin_abs, margin_frac * R)
-    axis = np.asarray(cyl.axis_dir, dtype=float)
-    center = np.asarray(cyl.axis_point, dtype=float)
-    zmin, zmax = cyl.axial_min, cyl.axial_max
-    pad = max(zmax - zmin, 1.0)
-    cut = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
-    if cyl.outward:
-        fill = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
-    else:
-        outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
-        inner = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
-        fill = outer.cut(inner)
-    return cut, fill
+def _clean_cut_eps(radius: float) -> float:
+    """Radial clearance for an exact-radius boolean cut.
+
+    A faceted feature's vertices sit *on* the fitted radius, so a cut at exactly
+    that radius runs the cut surface through them — OCC then pinches the abutting
+    flat face to a point at every vertex, fragmenting it into hundreds of zero-
+    width slivers. Nudging the cut out by a hair past the vertices (and any small
+    fit noise) lets the boolean clear the whole faceted rim and leave one clean
+    face. The clearance is a micron-scale fraction of the radius, capped so a big
+    feature never grows meaningfully — 1..50 µm, far below any print tolerance,
+    so diameter/axis/centre are preserved for all practical purposes.
+    """
+    return min(max(1e-3, 2.5e-3 * radius), 0.05)
 
 
-def _cone_cut_and_fill(cone, Part, margin_frac: float = 0.15, margin_abs: float = 0.3):
-    """Return (oversized cut tool, fill-back solid) for one countersink cone."""
-    R = max(float(cone.r_base), float(cone.r_top))
-    R_cut = R + max(margin_abs, margin_frac * R)
-    axis = np.asarray(cone.axis_dir, dtype=float)
-    center = np.asarray(cone.axis_point, dtype=float)
-    zmin, zmax = float(cone.axial_min), float(cone.axial_max)
-    pad = max(zmax - zmin, 1.0)
-    cut = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
-    outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
-    true_cone = Part.makeCone(float(cone.r_base), float(cone.r_top), zmax - zmin,
-                              _vec(center + zmin * axis), _vec(axis))
-    fill = outer.cut(true_cone)
-    return cut, fill
+def _wall_vertex_radii(vertices, faces, axis_dir, axis_point, face_indices):
+    """Radial distances of a feature's wall-facet vertices from its axis."""
+    idx = np.unique(np.asarray(faces)[list(face_indices)].ravel())
+    d = vertices[idx] - np.asarray(axis_point, dtype=float)
+    axis = np.asarray(axis_dir, dtype=float)
+    radial = d - np.outer(d @ axis, axis)
+    return np.linalg.norm(radial, axis=1)
 
 
-def _boolean_clean_cylinder(
-    solid, cyl: Cylinder, Part, margin_frac: float = 0.15, margin_abs: float = 0.3
-):
-    """Replace a faceted hole/boss with an exact analytic cylinder via boolean
-    cut + fuse-back, instead of trying to sew mismatched topology.
+def _design_radius(vertices, faces, axis_dir, axis_point, face_indices, fit_radius):
+    """The feature's *design* radius — the circle its wall vertices lie on.
 
-    1. Cut an *oversized* cylinder over a padded axial range — reliably clears
-       all the faceted rim material regardless of which way the tessellation
-       bulged, leaving a clean bore whose end circles sit on the part's faces.
-    2. Fuse back the material that should be there, over the feature's *exact*
-       axial extent (``axial_min..axial_max``) so its end faces coincide with —
-       and bond to — the real part faces (a padded range would leave a floating
-       tube). For a hole that's the annulus between the true and cut radii; for
-       a boss it's a solid cylinder at the true radius.
+    A tessellated hole/boss is a polygon whose vertices sit on the design circle
+    and whose chords bulge off it, so the algebraic (Kasa) fit — which balances
+    residuals across the whole wall — can land *inside* the polygon's inradius
+    (seen on real parts: fit 2.10 for a wall whose vertices are all at 2.125).
+    Cutting at that under-fit radius misses the material entirely. The wall
+    vertices are the reliable signal: a high quantile of their radial distances
+    recovers the true radius while ignoring the odd misclassified facet. Falls
+    back to the fit radius if there are too few vertices to be meaningful.
+    """
+    r = _wall_vertex_radii(vertices, faces, axis_dir, axis_point, face_indices)
+    if r.size < 3:
+        return float(fit_radius)
+    return float(np.quantile(r, 0.95))
+
+
+def _boolean_clean_cylinder(solid, cyl: Cylinder, Part, radius: float | None = None, **_):
+    """Replace a faceted hole/boss with an exact analytic cylinder via a boolean
+    op, instead of trying to sew mismatched topology.
+
+    A faceted hole is *inscribed*: its vertices sit on the true cylinder and the
+    chordal facets bulge **inward**, so the solid material only ever reaches the
+    true radius R (never past it). Cutting a cylinder of *exactly* R therefore
+    removes every scrap of faceted rim and leaves an analytic wall at exactly R,
+    with the bore's end circles landing on the part's own faces — no fill-back,
+    and crucially no oversized cut ring left behind (the old oversize+shrink
+    scheme left a partial wall at R+margin whenever the shrink fuse-back failed,
+    which is exactly the "partial cylinder artifact" we must avoid). Diameter,
+    axis and centre are all preserved because the cut *is* the fitted cylinder.
+
+    A boss is the mirror image (material inside R), so we fuse a solid cylinder
+    of exactly R over the feature's exact axial extent to true-up its wall.
 
     Booleans recompute the intersection geometry, so the analytic tool and the
     faceted mesh need not share matching topology — unlike sewing.
     """
-    cut, fill = _cyl_cut_and_fill(cyl, Part, margin_frac, margin_abs)
-    return solid.cut(cut).fuse(fill)
+    R = float(cyl.radius if radius is None else radius)
+    eps = _clean_cut_eps(R)
+    axis = np.asarray(cyl.axis_dir, dtype=float)
+    center = np.asarray(cyl.axis_point, dtype=float)
+    zmin, zmax = cyl.axial_min, cyl.axial_max
+    if cyl.outward:
+        fill = _boolean_cut_tool_cylinder(center, axis, R + eps, zmin, zmax, Part)
+        return solid.fuse(fill)
+    pad = max(zmax - zmin, 1.0)
+    cut = _boolean_cut_tool_cylinder(center, axis, R + eps, zmin - pad, zmax + pad, Part)
+    return solid.cut(cut)
 
 
-def _boolean_clean_cone(solid, cone, Part, margin_frac: float = 0.15, margin_abs: float = 0.3):
-    """Same idea as :func:`_boolean_clean_cylinder`, for a countersink cone:
-    oversized cut over a padded range, then fuse back the annular shell between
-    the true cone and the cut cylinder over the cone's exact axial extent."""
-    cut, fill = _cone_cut_and_fill(cone, Part, margin_frac, margin_abs)
-    return solid.cut(cut).fuse(fill)
+def _boolean_clean_cone(solid, cone, Part, **_):
+    """Exact-cut analogue of :func:`_boolean_clean_cylinder` for a countersink
+    cone. The faceted cone is inscribed the same way, so cutting the exact cone
+    (extended a hair past each end along its own taper so it passes cleanly
+    through the surfaces) clears the facets and leaves an analytic conical wall
+    at the fitted radii — no oversize ring."""
+    r_base = float(cone.r_base)
+    r_top = float(cone.r_top)
+    axis = np.asarray(cone.axis_dir, dtype=float)
+    center = np.asarray(cone.axis_point, dtype=float)
+    zmin, zmax = float(cone.axial_min), float(cone.axial_max)
+    height = zmax - zmin
+    pad = max(height, 1.0)
+    # Nudge the radii out a hair (as for cylinders) so the cut clears the faceted
+    # vertices instead of pinching the abutting faces into slivers, then extend
+    # along the taper so radii stay ~exact at the real surfaces while the tool
+    # over-runs into open air at both ends (slope = dR/dz along the axis).
+    eps = _clean_cut_eps(max(r_base, r_top))
+    r_base += eps
+    r_top += eps
+    slope = (r_top - r_base) / height if height > 1e-9 else 0.0
+    r0 = max(r_base - slope * pad, 1e-4)
+    r1 = max(r_top + slope * pad, 1e-4)
+    cut = Part.makeCone(r0, r1, height + 2 * pad,
+                        _vec(center + (zmin - pad) * axis), _vec(axis))
+    return solid.cut(cut)
 
 
 def _is_valid_solid(shape) -> bool:
@@ -529,7 +566,10 @@ def build_boolean_clean_solid(
     # would fill the bore. One bad feature never corrupts the rest.
     cyl_ok = 0
     for i, cyl in enumerate(cylinders):
-        solid, ok = _try_boolean_step(solid, lambda s, c=cyl: _boolean_clean_cylinder(s, c, Part))
+        r_cut = _design_radius(vertices, faces, cyl.axis_dir, cyl.axis_point,
+                               cyl.face_indices, cyl.radius)
+        solid, ok = _try_boolean_step(
+            solid, lambda s, c=cyl, rc=r_cut: _boolean_clean_cylinder(s, c, Part, radius=rc))
         cyl_ok += ok
         if (i + 1) % 10 == 0 or i + 1 == len(cylinders):
             progress(f"  cylinders cleaned {cyl_ok}/{i + 1} of {len(cylinders)}")
