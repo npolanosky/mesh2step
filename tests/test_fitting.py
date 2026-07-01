@@ -42,3 +42,22 @@ def test_hole_vs_boss_classification():
     cyls = {round(c.radius): c for c in detect_cylinders(vertices, faces, ConversionConfig())}
     assert cyls[15].outward is True   # outer wall = boss
     assert cyls[9].outward is False   # central bore = hole
+
+
+def test_harmonize_snaps_near_equal_radii():
+    from mesh2step.fitting import Cylinder, _harmonize_radii
+
+    def cyl(r):
+        return Cylinder(
+            axis_point=__import__("numpy").zeros(3),
+            axis_dir=__import__("numpy").array([0.0, 0, 1]),
+            radius=r, axial_min=0, axial_max=1, rms=0.0,
+            face_indices=list(range(100)),
+        )
+
+    cfg = ConversionConfig(harmonize_rel_tol=0.03, harmonize_round=0.05)
+    cyls = [cyl(6.041), cyl(6.047), cyl(6.064), cyl(3.02), cyl(2.98)]
+    _harmonize_radii(cyls, cfg)
+    radii = sorted({round(c.radius, 3) for c in cyls})
+    # 6.04/6.05/6.06 collapse to one value; 3.02/2.98 collapse to 3.00.
+    assert radii == [3.0, 6.05]

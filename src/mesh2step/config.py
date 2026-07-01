@@ -66,6 +66,24 @@ class ConversionConfig:
     # to be accepted.
     cylinder_tol: float = 5e-2
 
+    # Minimum facets a curved region must have to attempt a cylinder fit.
+    min_cylinder_facets: int = 8
+
+    # Minimum fraction of the full circle the facets must cover (0..1). Holes
+    # and bosses wrap the whole way around (~1.0); this rejects shallow arcs and
+    # slivers that algebraically fit a huge circle (the classic false positive).
+    min_cylinder_coverage: float = 0.5
+
+    # Reject fitted radii larger than this (mm). None -> the mesh's largest
+    # bounding-box dimension (a hole/boss can't be bigger than the part).
+    max_cylinder_radius: float | None = None
+
+    # Snap near-equal detected radii to a shared rounded value, so triangulation
+    # noise doesn't yield 6.04/6.05/6.06 for what is really one 6.05 hole.
+    harmonize_radii: bool = True
+    harmonize_rel_tol: float = 0.03   # radii within 3% are treated as the same
+    harmonize_round: float = 0.05     # snap the shared radius to this grid (mm)
+
     @property
     def angle_tol_cos(self) -> float:
         """Pre-computed cosine of the angle tolerance for dot-product gating."""
