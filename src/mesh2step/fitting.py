@@ -71,6 +71,8 @@ class Cone:
     axial_max: float
     rms: float
     face_indices: list[int]
+    r_base: float = 0.0      # radius at axial_min (for building makeCone)
+    r_top: float = 0.0       # radius at axial_max
     outward: bool = False
 
     def as_dict(self) -> dict:
@@ -344,18 +346,23 @@ def detect_cones(
         if len(candidates) < config.min_cylinder_facets:
             continue
         for cluster in _connected_components(candidates, neighbors):
-            cone = _fit_cone(cluster, axis, p, axial, rho, centroids, config)
+            cone = _fit_cone(cluster, cyl, axis, p, vertices, faces, centroids, config)
             if cone is not None:
                 cones.append(cone)
                 claimed.update(cone.face_indices)
     return cones
 
 
-def _fit_cone(cluster, axis, p, axial, rho, centroids, config) -> Cone | None:
+def _fit_cone(cluster, cyl, axis, p, vertices, faces, centroids, config) -> Cone | None:
     if len(cluster) < config.min_cylinder_facets:
         return None
-    z = axial[cluster]
-    r = rho[cluster]
+    # Fit on the cluster's *vertices* (not facet centroids) so the cone reaches
+    # the true edges (mouth at the surface, junction at the bore).
+    vert_ids = np.unique(faces[cluster].reshape(-1))
+    pts = vertices[vert_ids]
+    rel = pts - p
+    z = rel @ axis
+    r = np.linalg.norm(rel - z[:, None] * axis, axis=1)
     # Linear radius-vs-axial fit: r = slope*z + intercept; slope = tan(half-angle).
     A = np.column_stack((z, np.ones_like(z)))
     (slope, intercept), *_ = np.linalg.lstsq(A, r, rcond=None)
@@ -365,15 +372,27 @@ def _fit_cone(cluster, axis, p, axial, rho, centroids, config) -> Cone | None:
         return None  # too flat to be a cone, or not a clean cone
     if _angular_coverage(centroids[cluster], axis, p) < config.min_cylinder_coverage:
         return None
+
     zmin, zmax = float(z.min()), float(z.max())
-    r_at = lambda zz: float(slope * zz + intercept)  # noqa: E731
-    r0, r1 = r_at(zmin), r_at(zmax)
+    # Snap the cone's near end exactly to the paired cylinder's end circle, so
+    # the two analytic faces share an identical junction edge and sew closed.
+    junction_z = min((cyl.axial_min, cyl.axial_max),
+                     key=lambda ze: min(abs(zmin - ze), abs(zmax - ze)))
+    far_z = zmax if abs(zmax - junction_z) >= abs(zmin - junction_z) else zmin
+    intercept = cyl.radius - slope * junction_z  # force line through the junction
+    r_far = slope * far_z + intercept
+    if r_far <= 0:
+        return None
+    axial_min, axial_max = sorted((junction_z, far_z))
+    r_base = slope * axial_min + intercept
+    r_top = slope * axial_max + intercept
     return Cone(
         axis_point=p, axis_dir=axis,
-        r_small=min(r0, r1), r_large=max(r0, r1),
+        r_small=min(cyl.radius, r_far), r_large=max(cyl.radius, r_far),
         half_angle_deg=float(np.degrees(np.arctan(abs(slope)))),
-        axial_min=zmin, axial_max=zmax, rms=rms,
+        axial_min=axial_min, axial_max=axial_max, rms=rms,
         face_indices=list(cluster),
+        r_base=float(r_base), r_top=float(r_top),
     )
 
 

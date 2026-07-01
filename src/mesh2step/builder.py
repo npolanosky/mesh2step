@@ -38,35 +38,47 @@ def _circle_wire(center, normal, radius: float, Part):
     return Part.Wire([circle.toShape()])
 
 
-def _match_loop_to_cylinder(
-    loop: np.ndarray, plane_normal: np.ndarray, cylinders: list[Cylinder]
-):
-    """If a boundary loop is a faceted circle matching a cylinder end, return
-    the exact circle (center, normal, radius) to replace it with; else None."""
+def _analytic_circles(cylinders, cones):
+    """End-circles of every analytic face, as (center, axis, radius) tuples.
+
+    Planar boundary loops that match one of these get replaced by the exact
+    circle so their edges coincide with the analytic faces and sew cleanly.
+    """
+    circles = []
+    for cyl in cylinders:
+        for za in (cyl.axial_min, cyl.axial_max):
+            circles.append((cyl.axis_point + za * cyl.axis_dir, cyl.axis_dir, cyl.radius))
+    for cone in cones:
+        circles.append((cone.axis_point + cone.axial_min * cone.axis_dir, cone.axis_dir, cone.r_base))
+        circles.append((cone.axis_point + cone.axial_max * cone.axis_dir, cone.axis_dir, cone.r_top))
+    return [(c, a, r) for (c, a, r) in circles if r > 1e-6]
+
+
+def _match_loop_to_circle(loop: np.ndarray, plane_normal: np.ndarray, circles):
+    """If a boundary loop is a faceted circle matching an analytic end-circle,
+    return the exact (center, normal, radius) to replace it with; else None."""
     centroid = loop.mean(axis=0)
     mean_radius = float(np.linalg.norm(loop - centroid, axis=1).mean())
-    for cyl in cylinders:
-        # Plane must be perpendicular to the cylinder axis.
-        if abs(float(plane_normal @ cyl.axis_dir)) < 0.99:
+    for center0, axis, radius in circles:
+        if abs(float(plane_normal @ axis)) < 0.99:  # plane must be ⊥ axis
             continue
-        if abs(mean_radius - cyl.radius) > 0.05 * cyl.radius + 0.1:
+        if abs(mean_radius - radius) > 0.05 * radius + 0.1:
             continue
-        # Loop must be centred on the axis line.
-        rel = centroid - cyl.axis_point
-        off_axis = np.linalg.norm(rel - (rel @ cyl.axis_dir) * cyl.axis_dir)
-        if off_axis > 0.05 * cyl.radius + 0.1:
+        rel = centroid - center0
+        off_axis = np.linalg.norm(rel - (rel @ axis) * axis)
+        if off_axis > 0.05 * radius + 0.1:  # loop centred on the axis line
             continue
-        # Exact circle = where the axis pierces this loop's plane.
-        denom = float(cyl.axis_dir @ plane_normal)
+        denom = float(axis @ plane_normal)
         if abs(denom) < 1e-9:
             continue
-        s = float((centroid - cyl.axis_point) @ plane_normal) / denom
-        center = cyl.axis_point + s * cyl.axis_dir
-        return center, plane_normal, cyl.radius
+        # Slide center0 along the axis onto the loop's plane (axis ∩ plane).
+        s = float((centroid - center0) @ plane_normal) / denom
+        center = center0 + s * axis
+        return center, plane_normal, radius
     return None
 
 
-def _planar_face(loops: FaceLoops, cylinders: list[Cylinder], Part):
+def _planar_face(loops: FaceLoops, circles, Part):
     """Build a planar face, swapping any faceted-circle loop for a true circle.
 
     Hole loops are wound opposite to the outer loop so OCC subtracts them; when
@@ -75,7 +87,7 @@ def _planar_face(loops: FaceLoops, cylinders: list[Cylinder], Part):
     normal = loops.normal
 
     def wire_for(loop, is_hole):
-        match = _match_loop_to_cylinder(loop, normal, cylinders)
+        match = _match_loop_to_circle(loop, normal, circles)
         if match is not None:
             center, n, radius = match
             return _circle_wire(center, -n if is_hole else n, radius, Part)
@@ -102,6 +114,16 @@ def _cylinder_face(cyl: Cylinder, Part):
     return face if cyl.outward else face.reversed()
 
 
+def _cone_face(cone, Part):
+    """Build an analytic conical face (countersink) from makeCone's lateral face."""
+    base = cone.axis_point + cone.axial_min * cone.axis_dir
+    height = cone.axial_max - cone.axial_min
+    solid = Part.makeCone(float(cone.r_base), float(cone.r_top), float(height),
+                          _vec(base), _vec(cone.axis_dir))
+    lateral = [f for f in solid.Faces if f.Surface.TypeId == "Part::GeomCone"][0]
+    return lateral if cone.outward else lateral.reversed()
+
+
 def build_reconstructed_solid(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -122,14 +144,18 @@ def build_reconstructed_solid(
     cylinders = detect_cylinders(vertices, faces, config)
     holes = sum(1 for c in cylinders if not c.outward)
     progress(f"Found {len(cylinders)} cylinders ({holes} holes)")
-    # Cones (countersinks) are detected and reported; analytic cone faces are a
-    # follow-up, so their facets are left to the surrounding reconstruction.
     cones = detect_cones(vertices, faces, cylinders, config)
     if cones:
         progress(f"Found {len(cones)} countersink cone(s)")
     claimed: set[int] = set()
     for cyl in cylinders:
         claimed.update(cyl.face_indices)
+    for cone in cones:
+        claimed.update(cone.face_indices)
+
+    # Exact end-circles of the analytic faces, used to replace matching faceted
+    # boundary loops so their edges coincide and sew.
+    circles = _analytic_circles(cylinders, cones)
 
     # Segment the *remaining* facets into planar regions. Removing the cylinder
     # walls turns each hole into a clean inner boundary loop on its end faces.
@@ -151,7 +177,7 @@ def build_reconstructed_solid(
             skipped += region.size
             continue
         try:
-            occ_faces.append(_planar_face(loops, cylinders, Part))
+            occ_faces.append(_planar_face(loops, circles, Part))
             reconstructed += 1
         except Exception:  # noqa: BLE001 - OCC raises bare RuntimeErrors
             skipped += region.size
@@ -161,6 +187,14 @@ def build_reconstructed_solid(
         try:
             occ_faces.append(_cylinder_face(cyl, Part))
             cyl_faces_ok += 1
+        except Exception:  # noqa: BLE001
+            pass
+
+    cone_faces_ok = 0
+    for cone in cones:
+        try:
+            occ_faces.append(_cone_face(cone, Part))
+            cone_faces_ok += 1
         except Exception:  # noqa: BLE001
             pass
 
@@ -174,8 +208,9 @@ def build_reconstructed_solid(
         "faces_in": int(len(faces)),
         "planar_faces": reconstructed,
         "cylinder_faces": cyl_faces_ok,
+        "cone_faces": cone_faces_ok,
         "cylinders_detected": len(cylinders),
-        "faces_out": reconstructed + cyl_faces_ok,
+        "faces_out": reconstructed + cyl_faces_ok + cone_faces_ok,
         "cylinders": [c.as_dict() for c in cylinders],
         "cones_detected": len(cones),
         "cones": [c.as_dict() for c in cones],

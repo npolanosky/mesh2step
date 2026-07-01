@@ -396,8 +396,8 @@ class App:
         cones = s.get("cones", [])
         if cones:
             angles = sorted({round(c["half_angle_deg"], 1) for c in cones})
-            self._log(f"   countersinks detected: {len(cones)} (half-angles {angles}°) — "
-                      f"reported; left faceted for now", "muted")
+            self._log(f"   countersinks: {s.get('cone_faces', 0)}/{len(cones)} built as "
+                      f"cone faces (half-angles {angles}°)", "muted")
         bi, bo = s.get("bbox_input_mm"), s.get("bbox_output_mm")
         if bi and bo:
             self._log(f"   bbox in {bi} → out {bo}  (Δ{s.get('bbox_delta_pct',0)}%)", "muted")
