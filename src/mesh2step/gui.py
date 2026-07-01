@@ -148,8 +148,13 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("mesh2step")
-        root.geometry("760x820")
-        root.minsize(680, 720)
+        # Cap the initial height to the screen (leaving room for the taskbar) so
+        # the window — and its scrollbar — are never taller than the display.
+        # The body scrolls, so all controls stay reachable at any size/DPI.
+        screen_h = root.winfo_screenheight()
+        init_h = min(1080, max(560, screen_h - 90))
+        root.geometry(f"760x{init_h}")
+        root.minsize(560, 420)
         root.configure(bg=BG)
         self.q: queue.Queue = queue.Queue()
         self.busy = False
@@ -220,8 +225,32 @@ class App:
         tk.Label(header, text="STL mesh → STEP solid  ·  surface & hole reconstruction",
                  bg=ACCENT, fg="#dbeafe", font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(0, 12))
 
-        body = ttk.Frame(self.root, style="Bg.TFrame", padding=16)
-        body.pack(fill="both", expand=True)
+        # Scrollable body: the frozen app is DPI-aware, so on a scaled Windows
+        # display the content is taller than the physical window and the lower
+        # controls (Convert, result actions, log) would clip off-screen with no
+        # way to reach them. A canvas + scrollbar keeps everything reachable.
+        scroll_area = ttk.Frame(self.root, style="Bg.TFrame")
+        scroll_area.pack(fill="both", expand=True)
+        canvas = tk.Canvas(scroll_area, bg=BG, highlightthickness=0, bd=0)
+        vbar = ttk.Scrollbar(scroll_area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = ttk.Frame(canvas, style="Bg.TFrame", padding=16)
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        # Inner frame tracks the canvas width; scrollregion tracks its height.
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_id, width=e.width))
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def _on_wheel(e):
+            # Leave the log's own text area free to scroll itself.
+            w = self.root.winfo_containing(e.x_root, e.y_root)
+            if isinstance(w, tk.Text):
+                return
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_wheel)
 
         # --- Input card ---
         c1 = self._card(body, "1  ·  Input mesh")

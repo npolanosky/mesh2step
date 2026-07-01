@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mesh2step"
-version = "0.2.0a2"
+version = "0.2.0a3"
 description = "Convert STL meshes to STEP solids with surface reconstruction (coplanar-facet merging) via FreeCAD."
 readme = "README.md"
 license = { file = "LICENSE" }
