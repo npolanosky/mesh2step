@@ -1,14 +1,18 @@
-# PyInstaller spec for the mesh2step GUI.
+# PyInstaller spec for the mesh2step GUI (cross-platform: Windows + macOS).
 #
 # Build (from the repo root, with a Python that has pyinstaller + tkinterdnd2):
 #     pyinstaller packaging/mesh2step.spec
 #
-# Produces dist/mesh2step/mesh2step.exe (a one-folder app). FreeCAD is NOT
-# bundled — it is located on the user's machine at runtime. Our own package
-# source is bundled as data ("mesh2step_src/") so that FreeCAD's separate Python
-# can import the conversion worker out-of-process.
+# Windows -> dist/mesh2step/mesh2step.exe (one-folder app).
+# macOS   -> dist/mesh2step.app (app bundle).
+# PyInstaller cannot cross-compile: build the mac app ON a mac.
+#
+# FreeCAD is NOT bundled — it is located on the user's machine at runtime. Our
+# own package source is bundled as data ("mesh2step_src/") so that FreeCAD's
+# separate Python can import the conversion worker out-of-process.
 
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
@@ -52,3 +56,19 @@ coll = COLLECT(
     exe, a.binaries, a.datas,
     name="mesh2step",
 )
+
+# macOS: wrap the one-folder app in a proper .app bundle.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="mesh2step.app",
+        icon=None,
+        bundle_identifier="com.mesh2step.app",
+        info_plist={
+            "CFBundleName": "mesh2step",
+            "CFBundleDisplayName": "mesh2step",
+            "NSHighResolutionCapable": True,
+            # Not a document-based app; keeps it a plain windowed tool.
+            "LSBackgroundOnly": False,
+        },
+    )

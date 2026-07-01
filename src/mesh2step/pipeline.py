@@ -8,6 +8,10 @@ from pathlib import Path
 from .config import ConversionConfig
 from .mesh_io import load_stl
 
+# Target face count for the boolean clean-up base. Each cut is O(base faces);
+# ~12k keeps holes accurate while making dozens of cuts complete in ~1–2 min.
+DEFAULT_BOOLEAN_TARGET = 12000
+
 
 @dataclass
 class ConversionResult:
@@ -35,6 +39,13 @@ def convert(
             on_progress(msg)
 
     config = config or ConversionConfig()
+    # Fully-closed relies on the boolean base being small; decimate the whole
+    # pipeline by default so reconstruction is fast (and may even close) and the
+    # boolean base is tractable. Users can override with an explicit target.
+    if config.full_closed and config.decimate_target_faces is None:
+        import dataclasses
+
+        config = dataclasses.replace(config, decimate_target_faces=DEFAULT_BOOLEAN_TARGET)
     input_path = Path(input_path)
     if output_path is None:
         output_path = input_path.with_suffix(".step")
@@ -50,8 +61,8 @@ def convert(
     # Weld in raw units, then scale to millimetres (STEP is always mm). Welding
     # first keeps weld_tol meaningful regardless of the source unit scale.
     prep_report = None
-    if config.repair_mesh or config.decimate:
-        progress("Preparing mesh (repair/decimate)")
+    if config.repair_mesh:
+        progress("Preparing mesh (repair)")
         from . import meshprep
 
         vertices, faces, prep_report = meshprep.load_and_prepare(str(input_path), config)
@@ -69,12 +80,26 @@ def convert(
         progress(f"Scaling {config.source_units} -> mm (x{scale:g})")
         vertices = vertices * scale
 
+    # Planar-preserving decimation: collapses over-tessellated flats while
+    # keeping holes/curves dense — shrinks the file and can improve detection.
+    dec_report = None
+    if config.decimate_target_faces:
+        from . import meshprep
+
+        target = int(config.decimate_target_faces)
+        if len(faces) > target * 1.2:
+            progress(f"Decimating {len(faces):,} -> ~{target:,} faces (planar-preserving)")
+            vertices, faces, dec_report = meshprep.decimate_planar(vertices, faces, target)
+            progress(f"Decimated to {len(faces):,} faces")
+
     input_dims = sorted((vertices.max(axis=0) - vertices.min(axis=0)).tolist(), reverse=True)
 
     method = "faceted"
     stats: dict = {"faces_in": int(len(faces))}
     if prep_report is not None:
         stats["mesh_prep"] = prep_report
+    if dec_report is not None:
+        stats["decimation"] = dec_report
 
     if not config.faceted:
         try:
@@ -91,37 +116,61 @@ def convert(
         progress("Building faceted solid")
         shape = builder.build_faceted_solid(vertices, faces)
 
-    # Fully-closed toggle: guarantee a watertight solid.
+    # Fully-closed toggle: upgrade the (possibly open) reconstruction to a
+    # watertight solid via boolean clean-up. Priority: (1) watertight AND
+    # artifact-free is ideal; (2) watertight with some artifacts is still
+    # preferred over an open shell; (3) an open (but clean) reconstruction is the
+    # last resort. We adopt any watertight boolean result, surfacing any
+    # remaining partial-radius artifacts as a warning so they're not a surprise.
     if config.full_closed and not _is_solid(shape):
-        # Tier 2: boolean clean-up. Start from the (guaranteed watertight)
-        # faceted solid and cut+fuse each detected hole/boss/cone to its exact
-        # analytic geometry. Robust where sewing failed — booleans recompute the
-        # intersection rather than needing analytic and mesh faces to already
-        # share topology — and gives real round holes, not faceted ones.
         progress("Fully-closed: boolean clean-up (cut + fuse-back analytic holes)")
-        # Use the ORIGINAL welded mesh — repair can leave it non-watertight,
-        # which breaks the base faceted solid the booleans build on.
+        # Use the ORIGINAL welded mesh (repair can leave it non-watertight, which
+        # breaks the base solid), then decimate: each boolean cut costs O(base
+        # faces), so a dense base makes this minutes. Decimation keeps holes
+        # dense (planar-preserving) so detection/accuracy hold while the base
+        # shrinks enough for the cuts to be fast.
         bverts, bfaces = load_stl(input_path, weld_tol=config.weld_tol)
         if scale != 1.0:
             bverts = bverts * scale
+        target = config.decimate_target_faces or DEFAULT_BOOLEAN_TARGET
+        if len(bfaces) > target * 1.2:
+            from . import meshprep
+
+            progress(f"Decimating boolean base {len(bfaces):,} -> ~{target:,} faces")
+            bverts, bfaces, _ = meshprep.decimate_planar(bverts, bfaces, target)
+            progress(f"Boolean base: {len(bfaces):,} faces")
         try:
+            import dataclasses
+
+            bcfg = dataclasses.replace(config, boolean_max_base_faces=None)
             bshape, built2 = builder.build_boolean_clean_solid(
-                bverts, bfaces, config, on_progress=progress
+                bverts, bfaces, bcfg, on_progress=progress
             )
             if _is_solid(bshape):
                 shape, method = bshape, "boolean-clean"
                 stats.update(built2)
+                if built2.get("artifact_free", False):
+                    progress("Boolean clean-up: watertight + artifact-free — adopted")
+                else:
+                    progress(f"Boolean clean-up: watertight (adopted); residual "
+                             f"partial-radius artifacts at Ø~{built2.get('rogue_radii')}")
+                    stats.setdefault("warnings_extra", []).append(
+                        "Watertight, but some intersecting holes left partial-radius "
+                        f"artifacts (extra cylinder faces near {built2.get('rogue_radii')} mm "
+                        "radius) — trim/heal in CAD if needed.")
             else:
                 stats.setdefault("warnings_extra", []).append(
-                    "Boolean clean-up did not produce a watertight solid.")
+                    "Boolean clean-up did not produce a watertight solid; kept the "
+                    "artifact-free open reconstruction as a last resort.")
         except Exception as exc:  # noqa: BLE001
             progress(f"Boolean clean-up failed ({exc})")
             stats.setdefault("warnings_extra", []).append(f"Boolean clean-up failed: {exc}")
 
-    if config.full_closed and not _is_solid(shape):
-        # Tier 3: plain watertight faceted solid — no analytic holes, but
-        # guaranteed closed. Last resort.
-        progress("Fully-closed: building watertight faceted solid (slow on large meshes)")
+    # Tier 3 (plain faceted solid) is only a last resort when there is no usable
+    # analytic reconstruction at all — never prefer faceted holes over clean
+    # analytic ones just to be closed.
+    if config.full_closed and not _is_solid(shape) and stats.get("faces_out", 0) == 0:
+        progress("Fully-closed: building watertight faceted solid (last resort)")
         fverts, ffaces = load_stl(input_path, weld_tol=config.weld_tol)
         if scale != 1.0:
             fverts = fverts * scale

@@ -365,6 +365,42 @@ def _boolean_cut_tool_cylinder(center, axis, radius: float, z0: float, z1: float
     return Part.makeCylinder(float(radius), float(height), _vec(base), _vec(axis))
 
 
+def _cyl_cut_and_fill(cyl: Cylinder, Part, margin_frac: float = 0.15, margin_abs: float = 0.3):
+    """Return (oversized cut tool, fill-back solid) for one cylinder — the tools
+    used by both the batched and per-feature boolean clean-up (see
+    :func:`_boolean_clean_cylinder` for the geometry rationale)."""
+    R = float(cyl.radius)
+    R_cut = R + max(margin_abs, margin_frac * R)
+    axis = np.asarray(cyl.axis_dir, dtype=float)
+    center = np.asarray(cyl.axis_point, dtype=float)
+    zmin, zmax = cyl.axial_min, cyl.axial_max
+    pad = max(zmax - zmin, 1.0)
+    cut = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
+    if cyl.outward:
+        fill = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
+    else:
+        outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
+        inner = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
+        fill = outer.cut(inner)
+    return cut, fill
+
+
+def _cone_cut_and_fill(cone, Part, margin_frac: float = 0.15, margin_abs: float = 0.3):
+    """Return (oversized cut tool, fill-back solid) for one countersink cone."""
+    R = max(float(cone.r_base), float(cone.r_top))
+    R_cut = R + max(margin_abs, margin_frac * R)
+    axis = np.asarray(cone.axis_dir, dtype=float)
+    center = np.asarray(cone.axis_point, dtype=float)
+    zmin, zmax = float(cone.axial_min), float(cone.axial_max)
+    pad = max(zmax - zmin, 1.0)
+    cut = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
+    outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
+    true_cone = Part.makeCone(float(cone.r_base), float(cone.r_top), zmax - zmin,
+                              _vec(center + zmin * axis), _vec(axis))
+    fill = outer.cut(true_cone)
+    return cut, fill
+
+
 def _boolean_clean_cylinder(
     solid, cyl: Cylinder, Part, margin_frac: float = 0.15, margin_abs: float = 0.3
 ):
@@ -383,45 +419,45 @@ def _boolean_clean_cylinder(
     Booleans recompute the intersection geometry, so the analytic tool and the
     faceted mesh need not share matching topology — unlike sewing.
     """
-    R = float(cyl.radius)
-    R_cut = R + max(margin_abs, margin_frac * R)
-    axis = np.asarray(cyl.axis_dir, dtype=float)
-    center = np.asarray(cyl.axis_point, dtype=float)
-    zmin, zmax = cyl.axial_min, cyl.axial_max
-    pad = max(zmax - zmin, 1.0)
-
-    cut_tool = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
-    result = solid.cut(cut_tool)
-
-    if cyl.outward:  # boss: solid cylinder at true radius over the exact extent
-        plug = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
-    else:            # hole: annulus [R, R_cut] over the exact extent
-        ring_outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
-        ring_inner = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
-        plug = ring_outer.cut(ring_inner)
-
-    return result.fuse(plug)
+    cut, fill = _cyl_cut_and_fill(cyl, Part, margin_frac, margin_abs)
+    return solid.cut(cut).fuse(fill)
 
 
 def _boolean_clean_cone(solid, cone, Part, margin_frac: float = 0.15, margin_abs: float = 0.3):
     """Same idea as :func:`_boolean_clean_cylinder`, for a countersink cone:
     oversized cut over a padded range, then fuse back the annular shell between
     the true cone and the cut cylinder over the cone's exact axial extent."""
-    R = max(float(cone.r_base), float(cone.r_top))
-    R_cut = R + max(margin_abs, margin_frac * R)
-    axis = np.asarray(cone.axis_dir, dtype=float)
-    center = np.asarray(cone.axis_point, dtype=float)
-    zmin, zmax = float(cone.axial_min), float(cone.axial_max)
-    pad = max(zmax - zmin, 1.0)
+    cut, fill = _cone_cut_and_fill(cone, Part, margin_frac, margin_abs)
+    return solid.cut(cut).fuse(fill)
 
-    cut_tool = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
-    result = solid.cut(cut_tool)
 
-    ring_outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
-    true_cone = Part.makeCone(float(cone.r_base), float(cone.r_top), zmax - zmin,
-                              _vec(center + zmin * axis), _vec(axis))
-    plug = ring_outer.cut(true_cone)
-    return result.fuse(plug)
+def _is_valid_solid(shape) -> bool:
+    solids = getattr(shape, "Solids", [])
+    return bool(solids) and solids[0].isValid()
+
+
+def _repair_nonmanifold(vertices: np.ndarray, faces: np.ndarray):
+    """Repair non-manifold/duplicate mesh defects via FreeCAD's Mesh kernel.
+
+    Uses only watertightness-safe ops (NOT fixSelfIntersections, which can open
+    the mesh). Returns repaired ``(vertices, faces)``.
+    """
+    import Mesh  # type: ignore
+
+    m = Mesh.Mesh()
+    m.addFacets([(tuple(vertices[a]), tuple(vertices[b]), tuple(vertices[c]))
+                 for a, b, c in faces])
+    for op in ("removeDuplicatedPoints", "removeDuplicatedFacets",
+               "removeNonManifolds", "removeNonManifoldPoints",
+               "harmonizeNormals", "fixIndices"):
+        try:
+            getattr(m, op)()
+        except Exception:  # noqa: BLE001
+            pass
+    points, facets = m.Topology
+    verts = np.array([[p.x, p.y, p.z] for p in points], dtype=np.float64)
+    tris = np.array(facets, dtype=np.int64) if facets else faces
+    return verts, tris
 
 
 def _try_boolean_step(current_solid, fn):
@@ -477,10 +513,20 @@ def build_boolean_clean_solid(
 
     progress("Building faceted watertight solid (base)")
     solid = build_faceted_solid(vertices, faces)
-    base_solids = getattr(solid, "Solids", [])
-    if not (base_solids and base_solids[0].isValid()):
+    if not _is_valid_solid(solid):
+        # Decimation can leave non-manifold edges; repair them (FreeCAD's Mesh
+        # kernel, safe ops only — no fixSelfIntersections, which breaks
+        # watertightness) and rebuild before giving up.
+        progress("  base not watertight; repairing non-manifold edges")
+        rv, rf = _repair_nonmanifold(vertices, faces)
+        solid = build_faceted_solid(rv, rf)
+    if not _is_valid_solid(solid):
         raise RuntimeError("base faceted solid is not watertight; cannot boolean-clean")
 
+    # Per-feature cut + fuse-back, each reverting if it breaks validity. Applied
+    # sequentially (not batched) because coaxial/nested features — e.g. a bore
+    # inside a boss — must be processed in order: a batched fuse-back of the boss
+    # would fill the bore. One bad feature never corrupts the rest.
     cyl_ok = 0
     for i, cyl in enumerate(cylinders):
         solid, ok = _try_boolean_step(solid, lambda s, c=cyl: _boolean_clean_cylinder(s, c, Part))
@@ -502,6 +548,20 @@ def build_boolean_clean_solid(
     solids = getattr(solid, "Solids", [])
     is_solid = bool(solids) and solids[0].isValid()
 
+    # Artifact check: every cylindrical face in the result should sit at (near)
+    # a detected hole radius. Oversize-cut rings or partial-radius slivers left
+    # by booleans on intersecting holes show up as faces at *other* radii — those
+    # cause downstream CAD issues, so we flag them and the caller rejects the
+    # result rather than shipping artifacts.
+    detected_r = sorted({round(c.radius, 3) for c in cylinders})
+    rogue = []
+    for fc in solid.Faces:
+        if fc.Surface.TypeId == "Part::GeomCylinder":
+            r = fc.Surface.Radius
+            if not any(abs(r - d) <= 0.05 * d + 0.05 for d in detected_r):
+                rogue.append(round(r, 3))
+    artifact_free = len(rogue) == 0
+
     stats = {
         "faces_in": int(len(faces)),
         "faces_out": len(solid.Faces),
@@ -513,6 +573,8 @@ def build_boolean_clean_solid(
         "cones": [c.as_dict() for c in cones],
         "boolean_cleaned": cleaned,
         "boolean_failed": total - cleaned,
+        "artifact_free": artifact_free,
+        "rogue_radii": sorted(set(rogue)),
         "is_solid": is_solid,
     }
     return solid, stats

@@ -28,17 +28,35 @@ the app auto-detects it (or the user points at FreeCAD's `python.exe`).
 - `numpy`, `FreeCAD`, `Part`, `Mesh` are **excluded** from the frozen app — they
   belong to FreeCAD's Python, not ours.
 
-## macOS (deferred)
+## macOS
 
-Planned once the Windows build is confirmed in real use. The same architecture
-applies (locate FreeCAD's bundled Python under `FreeCAD.app/Contents/Resources`,
-shell out to the worker). Build with PyInstaller on a Mac:
+PyInstaller **cannot cross-compile**, so build the mac app *on a Mac*. A helper
+script does the whole thing (creates an isolated build venv, installs deps,
+runs PyInstaller):
 
 ```bash
-pip install -e ".[gui,build]"
-pyinstaller --clean --noconfirm --windowed packaging/mesh2step.spec
+cd <repo root>
+./packaging/build_mac.sh          # -> dist/mesh2step.app
+open dist/mesh2step.app
 ```
 
-`freecad_env.py` already contains macOS search paths for both the library dir
-and the bundled Python. A `.app` bundle / DMG and notarization are the remaining
-steps. PyInstaller cannot cross-compile, so the Mac build must run on macOS.
+Or manually:
+
+```bash
+python3 -m pip install -e ".[gui,viewer,build]"
+pyinstaller --clean --noconfirm packaging/mesh2step.spec   # spec makes a .app on macOS
+```
+
+The same spec builds both platforms — on macOS its `BUNDLE` step wraps the
+one-folder app into `dist/mesh2step.app`. The target Mac still needs **FreeCAD
+0.20+ installed**; the app auto-detects `/Applications/FreeCAD.app` (see the
+macOS globs in `freecad_env.py`) or you can point it at FreeCAD's `python` in the
+GUI. The deviation viewer's pyvista/VTK are bundled into the app.
+
+Notes:
+- **tkinter**: the python.org macOS Python includes it. With Homebrew Python run
+  `brew install python-tk` first.
+- Gatekeeper: an unsigned `.app` needs right-click → Open the first time (or
+  `xattr -dr com.apple.quarantine dist/mesh2step.app`). Code-signing +
+  notarization are optional follow-ups for distribution.
+- To share it: `(cd dist && zip -r mesh2step-mac.zip mesh2step.app)`.

@@ -112,12 +112,18 @@ class ConversionConfig:
     # size (radius = size/2), while rejecting shallow-arc mega-circles.
     max_cylinder_radius: float | None = None
 
-    # Mesh preparation (uses FreeCAD's mesh kernel). Repair fixes duplicate
-    # points/facets, degenerate facets, normals and non-manifold edges. Decimate
-    # reduces triangle count (reduction fraction 0..1) to speed up heavy meshes.
+    # Mesh preparation. Repair (FreeCAD mesh kernel) fixes duplicate
+    # points/facets, degenerate facets, normals and non-manifold edges.
     repair_mesh: bool = False
-    decimate: float | None = None      # e.g. 0.5 => reduce by up to 50%
-    decimate_tol: float = 0.1          # max geometric error (mm) when decimating
+
+    # Planar-preserving decimation (pymeshlab quadric edge-collapse). Collapses
+    # over-tessellated flat regions while keeping holes/curves dense and edges
+    # sharp — it both shrinks the file and, crucially, makes the boolean
+    # clean-up tractable (its cost is O(base faces) per hole). If the mesh has
+    # more than ``decimate_target_faces`` triangles it is decimated down toward
+    # that count. Set to None to disable. The fully-closed path enables a
+    # default target automatically when needed.
+    decimate_target_faces: int | None = None
 
     # Snap near-equal detected radii to a shared rounded value, so triangulation
     # noise doesn't yield 6.04/6.05/6.06 for what is really one 6.05 hole.
