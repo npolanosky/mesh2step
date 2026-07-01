@@ -99,25 +99,36 @@ so the tool never fails to produce *a* watertight result.
       hole; junction snapped to the cylinder end so it sews watertight)
 - [x] Fast / fully-closed toggle — fully-closed falls back to a watertight
       faceted solid when analytic reconstruction can't close (organic parts)
-- [x] Gap-fill (hybrid subdivision): unreconstructed regions are grouped into
-      connected local patches and merged with `removeSplitter` (not emitted as
-      thousands of raw per-triangle faces) — keeps merged planar faces + analytic
-      holes while patching the shell closed, instead of falling straight to a
-      fully-faceted rebuild. All `removeSplitter`/sew calls are now guarded so a
-      malformed edge degrades gracefully instead of crashing/hanging.
-      **Known limit**: on a mesh with many *intersecting* holes (Blank Topper:
-      38 holes, several pairs crossing near the corners), gap-fill sewing
-      (~40k faces) does not converge to a single valid solid even after local
-      merging — it still falls back to tier 3 (full faceted, ~233MB), just
-      slower (~140s wasted first). The default *fast* path (no gap-fill) already
-      gives all holes as real analytic cylinders with no faceting, at ~62MB vs.
-      the 233MB fully-faceted export — just not a single watertight solid
-      (1,188 open shells on that part).
-- [ ] Close the remaining intersecting-hole regions cleanly (real topology
-      repair — e.g. explicit edge stitching at hole intersections — rather than
-      relying on OCC's global sewShape over tens of thousands of faces)
-- [ ] Effective decimation — FreeCAD's scripted `Mesh.decimate` barely reduces
-      these meshes; needs pymeshlab/open3d or a numpy vertex-clustering pass
+- [x] Boolean clean-up (fully-closed tier 2) — `builder.build_boolean_clean_solid`.
+      Start from the guaranteed-watertight faceted solid and, per detected
+      hole/boss/cone, boolean **cut** an oversized analytic cylinder over a
+      padded axial range (clears the faceted rim), then **fuse back** the exact
+      material (hole → annulus `[R, R_cut]`; boss → solid cylinder) over the
+      feature's *exact* axial extent so its end faces bond to the real part
+      faces. Booleans recompute the intersection, so the analytic tool and the
+      faceted mesh need not share topology — this is what made it work where
+      sewing (mismatched edges) failed. Each step reverts on invalidity so one
+      bad feature never corrupts the result. Verified: all sample holes/bosses/
+      countersinks come out as true analytic surfaces at ground-truth radii
+      (`scripts/smoke_boolean.py`), and an intersecting bore+cross-hole part
+      converts end-to-end via `convert(full_closed=True)` to a valid watertight
+      solid with analytic holes in ~3s.
+      **Fundamental cost**: each boolean cut is O(base faces), and building the
+      faceted base + `isValid` is ~55s at 174k faces, ~26s *per cut*. So on very
+      dense meshes it is minutes — guarded by `boolean_max_base_faces` (default
+      60k): above that it raises immediately and the pipeline falls through to
+      tier 3 (plain faceted). The real unlock is decimation (next item): with a
+      few-hundred-face base every cut is sub-second and the walls stay single
+      clean faces (they only fragment when the surrounding *end faces* are still
+      faceted).
+- [ ] **Planar mesh decimation** (the key enabler) — collapse over-tessellated
+      coplanar regions (~170k → a few hundred triangles on parts like the Blank
+      Topper) *before* OCC work. This is the root fix for file size AND speed
+      AND boolean-clean wall fragmentation. FreeCAD's scripted `Mesh.decimate`
+      is inert here; needs pymeshlab/open3d or a numpy coplanar-region
+      retriangulation pass. Proven dependency: with an analytic base a
+      true-radius cut yields ONE clean wall face (8 faces total on the plate);
+      with a 258-facet base the same cut fragments into 76 wall slivers.
 - [ ] Angled holes (arbitrary axis not perpendicular to a flat face)
 - [ ] Sphere fitting
 - [ ] Viewer + deviation heatmap (see docs/VIEWER.md) — also a dev/QA tool

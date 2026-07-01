@@ -72,6 +72,13 @@ class ConversionConfig:
     # tolerance lets OCC bridge that without needing bit-exact vertices.
     sew_tolerance: float = 1e-3
 
+    # Boolean clean-up (fully-closed tier 2) cuts each analytic hole into the
+    # faceted base solid; every cut costs O(base faces), so on very dense meshes
+    # this becomes minutes. Above this triangle count, skip boolean clean-up and
+    # fall through to the plain faceted solid. Raise it if you're willing to wait
+    # (or, better, decimate the mesh first). None disables the guard.
+    boolean_max_base_faces: int | None = 60000
+
     # Explicit path to FreeCAD's bin/ directory (overrides auto-detection).
     freecad_bin: str | None = None
 

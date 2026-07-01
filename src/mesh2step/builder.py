@@ -354,6 +354,170 @@ def build_faceted_solid(vertices: np.ndarray, faces: np.ndarray):
     return shape
 
 
+def _boolean_cut_tool_cylinder(center, axis, radius: float, z0: float, z1: float, Part):
+    """A solid cylinder for use as a boolean cut/fuse tool.
+
+    ``z0``/``z1`` are axial offsets from ``center`` along ``axis``; the cylinder
+    spans exactly that range (``center`` need not be the cylinder's own base).
+    """
+    base = center + z0 * axis
+    height = z1 - z0
+    return Part.makeCylinder(float(radius), float(height), _vec(base), _vec(axis))
+
+
+def _boolean_clean_cylinder(
+    solid, cyl: Cylinder, Part, margin_frac: float = 0.15, margin_abs: float = 0.3
+):
+    """Replace a faceted hole/boss with an exact analytic cylinder via boolean
+    cut + fuse-back, instead of trying to sew mismatched topology.
+
+    1. Cut an *oversized* cylinder over a padded axial range — reliably clears
+       all the faceted rim material regardless of which way the tessellation
+       bulged, leaving a clean bore whose end circles sit on the part's faces.
+    2. Fuse back the material that should be there, over the feature's *exact*
+       axial extent (``axial_min..axial_max``) so its end faces coincide with —
+       and bond to — the real part faces (a padded range would leave a floating
+       tube). For a hole that's the annulus between the true and cut radii; for
+       a boss it's a solid cylinder at the true radius.
+
+    Booleans recompute the intersection geometry, so the analytic tool and the
+    faceted mesh need not share matching topology — unlike sewing.
+    """
+    R = float(cyl.radius)
+    R_cut = R + max(margin_abs, margin_frac * R)
+    axis = np.asarray(cyl.axis_dir, dtype=float)
+    center = np.asarray(cyl.axis_point, dtype=float)
+    zmin, zmax = cyl.axial_min, cyl.axial_max
+    pad = max(zmax - zmin, 1.0)
+
+    cut_tool = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
+    result = solid.cut(cut_tool)
+
+    if cyl.outward:  # boss: solid cylinder at true radius over the exact extent
+        plug = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
+    else:            # hole: annulus [R, R_cut] over the exact extent
+        ring_outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
+        ring_inner = _boolean_cut_tool_cylinder(center, axis, R, zmin, zmax, Part)
+        plug = ring_outer.cut(ring_inner)
+
+    return result.fuse(plug)
+
+
+def _boolean_clean_cone(solid, cone, Part, margin_frac: float = 0.15, margin_abs: float = 0.3):
+    """Same idea as :func:`_boolean_clean_cylinder`, for a countersink cone:
+    oversized cut over a padded range, then fuse back the annular shell between
+    the true cone and the cut cylinder over the cone's exact axial extent."""
+    R = max(float(cone.r_base), float(cone.r_top))
+    R_cut = R + max(margin_abs, margin_frac * R)
+    axis = np.asarray(cone.axis_dir, dtype=float)
+    center = np.asarray(cone.axis_point, dtype=float)
+    zmin, zmax = float(cone.axial_min), float(cone.axial_max)
+    pad = max(zmax - zmin, 1.0)
+
+    cut_tool = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin - pad, zmax + pad, Part)
+    result = solid.cut(cut_tool)
+
+    ring_outer = _boolean_cut_tool_cylinder(center, axis, R_cut, zmin, zmax, Part)
+    true_cone = Part.makeCone(float(cone.r_base), float(cone.r_top), zmax - zmin,
+                              _vec(center + zmin * axis), _vec(axis))
+    plug = ring_outer.cut(true_cone)
+    return result.fuse(plug)
+
+
+def _try_boolean_step(current_solid, fn):
+    """Apply one boolean cleanup step; revert if it breaks solid validity.
+
+    Never lets a single bad feature corrupt or abort the whole result — later
+    steps always see a known-good solid.
+    """
+    try:
+        candidate = fn(current_solid)
+    except Exception:  # noqa: BLE001
+        return current_solid, False
+    solids = getattr(candidate, "Solids", [])
+    if len(solids) == 1 and solids[0].isValid():
+        return candidate, True
+    return current_solid, False
+
+
+def build_boolean_clean_solid(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    config: ConversionConfig,
+    on_progress=None,
+):
+    """Watertight faceted solid + boolean cut/fuse to make holes/cones analytic.
+
+    More robust than sewing analytic and mesh-derived faces together (which
+    needs matching topology): booleans recompute intersection geometry, so they
+    tolerate the faceted mesh and the analytic tool disagreeing about exactly
+    where their surfaces are. Always watertight if the base faceted solid is
+    (each step reverts on failure), with far fewer faces than a fully faceted
+    solid, and true round holes/bosses/countersinks.
+    """
+    import Part  # type: ignore
+
+    def progress(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
+
+    # Each boolean cut costs O(base faces); on very dense meshes that is minutes
+    # per hole, so bail early and let the caller fall through to a plain faceted
+    # solid rather than spending many minutes. (Mesh decimation is the real fix.)
+    limit = config.boolean_max_base_faces
+    if limit is not None and len(faces) > limit:
+        raise RuntimeError(
+            f"mesh too dense for boolean clean-up ({len(faces):,} > {limit:,} "
+            f"triangles); decimate the mesh or raise boolean_max_base_faces")
+
+    progress("Detecting cylinders/holes")
+    cylinders = detect_cylinders(vertices, faces, config)
+    cones = detect_cones(vertices, faces, cylinders, config)
+    progress(f"Found {len(cylinders)} cylinders, {len(cones)} cones")
+
+    progress("Building faceted watertight solid (base)")
+    solid = build_faceted_solid(vertices, faces)
+    base_solids = getattr(solid, "Solids", [])
+    if not (base_solids and base_solids[0].isValid()):
+        raise RuntimeError("base faceted solid is not watertight; cannot boolean-clean")
+
+    cyl_ok = 0
+    for i, cyl in enumerate(cylinders):
+        solid, ok = _try_boolean_step(solid, lambda s, c=cyl: _boolean_clean_cylinder(s, c, Part))
+        cyl_ok += ok
+        if (i + 1) % 10 == 0 or i + 1 == len(cylinders):
+            progress(f"  cylinders cleaned {cyl_ok}/{i + 1} of {len(cylinders)}")
+
+    cone_ok = 0
+    for cone in cones:
+        solid, ok = _try_boolean_step(solid, lambda s, c=cone: _boolean_clean_cone(s, c, Part))
+        cone_ok += ok
+
+    total = len(cylinders) + len(cones)
+    cleaned = cyl_ok + cone_ok
+    progress(f"Boolean clean-up: {cleaned}/{total} features replaced with analytic geometry "
+             f"({total - cleaned} left faceted)")
+
+    solid = _safe_remove_splitter(solid, Part)
+    solids = getattr(solid, "Solids", [])
+    is_solid = bool(solids) and solids[0].isValid()
+
+    stats = {
+        "faces_in": int(len(faces)),
+        "faces_out": len(solid.Faces),
+        "cylinders_detected": len(cylinders),
+        "cylinder_faces": cyl_ok,
+        "cones_detected": len(cones),
+        "cone_faces": cone_ok,
+        "cylinders": [c.as_dict() for c in cylinders],
+        "cones": [c.as_dict() for c in cones],
+        "boolean_cleaned": cleaned,
+        "boolean_failed": total - cleaned,
+        "is_solid": is_solid,
+    }
+    return solid, stats
+
+
 def export_step(shape, out_path: str | Path) -> None:
     """Write ``shape`` to a STEP file."""
     shape.exportStep(str(out_path))

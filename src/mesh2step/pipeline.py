@@ -77,18 +77,9 @@ def convert(
         stats["mesh_prep"] = prep_report
 
     if not config.faceted:
-        # When fully-closed is requested, gap-fill unreconstructed regions with
-        # locally-merged patches in this same pass — keeps analytic holes + a
-        # small file (vs. a full faceted rebuild) while aiming for watertight.
-        import dataclasses
-
-        recon_config = (
-            dataclasses.replace(config, fill_faceted_gaps=True)
-            if config.full_closed else config
-        )
         try:
             shape, built = builder.build_reconstructed_solid(
-                vertices, faces, recon_config, on_progress=progress
+                vertices, faces, config, on_progress=progress
             )
             stats.update(built)  # merge (don't drop mesh_prep / faces_in)
             method = "reconstructed"
@@ -100,12 +91,36 @@ def convert(
         progress("Building faceted solid")
         shape = builder.build_faceted_solid(vertices, faces)
 
-    # Fully-closed toggle: gap-fill above is tier 1; if the result still isn't a
-    # valid watertight solid, fall back to the heavy faceted solid as a last
-    # resort — guaranteed closed, but faceted and large.
+    # Fully-closed toggle: guarantee a watertight solid.
     if config.full_closed and not _is_solid(shape):
-        # Tier 2: watertight faceted solid from the ORIGINAL welded mesh (repair
-        # can break watertightness). Guaranteed closed but faceted and large.
+        # Tier 2: boolean clean-up. Start from the (guaranteed watertight)
+        # faceted solid and cut+fuse each detected hole/boss/cone to its exact
+        # analytic geometry. Robust where sewing failed — booleans recompute the
+        # intersection rather than needing analytic and mesh faces to already
+        # share topology — and gives real round holes, not faceted ones.
+        progress("Fully-closed: boolean clean-up (cut + fuse-back analytic holes)")
+        # Use the ORIGINAL welded mesh — repair can leave it non-watertight,
+        # which breaks the base faceted solid the booleans build on.
+        bverts, bfaces = load_stl(input_path, weld_tol=config.weld_tol)
+        if scale != 1.0:
+            bverts = bverts * scale
+        try:
+            bshape, built2 = builder.build_boolean_clean_solid(
+                bverts, bfaces, config, on_progress=progress
+            )
+            if _is_solid(bshape):
+                shape, method = bshape, "boolean-clean"
+                stats.update(built2)
+            else:
+                stats.setdefault("warnings_extra", []).append(
+                    "Boolean clean-up did not produce a watertight solid.")
+        except Exception as exc:  # noqa: BLE001
+            progress(f"Boolean clean-up failed ({exc})")
+            stats.setdefault("warnings_extra", []).append(f"Boolean clean-up failed: {exc}")
+
+    if config.full_closed and not _is_solid(shape):
+        # Tier 3: plain watertight faceted solid — no analytic holes, but
+        # guaranteed closed. Last resort.
         progress("Fully-closed: building watertight faceted solid (slow on large meshes)")
         fverts, ffaces = load_stl(input_path, weld_tol=config.weld_tol)
         if scale != 1.0:
