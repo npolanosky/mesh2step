@@ -15,9 +15,14 @@ DEFAULT_BOOLEAN_TARGET = 12000
 
 @dataclass
 class ConversionResult:
-    output_path: Path
-    method: str  # "reconstructed" or "faceted"
+    output_path: Path          # primary file written
+    method: str                # e.g. "reconstructed", "boolean-clean", "faceted"
     stats: dict
+    outputs: list | None = None  # all files written (>1 when dual output)
+
+
+def _suffixed(path: Path, suffix: str) -> Path:
+    return path.with_name(path.stem + suffix + path.suffix)
 
 
 def convert(
@@ -116,12 +121,16 @@ def convert(
         progress("Building faceted solid")
         shape = builder.build_faceted_solid(vertices, faces)
 
+    # Keep the clean (possibly open) reconstruction so we can also emit it when
+    # the watertight version can only be produced with artifacts.
+    clean_shape = shape if method == "reconstructed" else None
+    dual = False
+
     # Fully-closed toggle: upgrade the (possibly open) reconstruction to a
     # watertight solid via boolean clean-up. Priority: (1) watertight AND
-    # artifact-free is ideal; (2) watertight with some artifacts is still
-    # preferred over an open shell; (3) an open (but clean) reconstruction is the
-    # last resort. We adopt any watertight boolean result, surfacing any
-    # remaining partial-radius artifacts as a warning so they're not a surprise.
+    # artifact-free is ideal; (2) watertight with some artifacts — still emit it,
+    # but ALSO emit the clean (open) reconstruction so the user has both and can
+    # pick; (3) an open (but clean) reconstruction is the last resort.
     if config.full_closed and not _is_solid(shape):
         progress("Fully-closed: boolean clean-up (cut + fuse-back analytic holes)")
         # Use the ORIGINAL welded mesh (repair can leave it non-watertight, which
@@ -151,13 +160,23 @@ def convert(
                 stats.update(built2)
                 if built2.get("artifact_free", False):
                     progress("Boolean clean-up: watertight + artifact-free — adopted")
+                elif clean_shape is not None:
+                    # Watertight but with artifacts, and we have a clean open
+                    # version too — emit both, named so it's obvious which is which.
+                    dual = True
+                    progress(f"Boolean clean-up: watertight but with artifacts at "
+                             f"Ø~{built2.get('rogue_radii')}; will emit BOTH a "
+                             f"_watertight and a _clean (open) file")
+                    stats.setdefault("warnings_extra", []).append(
+                        "Watertight version has partial-radius artifacts on intersecting "
+                        f"holes (extra cylinder faces near {built2.get('rogue_radii')} mm "
+                        "radius); a separate artifact-free open version is also written.")
                 else:
                     progress(f"Boolean clean-up: watertight (adopted); residual "
-                             f"partial-radius artifacts at Ø~{built2.get('rogue_radii')}")
+                             f"artifacts at Ø~{built2.get('rogue_radii')}")
                     stats.setdefault("warnings_extra", []).append(
                         "Watertight, but some intersecting holes left partial-radius "
-                        f"artifacts (extra cylinder faces near {built2.get('rogue_radii')} mm "
-                        "radius) — trim/heal in CAD if needed.")
+                        f"artifacts near {built2.get('rogue_radii')} mm radius.")
             else:
                 stats.setdefault("warnings_extra", []).append(
                     "Boolean clean-up did not produce a watertight solid; kept the "
@@ -184,10 +203,25 @@ def convert(
 
     _assess_quality(shape, input_dims, method, stats)
 
+    if dual and clean_shape is not None:
+        # Two deliverables, clearly named: watertight (may contain artifacts) and
+        # clean (artifact-free, but open shells — heal on import).
+        wt_path = _suffixed(output_path, "_watertight")
+        clean_path = _suffixed(output_path, "_clean")
+        progress(f"Exporting {wt_path.name} (watertight, has artifacts)")
+        builder.export_step(shape, wt_path)
+        progress(f"Exporting {clean_path.name} (artifact-free, open)")
+        builder.export_step(clean_shape, clean_path)
+        stats["dual_output"] = {"watertight": str(wt_path), "clean": str(clean_path)}
+        progress("Done")
+        return ConversionResult(output_path=wt_path, method=method, stats=stats,
+                                outputs=[wt_path, clean_path])
+
     progress("Exporting STEP")
     builder.export_step(shape, output_path)
     progress("Done")
-    return ConversionResult(output_path=output_path, method=method, stats=stats)
+    return ConversionResult(output_path=output_path, method=method, stats=stats,
+                            outputs=[output_path])
 
 
 def _is_solid(shape) -> bool:

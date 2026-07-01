@@ -99,6 +99,14 @@ so the tool never fails to produce *a* watertight result.
       hole; junction snapped to the cylinder end so it sews watertight)
 - [x] Fast / fully-closed toggle — fully-closed falls back to a watertight
       faceted solid when analytic reconstruction can't close (organic parts)
+- [x] Planar decimation (pymeshlab) — collapses over-tessellated flats while
+      keeping holes/curves dense; shrinks files, speeds up OCC, and can improve
+      hole detection (real part: 38 -> 54 holes found). Auto-enabled by
+      fully-closed; `config.decimate_target_faces` to control.
+- [x] Dual output — when the watertight (boolean) result can only be made with
+      partial-radius artifacts on intersecting holes, the pipeline writes BOTH
+      `<name>_watertight.step` (watertight, may have artifacts) and
+      `<name>_clean.step` (artifact-free, open) so the user picks.
 - [x] Boolean clean-up (fully-closed tier 2) — `builder.build_boolean_clean_solid`.
       Start from the guaranteed-watertight faceted solid and, per detected
       hole/boss/cone, boolean **cut** an oversized analytic cylinder over a

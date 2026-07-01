@@ -71,6 +71,7 @@ def run_convert(job: dict) -> dict:
         "ok": True,
         "mode": "convert",
         "output": str(result.output_path),
+        "outputs": [str(p) for p in (result.outputs or [result.output_path])],
         "method": result.method,
         "stats": result.stats,
     }

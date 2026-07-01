@@ -452,7 +452,15 @@ class App:
         badge = {"good": ("✔  GOOD", OK_GREEN),
                  "warnings": ("⚠  OK — with warnings", "#b45309"),
                  "problems": ("✖  PROBLEMS", ERR_RED)}.get(quality, ("done", MUTED))
-        self._log(f"✔  Wrote {result['output']}", "ok")
+        outputs = result.get("outputs") or [result["output"]]
+        if len(outputs) > 1:
+            self._log(f"✔  Wrote {len(outputs)} files:", "ok")
+            for pth in outputs:
+                tag = ("watertight (may have artifacts)" if "_watertight" in pth
+                       else "artifact-free, open" if "_clean" in pth else "")
+                self._log(f"     • {Path(pth).name}  — {tag}", "ok")
+        else:
+            self._log(f"✔  Wrote {result['output']}", "ok")
         self._log(f"   method={result['method']}  faces {s.get('faces_in')}→{s.get('faces_out')} "
                   f"({s.get('planar_faces',0)} planar, {s.get('cylinder_faces',0)} cyl)", "muted")
         self._log(f"   holes={holes}  bosses={len(cyls)-holes}  diameters(mm)={radii}", "muted")
