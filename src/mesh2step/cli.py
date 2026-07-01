@@ -40,6 +40,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="disable cylindrical hole/boss detection",
     )
     p.add_argument(
+        "--repair", action="store_true",
+        help="repair the mesh first (fix self-intersections, duplicates, normals)",
+    )
+    p.add_argument(
+        "--closed", action="store_true",
+        help="guarantee a watertight solid (faceted fallback if reconstruction can't close)",
+    )
+    p.add_argument(
         "--faceted", action="store_true",
         help="skip reconstruction; emit the classic faceted solid",
     )
@@ -65,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
         dist_tol=args.dist_tol,
         source_units=args.units,
         detect_cylinders=not args.no_cylinders,
+        repair_mesh=args.repair,
+        full_closed=args.closed,
         faceted=args.faceted,
         freecad_bin=args.freecad_bin,
     )

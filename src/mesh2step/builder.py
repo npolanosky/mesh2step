@@ -256,7 +256,12 @@ def build_faceted_solid(vertices: np.ndarray, faces: np.ndarray):
     topo = [(int(a), int(b), int(c)) for a, b, c in faces]
     shape = Part.Shape()
     shape.makeShapeFromMesh((points, topo), 0.1)
-    shape = shape.removeSplitter()
+    try:
+        # Coalesce coplanar facets where possible (fails on some large/degenerate
+        # meshes — it's an optimization, so skip it if OCC objects).
+        shape = shape.removeSplitter()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         solid = Part.Solid(shape)
         if solid.isValid():

@@ -95,11 +95,17 @@ so the tool never fails to produce *a* watertight result.
       recovers holes lost to self-intersections (e.g. intersecting corner holes)
 - [x] Post-conversion quality report (watertight, faceted fallbacks, skipped
       facets, bbox delta, features that failed) surfaced in the GUI
+- [x] Cone/countersink detection + analytic cone-face building (coaxial with a
+      hole; junction snapped to the cylinder end so it sews watertight)
+- [x] Fast / fully-closed toggle — fully-closed falls back to a watertight
+      faceted solid when analytic reconstruction can't close (organic parts)
 - [ ] Effective decimation — FreeCAD's scripted `Mesh.decimate` barely reduces
       these meshes; needs pymeshlab/open3d or a numpy vertex-clustering pass
-- [ ] Intersecting / partial-arc holes (repair recovers some; coverage guard
-      still rejects heavily-clipped walls) and cone/countersink fitting
-- [ ] Cone / sphere RANSAC fitting (`fitting.py`)
+- [ ] Intersecting / partial-arc holes (repair recovers some; the rest need the
+      viewer to diagnose why specific walls don't cluster)
+- [ ] Angled holes (arbitrary axis not perpendicular to a flat face)
+- [ ] Fully-closed WITH analytic holes on organic parts (transition faces)
+- [ ] Sphere fitting
 - [ ] Viewer + deviation heatmap (see docs/VIEWER.md) — also a dev/QA tool
 - [ ] Curved-surface face rebuild (B-spline fallback for free-form regions)
 - [ ] Cylinders whose axis is not perpendicular to the end faces (blind/angled)

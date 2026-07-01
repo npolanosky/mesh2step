@@ -91,6 +91,19 @@ def convert(
         progress("Building faceted solid")
         shape = builder.build_faceted_solid(vertices, faces)
 
+    # Fully-closed toggle: if reconstruction couldn't produce a watertight solid,
+    # fall back to the faceted mesh solid (watertight for a manifold mesh).
+    if config.full_closed and method == "reconstructed":
+        solids = getattr(shape, "Solids", [])
+        if not (solids and solids[0].isValid()):
+            progress("Fully-closed requested: building watertight faceted solid")
+            fshape = builder.build_faceted_solid(vertices, faces)
+            fsolids = getattr(fshape, "Solids", [])
+            if fsolids and fsolids[0].isValid():
+                shape = fshape
+                method = "faceted-closed"
+                stats["closed_fallback"] = True
+
     _assess_quality(shape, input_dims, method, stats)
 
     progress("Exporting STEP")
@@ -117,6 +130,8 @@ def _assess_quality(shape, input_dims, method: str, stats: dict) -> None:
 
     if method == "faceted":
         warnings.append("Surface reconstruction was skipped or failed; faceted solid produced.")
+    if method == "faceted-closed":
+        warnings.append("Fully-closed fallback: watertight faceted solid (holes not analytic).")
     if stats.get("reconstruction_error"):
         warnings.append(f"Reconstruction fell back to faceted: {stats['reconstruction_error']}")
 

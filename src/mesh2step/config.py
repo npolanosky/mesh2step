@@ -55,6 +55,12 @@ class ConversionConfig:
     # Skip reconstruction entirely and emit the classic faceted solid.
     faceted: bool = False
 
+    # Guarantee a watertight solid. If surface reconstruction can't close (common
+    # for organic meshes, where analytic hole edges can't meet the faceted
+    # surrounding surface), fall back to a watertight faceted solid. Slower, and
+    # holes stay faceted on organic parts — but the body is closed.
+    full_closed: bool = False
+
     # Explicit path to FreeCAD's bin/ directory (overrides auto-detection).
     freecad_bin: str | None = None
 

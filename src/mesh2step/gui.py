@@ -101,6 +101,7 @@ class App:
         self.detect_var = tk.BooleanVar(value=True)
         self.faceted_var = tk.BooleanVar(value=False)
         self.repair_var = tk.BooleanVar(value=False)
+        self.closed_var = tk.BooleanVar(value=False)
         self.freecad_var = tk.StringVar(value=find_freecad_python() or "")
         self._longest_mm = None
 
@@ -196,6 +197,9 @@ class App:
         ttk.Checkbutton(c2, text="Repair mesh (fix self-intersections, duplicates, normals) — "
                                  "recovers holes on defective meshes",
                         variable=self.repair_var).pack(anchor="w")
+        ttk.Checkbutton(c2, text="Fully closed (guarantee watertight; slower, faceted holes on "
+                                 "organic parts)",
+                        variable=self.closed_var).pack(anchor="w")
         ttk.Checkbutton(c2, text="Faceted only (skip reconstruction)",
                         variable=self.faceted_var).pack(anchor="w")
 
@@ -302,6 +306,7 @@ class App:
                 "detect_cylinders": self.detect_var.get(),
                 "faceted": self.faceted_var.get(),
                 "repair_mesh": self.repair_var.get(),
+                "full_closed": self.closed_var.get(),
             },
         }
         self._run(job, fc, "convert")
