@@ -41,6 +41,7 @@ class EmbeddedViewer(ttk.Frame):
         self._azim = 0.0
         self._elev = 0.0
         self._zoom = 1.0
+        self._mode = "shaded"                    # shaded | edges | wire
         self._drag = None
         self._resize_job = None
         self._photo = None                       # keep a ref so Tk doesn't GC it
@@ -59,6 +60,12 @@ class EmbeddedViewer(ttk.Frame):
         ttk.Button(bar, text="Reset view", command=self.reset_view).pack(side="left", padx=(8, 0))
         if on_popout is not None:
             ttk.Button(bar, text="Pop out ↗", command=on_popout).pack(side="right")
+        self._mode_var = tk.StringVar(value="Shaded")
+        mode_cb = ttk.Combobox(bar, textvariable=self._mode_var, width=13, state="readonly",
+                               values=["Shaded", "Shaded + edges", "Wireframe"])
+        mode_cb.pack(side="right", padx=(0, 8))
+        mode_cb.bind("<<ComboboxSelected>>", self._on_mode)
+        ttk.Label(bar, text="Display", style="Muted.TLabel").pack(side="right", padx=(0, 4))
 
         # --- render surface ---
         self.canvas = tk.Label(self, bg=BG, fg=MUTED, anchor="center",
@@ -213,6 +220,29 @@ class EmbeddedViewer(ttk.Frame):
         self._zoom = 1.0
         self._render()
 
+    def _on_mode(self, _e=None):
+        self._mode = {"Shaded": "shaded", "Shaded + edges": "edges",
+                      "Wireframe": "wire"}.get(self._mode_var.get(), "shaded")
+        self._built_view = None  # style is set when actors are added → rebuild
+        self._render()
+
+    def _apply_mode(self, kwargs: dict) -> dict:
+        """Overlay the current display mode (shaded / edges / wireframe) onto a
+        mesh's render kwargs. Point-marker clouds are left untouched."""
+        kw = dict(kwargs)
+        if "render_points_as_spheres" in kw:
+            return kw
+        if self._mode == "wire":
+            kw["style"] = "wireframe"
+            kw.setdefault("line_width", 1)
+        elif self._mode == "edges":
+            kw["style"] = "surface"
+            kw["show_edges"] = True
+        else:
+            kw["style"] = "surface"
+            kw["show_edges"] = False
+        return kw
+
     def _ensure_plotter(self, w: int, h: int):
         pv = self._pv()
         if pv is None:
@@ -241,7 +271,7 @@ class EmbeddedViewer(ttk.Frame):
             if self._built_view != self._active:
                 pl.clear()
                 for poly, kwargs in self._scenes[self._active]["meshes"]:
-                    pl.add_mesh(poly, **kwargs)
+                    pl.add_mesh(poly, **self._apply_mode(kwargs))
                 self._built_view = self._active
             # Absolute camera each frame: reset to iso, then apply orbit + zoom.
             pl.camera_position = "iso"
