@@ -22,6 +22,7 @@ from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from .config import UNIT_SCALE_MM
+from .embedded_viewer import EmbeddedViewer
 from .freecad_env import find_freecad_python
 
 try:
@@ -151,10 +152,12 @@ class App:
         # Cap the initial height to the screen (leaving room for the taskbar) so
         # the window — and its scrollbar — are never taller than the display.
         # The body scrolls, so all controls stay reachable at any size/DPI.
+        screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
         init_h = min(1080, max(560, screen_h - 90))
-        root.geometry(f"760x{init_h}")
-        root.minsize(560, 420)
+        init_w = min(1300, max(760, screen_w - 120))
+        root.geometry(f"{init_w}x{init_h}")
+        root.minsize(620, 420)
         root.configure(bg=BG)
         self.q: queue.Queue = queue.Queue()
         self.busy = False
@@ -226,13 +229,17 @@ class App:
         tk.Label(header, text="STL mesh → STEP solid  ·  surface & hole reconstruction",
                  bg=ACCENT, fg="#dbeafe", font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(0, 12))
 
+        # Split the window: scrollable controls on the left, the live 3D preview
+        # on the right (which expands as the window grows — the responsive part).
+        main_pane = ttk.PanedWindow(self.root, orient="horizontal")
+        main_pane.pack(fill="both", expand=True)
+
         # Scrollable body: the frozen app is DPI-aware, so on a scaled Windows
         # display the content is taller than the physical window and the lower
         # controls (Convert, result actions, log) would clip off-screen with no
         # way to reach them. A canvas + scrollbar keeps everything reachable.
-        scroll_area = ttk.Frame(self.root, style="Bg.TFrame")
-        scroll_area.pack(fill="both", expand=True)
-        canvas = tk.Canvas(scroll_area, bg=BG, highlightthickness=0, bd=0)
+        scroll_area = ttk.Frame(main_pane, style="Bg.TFrame")
+        canvas = tk.Canvas(scroll_area, bg=BG, highlightthickness=0, bd=0, width=560)
         vbar = ttk.Scrollbar(scroll_area, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vbar.set)
         vbar.pack(side="right", fill="y")
@@ -335,7 +342,7 @@ class App:
 
         # --- Result actions ---
         arow = ttk.Frame(body, style="Bg.TFrame"); arow.pack(fill="x", pady=(0, 6))
-        self.view_btn = ttk.Button(arow, text="View 3D deviation", state="disabled",
+        self.view_btn = ttk.Button(arow, text="Pop out 3D view ↗", state="disabled",
                                    command=self._view_result)
         self.view_btn.pack(side="left")
         ttk.Button(arow, text="Save log…", command=self._save_log).pack(side="left", padx=6)
@@ -350,6 +357,14 @@ class App:
         self.log.tag_config("ok", foreground="#4ade80")
         self.log.tag_config("err", foreground="#f87171")
         self.log.tag_config("stage", foreground="#93c5fd")
+
+        # Assemble the split: controls (fixed-ish) + preview (grows).
+        self.viewer = EmbeddedViewer(
+            main_pane,
+            freecad_python_getter=lambda: (self.freecad_var.get().strip() or None),
+            on_popout=self._view_result)
+        main_pane.add(scroll_area, weight=0)
+        main_pane.add(self.viewer, weight=1)
 
     # ---- actions ----------------------------------------------------------
     def _browse_input(self):
@@ -556,6 +571,10 @@ class App:
             self._info_labels["Mesh health"].config(text="✔ clean")
         self.status.config(text="Mesh inspected — set units and convert.")
 
+        # Show the input mesh in the preview, marking any defect regions.
+        self.viewer.show_stl(self.input_var.get().strip(),
+                             problem_points=result.get("problem_points"))
+
     def _on_convert(self, result: dict):
         took = time.monotonic() - self._t0
         self._stop()
@@ -612,6 +631,10 @@ class App:
         written = [p for p in outputs if Path(p).exists()]
         self.last_step = written[0] if written else result["output"]
         self.view_btn.config(state="normal" if written else "disabled")
+
+        # Show the result (STEP + deviation heatmap) in the embedded preview.
+        if written and self.last_stl:
+            self.viewer.show_result(self.last_stl, self.last_step)
 
     # ---- result actions ---------------------------------------------------
     def _view_result(self):

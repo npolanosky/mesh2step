@@ -59,8 +59,14 @@ def _run() -> int:
     if "--selfcheck" in sys.argv:
         # Import the whole GUI/viewer stack (the parts most likely to fail to
         # bundle) without opening a window, so the build can verify the app.
+        # pyvista/PIL are imported lazily at runtime, so pull them in explicitly
+        # here — otherwise a missing bundle would only surface when the user
+        # first opens the 3D preview.
+        import mesh2step.embedded_viewer  # noqa: F401
         import mesh2step.gui  # noqa: F401
         import mesh2step.viewer  # noqa: F401
+        import pyvista  # noqa: F401
+        from PIL import Image, ImageTk  # noqa: F401
 
         print("selfcheck ok")
         return 0

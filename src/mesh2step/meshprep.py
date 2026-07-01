@@ -45,6 +45,32 @@ def mesh_health(path: str) -> dict:
     return info
 
 
+def problem_points(path: str, cap: int = 4000) -> list[list[float]]:
+    """3D points marking mesh defects, for highlighting in the preview.
+
+    Currently the self-intersection segments (the defect that most often blocks
+    a watertight solid). Each self-intersection yields its two segment
+    endpoints. Returns up to ``cap`` points; empty if the mesh is clean or the
+    kernel can't report them.
+    """
+    import FreeCAD  # type: ignore  # noqa: F401  (must precede `import Mesh`)
+    import Mesh  # type: ignore
+
+    m = Mesh.Mesh(str(path))
+    pts: list[list[float]] = []
+    try:
+        if m.hasSelfIntersections():
+            for entry in m.getSelfIntersections():
+                # entry = (facetA, facetB, Vector p1, Vector p2)
+                for v in entry[2:4]:
+                    pts.append([float(v.x), float(v.y), float(v.z)])
+                    if len(pts) >= cap:
+                        return pts
+    except Exception:  # noqa: BLE001 - best-effort; never break inspect over this
+        pass
+    return pts
+
+
 def load_and_prepare(
     path: str, config: ConversionConfig
 ) -> tuple[np.ndarray, np.ndarray, dict]:

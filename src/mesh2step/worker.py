@@ -48,6 +48,17 @@ def run_inspect(job: dict) -> dict:
     except Exception as exc:  # noqa: BLE001 - health check is best-effort
         info["health"] = {"error": str(exc)}
 
+    # 3D locations of defects, so the preview can highlight problem regions.
+    # Only bother when health already flags a problem (keeps clean meshes fast).
+    info["problem_points"] = []
+    try:
+        if info.get("health", {}).get("self_intersections"):
+            from .meshprep import problem_points
+
+            info["problem_points"] = problem_points(job["input"])
+    except Exception:  # noqa: BLE001 - best-effort
+        pass
+
     # What the longest dimension becomes under each unit preset, so the GUI can
     # help the user pick the source units.
     longest = float(info["aabb"]["dimensions"][0]) if info["aabb"]["dimensions"] else 0.0
