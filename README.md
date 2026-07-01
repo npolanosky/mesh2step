@@ -33,9 +33,20 @@ reconstructed, so you always get a watertight solid.
 
 - **Unit scaling** — STL is unit-less; tell mesh2step the source units
   (mm / cm / m / inch) and it scales to millimetres (STEP is always mm).
-- **Bounding-box inspection** — on import, reports the axis-aligned and
-  oriented (PCA) bounding-box dimensions so you can sanity-check size and units.
-- **GUI** with drag-and-drop, plus a packaged Windows executable.
+- **Countersink cones** — coaxial cones are fit and rebuilt as analytic cone
+  faces (best-fit half-angle).
+- **Mesh health + repair** — flags non-manifold / self-intersecting meshes on
+  import and can repair them (repair recovers holes lost to those defects).
+- **Quality report** — a good/warnings/problems verdict after conversion
+  (watertight? faceted fallbacks? features that failed? bounding-box delta?).
+- **Bounding-box inspection** — world X/Y/Z extents (axis-aligned) plus the
+  oriented (PCA) box, on import.
+- **Fully-closed toggle** — guarantee a watertight body (faceted fallback when
+  analytic reconstruction can't close, e.g. organic parts).
+- **Deviation viewer** — overlay the STL and STEP with a heatmap of geometric
+  deviation (`mesh2step-view`, or the "View 3D deviation" button).
+- **GUI** with drag-and-drop, live progress + elapsed time + log, plus a
+  packaged Windows executable.
 
 [m2s]: https://github.com/Charles-Garrison/mesh2solid
 [sre]: https://github.com/tsebukas/stl_reverse_engineering
