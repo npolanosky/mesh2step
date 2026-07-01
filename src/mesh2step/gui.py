@@ -527,10 +527,14 @@ class App:
                                  f"watertight={s.get('is_solid')}", fg=badge[1])
         self.status.config(text=f"Done in {took:.1f}s → {Path(result['output']).name}", fg=badge[1])
 
-        # Enable the deviation viewer for this result.
+        # Enable the deviation viewer for this result. Point it at a file that
+        # was actually written: in dual-output mode the base path is not written
+        # (only the suffixed _watertight/_clean files are), so prefer an existing
+        # output over result["output"].
         self.last_stl = self.input_var.get().strip()
-        self.last_step = result["output"]
-        self.view_btn.config(state="normal")
+        written = [p for p in outputs if Path(p).exists()]
+        self.last_step = written[0] if written else result["output"]
+        self.view_btn.config(state="normal" if written else "disabled")
 
     # ---- result actions ---------------------------------------------------
     def _view_result(self):

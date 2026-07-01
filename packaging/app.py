@@ -66,10 +66,11 @@ def _run() -> int:
         return 0
     if "--view" in sys.argv:
         i = sys.argv.index("--view")
-        from mesh2step.viewer import view
+        from mesh2step.viewer import main as viewer_main
 
-        view(sys.argv[i + 1], sys.argv[i + 2])
-        return 0
+        # Pass everything after --view through so the frozen app supports the
+        # same flags as the CLI (--screenshot, --clamp, --deflection, ...).
+        return viewer_main(sys.argv[i + 1:])
     from mesh2step.gui import main
 
     return main()
