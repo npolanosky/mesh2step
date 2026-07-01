@@ -380,6 +380,19 @@ def _clean_cut_eps(radius: float) -> float:
     return min(max(1e-3, 2.5e-3 * radius), 0.05)
 
 
+def _cut_pad(extent: float) -> float:
+    """Axial over-run for a bore cut past the feature's own extent.
+
+    Just enough for the cut to poke through the end faces and separate cleanly,
+    but deliberately small: a large pad (the old ``max(extent, 1)`` — a full
+    feature length) reaches down the axis and swallows anything coaxial, so a
+    wide counterbore would erase the narrow through-hole beneath it (rack-mount
+    screw holes are exactly this). 0.25..0.75 mm clears a face without spanning
+    the millimetre-plus gap to the next coaxial feature.
+    """
+    return min(max(0.25, 0.05 * extent), 0.75)
+
+
 def _wall_vertex_radii(vertices, faces, axis_dir, axis_point, face_indices):
     """Radial distances of a feature's wall-facet vertices from its axis."""
     idx = np.unique(np.asarray(faces)[list(face_indices)].ravel())
@@ -435,7 +448,7 @@ def _boolean_clean_cylinder(solid, cyl: Cylinder, Part, radius: float | None = N
     if cyl.outward:
         fill = _boolean_cut_tool_cylinder(center, axis, R + eps, zmin, zmax, Part)
         return solid.fuse(fill)
-    pad = max(zmax - zmin, 1.0)
+    pad = _cut_pad(zmax - zmin)
     cut = _boolean_cut_tool_cylinder(center, axis, R + eps, zmin - pad, zmax + pad, Part)
     return solid.cut(cut)
 
@@ -452,7 +465,7 @@ def _boolean_clean_cone(solid, cone, Part, **_):
     center = np.asarray(cone.axis_point, dtype=float)
     zmin, zmax = float(cone.axial_min), float(cone.axial_max)
     height = zmax - zmin
-    pad = max(height, 1.0)
+    pad = _cut_pad(height)
     # Nudge the radii out a hair (as for cylinders) so the cut clears the faceted
     # vertices instead of pinching the abutting faces into slivers, then extend
     # along the taper so radii stay ~exact at the real surfaces while the tool
