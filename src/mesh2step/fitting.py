@@ -104,7 +104,7 @@ def _plane_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _candidate_axes(
-    vertices: np.ndarray, normals: np.ndarray, areas: np.ndarray
+    vertices: np.ndarray, normals: np.ndarray, areas: np.ndarray, max_axes: int = 12
 ) -> list[np.ndarray]:
     """Directions to try as cylinder axes.
 
@@ -122,7 +122,7 @@ def _candidate_axes(
         weight[key] = weight.get(key, 0.0) + float(a)
         rep.setdefault(key, n)
     ranked = sorted(weight, key=weight.get, reverse=True)
-    axes = [rep[k] / (np.linalg.norm(rep[k]) or 1.0) for k in ranked[:12]]
+    axes = [rep[k] / (np.linalg.norm(rep[k]) or 1.0) for k in ranked[:max_axes]]
 
     centered = vertices - vertices.mean(axis=0)
     _, eigvecs = np.linalg.eigh(np.cov(centered, rowvar=False))
@@ -245,7 +245,7 @@ def detect_cylinders(
     # works even on organic meshes where nearly every facet is "curved".
     found: list[Cylinder] = []
     claimed: set[int] = set()
-    for axis in _candidate_axes(vertices, normals, areas):
+    for axis in _candidate_axes(vertices, normals, areas, config.max_candidate_axes):
         wall = [
             fi for fi in range(len(faces))
             if fi not in claimed and abs(float(normals[fi] @ axis)) < 0.25

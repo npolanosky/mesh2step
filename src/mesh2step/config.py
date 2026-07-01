@@ -69,10 +69,17 @@ class ConversionConfig:
     # Minimum facets a curved region must have to attempt a cylinder fit.
     min_cylinder_facets: int = 8
 
+    # How many flat-face-normal directions to try as cylinder axes (by area).
+    # More axes catch holes drilled perpendicular to small faces (e.g. pocket
+    # floors) at the cost of some speed.
+    max_candidate_axes: int = 12
+
     # Minimum fraction of the full circle the facets must cover (0..1). Holes
     # and bosses wrap the whole way around (~1.0); this rejects shallow arcs and
     # slivers that algebraically fit a huge circle (the classic false positive).
-    min_cylinder_coverage: float = 0.5
+    # Set below 0.5 to admit partial arcs (holes clipped by intersecting holes);
+    # the radius + centroid-radius + RMS guards keep false positives out.
+    min_cylinder_coverage: float = 0.33
 
     # Reject fitted radii larger than this (mm). None -> the mesh's largest
     # bounding-box dimension. A full cylinder of radius r spans 2r across, so
