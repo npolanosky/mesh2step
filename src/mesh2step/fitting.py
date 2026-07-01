@@ -164,6 +164,93 @@ def _candidate_axes(
     return unique
 
 
+def _region_axis(
+    component: list[int], comp_set: set[int], normals: np.ndarray,
+    neighbors: list[list[int]], config: ConversionConfig,
+) -> np.ndarray | None:
+    """Estimate an isolated curved region's axis from its own facet normals.
+
+    On a cylinder/cone wall the surface normals are (near) perpendicular to the
+    axis and rotate around it, so the cross product of two *adjacent* normals is
+    parallel to the axis. Summing their outer products, the axis is therefore
+    the largest-eigenvalue eigenvector, and it must clearly dominate the other
+    two (else the region is a sphere/blob whose normals — and their cross
+    products — point every which way, with no single axis). Used to seed
+    candidate axes for holes drilled at an arbitrary angle.
+    """
+    # Gate on the *angle* between normals, not the cross-product magnitude: a
+    # finely tessellated cylinder steps only a couple of degrees per facet, so a
+    # magnitude cut-off would discard every real curvature step. The smooth band
+    # (coplanar tol .. curve_max) keeps genuine curvature and drops both flat
+    # noise and sharp feature edges; the tiny cross product is then normalised.
+    cos_flat = config.angle_tol_cos
+    cos_sharp = float(np.cos(np.radians(config.curve_max_deg)))
+    M = np.zeros((3, 3))
+    count = 0
+    for i in component:
+        ni = normals[i]
+        for j in neighbors[i]:
+            if j > i and j in comp_set:
+                d = float(ni @ normals[j])
+                if cos_sharp < d < cos_flat:  # smooth curvature step
+                    c = np.cross(ni, normals[j])
+                    nc = float(np.linalg.norm(c))
+                    if nc > 1e-9:
+                        c /= nc
+                        M += np.outer(c, c)
+                        count += 1
+    if count < 3:
+        return None
+    eigvals, eigvecs = np.linalg.eigh(M)  # ascending
+    # The axis direction must dominate: the second-largest eigenvalue should be
+    # well below the largest, otherwise the cross products fill a plane/sphere.
+    if eigvals[1] > 0.35 * eigvals[2] + 1e-12:
+        return None
+    axis = eigvecs[:, 2]
+    return axis / (np.linalg.norm(axis) or 1.0)
+
+
+def _angled_axis_candidates(
+    vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray,
+    neighbors: list[list[int]], config: ConversionConfig,
+) -> list[np.ndarray]:
+    """Extra axes from isolated curved regions (holes at arbitrary angles).
+
+    A facet is 'curved' when at least one edge-neighbour's normal differs by a
+    small-to-moderate angle (a smooth surface transition) rather than being
+    coplanar (same flat face) or meeting at a sharp feature edge (a flat-face
+    boundary). This distinguishes a hole wall from the flat faces around it
+    regardless of how few facets each flat face has. The curved facets are then
+    grouped into connected regions and each contributes its estimated axis;
+    _region_axis returns None for regions with no single axis (organic blobs).
+    """
+    cos_flat = config.angle_tol_cos
+    cos_sharp = float(np.cos(np.radians(config.curve_max_deg)))
+    curved: list[int] = []
+    for i in range(len(faces)):
+        ni = normals[i]
+        for j in neighbors[i]:
+            d = float(ni @ normals[j])
+            if cos_sharp < d < cos_flat:  # smooth curvature, not flat/sharp
+                curved.append(i)
+                break
+    if not curved:
+        return []
+
+    # Each connected curved region contributes its axis. _region_axis returns
+    # None for regions with no single axis (a free-form/organic blob), so no
+    # fraction gate is needed — a plate dominated by one big angled hole is fine.
+    axes: list[np.ndarray] = []
+    curved_set = set(curved)
+    for comp in _connected_components(curved, neighbors):
+        if len(comp) < config.min_cylinder_facets:
+            continue
+        ax = _region_axis(comp, curved_set, normals, neighbors, config)
+        if ax is not None:
+            axes.append(ax)
+    return axes
+
+
 def _angular_coverage(
     centroids: np.ndarray, axis: np.ndarray, center: np.ndarray, bins: int = 24
 ) -> float:
@@ -272,9 +359,19 @@ def detect_cylinders(
     # connectivity, and fit + validate a circle per surface. Restricting to
     # perpendicular facets keeps flat faces from bridging unrelated holes, and
     # works even on organic meshes where nearly every facet is "curved".
+    axes = _candidate_axes(vertices, normals, areas, config.max_candidate_axes)
+    if config.detect_angled:
+        axes += _angled_axis_candidates(vertices, faces, normals, neighbors, config)
+    # De-duplicate up to sign so an angled axis that coincides with a flat-normal
+    # one isn't fitted twice.
+    unique_axes: list[np.ndarray] = []
+    for ax in axes:
+        if not any(abs(float(ax @ u)) > 0.999 for u in unique_axes):
+            unique_axes.append(ax)
+
     found: list[Cylinder] = []
     claimed: set[int] = set()
-    for axis in _candidate_axes(vertices, normals, areas, config.max_candidate_axes):
+    for axis in unique_axes:
         wall = [
             fi for fi in range(len(faces))
             if fi not in claimed and abs(float(normals[fi] @ axis)) < 0.25

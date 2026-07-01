@@ -98,6 +98,16 @@ class ConversionConfig:
     # floors) at the cost of some speed.
     max_candidate_axes: int = 12
 
+    # Also derive candidate axes from isolated curved regions, so holes drilled
+    # at an arbitrary angle (axis not perpendicular to any flat face) are found.
+    detect_angled: bool = True
+
+    # A facet is on a curved surface if an edge-neighbour's normal differs by
+    # more than the coplanar tolerance but less than this (a smooth transition);
+    # a larger difference is a sharp feature edge (a flat-face boundary), not
+    # curvature. Separates hole walls from flat faces regardless of facet count.
+    curve_max_deg: float = 50.0
+
     # Minimum fraction of the full circle the facets must cover (0..1). Holes
     # and bosses wrap the whole way around (~1.0); this rejects shallow arcs and
     # slivers that algebraically fit a huge circle (the classic false positive).
