@@ -1,52 +1,51 @@
 """In-window 3D preview panel (STL / STEP / deviation heatmap).
 
-Embeds a 3D view directly in the tkinter GUI. Rendering is done *off-screen*
-with pyvista (the same proven path as the standalone viewer) and the resulting
-frame is shown in a tkinter label — this avoids the fragility of hosting a live
-VTK/Tk render window inside a frozen app while still giving orbit/zoom and
-instant view toggling.
+Embeds a **real, GPU-accelerated VTK render window** directly in the tkinter
+GUI by reparenting it into a Tk frame (``vtkRenderWindow.SetParentInfo`` with the
+frame's native window id). This gives true trackball interaction (rotate/zoom/
+pan), correct lighting and edges — the same engine as the standalone viewer,
+just docked — instead of streaming off-screen screenshots (which were slow and
+unlit). The PyPI VTK build ships no working Tk render widget, so reparenting is
+the route to native interaction.
 
 States it shows through a conversion:
-  * the input STL as soon as a file is selected (with defect regions marked red)
+  * the input STL as soon as a file is selected (defect regions marked red)
   * the output STEP once the conversion finishes
   * the STEP coloured by its deviation from the STL (heatmap)
 
-All heavy data prep (STEP tessellation via FreeCAD, deviation) runs on a worker
-thread; only the actual rendering touches VTK, always on the Tk main thread.
+Reparenting relies on a native window id, so it is Windows-only; elsewhere the
+panel shows a hint and the "Pop out" button opens the standalone window.
 """
 
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
 
-BG = "#0f172a"
+BG = (0.06, 0.09, 0.16)      # matches the app's dark panel
 FG = "#e2e8f0"
 MUTED = "#94a3b8"
+
+
+def _hex_rgb(h: str):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
 
 
 class EmbeddedViewer(ttk.Frame):
     def __init__(self, parent, freecad_python_getter=None, on_popout=None):
         super().__init__(parent, style="Bg.TFrame")
         self._get_fc = freecad_python_getter or (lambda: None)
-        self._on_popout = on_popout
 
-        self._scenes: dict[str, dict] = {}      # name -> {"meshes": [(poly, kwargs)], "stats": {}}
+        self._scenes: dict[str, list] = {}       # name -> list of vtk actors
         self._active: str | None = None
-        self._plotter = None
-        self._plotter_size: tuple[int, int] | None = None
-        self._built_view: str | None = None
-        self._azim = 0.0
-        self._elev = 0.0
-        self._zoom = 1.0
-        self._mode = "shaded"                    # shaded | edges | wire
-        self._drag = None
-        self._resize_job = None
-        self._photo = None                       # keep a ref so Tk doesn't GC it
-        self._available = None                   # lazily probed pyvista availability
-        self._q: queue.Queue = queue.Queue()     # worker-thread -> main-thread callables
+        self._mode = "shaded"                     # shaded | edges | wire
+        self._q: queue.Queue = queue.Queue()
+        self._vtk = None                          # (renwin, renderer, interactor) once created
+        self._vtk_failed = False
 
         # --- toolbar ---
         bar = ttk.Frame(self, style="Bg.TFrame")
@@ -67,269 +66,239 @@ class EmbeddedViewer(ttk.Frame):
         mode_cb.bind("<<ComboboxSelected>>", self._on_mode)
         ttk.Label(bar, text="Display", style="Muted.TLabel").pack(side="right", padx=(0, 4))
 
-        # --- render surface ---
-        self.canvas = tk.Label(self, bg=BG, fg=MUTED, anchor="center",
-                               text="3D preview\n\nselect an STL to begin",
-                               font=("Segoe UI", 11), justify="center")
-        self.canvas.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        # --- native render surface (VTK reparents into this frame) ---
+        self._surface = tk.Frame(self, bg="#0f172a", width=640, height=480)
+        self._surface.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self._surface.bind("<Configure>", self._on_surface_configure)
 
-        # --- stats / hint line ---
-        self.info = tk.Label(self, text="", bg=BG, fg=MUTED, anchor="w",
-                             font=("Consolas", 9))
-        self.info.pack(fill="x", padx=8, pady=(0, 6))
-
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<MouseWheel>", self._on_wheel)
-        self.canvas.bind("<Configure>", self._on_resize)
+        self._hint = tk.Label(self, text="Select an STL to preview", bg="#0f172a", fg=MUTED,
+                              anchor="w", font=("Consolas", 9))
+        self._hint.pack(fill="x", padx=8, pady=(0, 6))
 
         self.after(60, self._poll)
 
+    # ---- worker-thread handoff -------------------------------------------
     def _poll(self):
-        """Run callables handed over from worker threads, on the main thread."""
         try:
             while True:
                 fn = self._q.get_nowait()
                 try:
                     fn()
-                except Exception:  # noqa: BLE001 - one bad update mustn't stop the poller
+                except Exception:  # noqa: BLE001
                     pass
         except queue.Empty:
             pass
         self.after(60, self._poll)
 
-    # ---- availability -----------------------------------------------------
-    def _pv(self):
-        """Import pyvista lazily; return the module or None if unavailable."""
-        if self._available is None:
-            try:
-                import pyvista as pv  # noqa: F401
-                self._available = True
-            except Exception:  # noqa: BLE001
-                self._available = False
-        if not self._available:
+    # ---- VTK setup --------------------------------------------------------
+    def _ensure_vtk(self):
+        """Create the embedded GPU render window on first use. Returns it or None."""
+        if self._vtk is not None or self._vtk_failed:
+            return self._vtk
+        if sys.platform != "win32":
+            self._vtk_failed = True
+            self._hint.config(text="Interactive preview is Windows-only — use Pop out ↗.")
             return None
-        import pyvista as pv
-        return pv
+        w = self._surface.winfo_width()
+        h = self._surface.winfo_height()
+        if w <= 1 or h <= 1:
+            return None  # not realised yet; caller retries after <Configure>
+        try:
+            import vtkmodules.all as vtk
+
+            renwin = vtk.vtkRenderWindow()
+            renwin.SetParentInfo(str(self._surface.winfo_id()))
+            renwin.SetSize(w, h)
+            ren = vtk.vtkRenderer()
+            ren.SetBackground(*BG)
+            renwin.AddRenderer(ren)
+            vtk.vtkLightKit().AddLightsToRenderer(ren)   # pleasant 3-point-ish lighting
+            iren = vtk.vtkRenderWindowInteractor()
+            iren.SetRenderWindow(renwin)
+            iren.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
+            iren.Initialize()
+            self._vtk = (renwin, ren, iren)
+            return self._vtk
+        except Exception as exc:  # noqa: BLE001
+            self._vtk_failed = True
+            self._hint.config(text=f"3D preview unavailable ({exc}); use Pop out ↗.")
+            return None
+
+    def _on_surface_configure(self, _e=None):
+        v = self._ensure_vtk()
+        if v is not None:
+            renwin, _ren, _iren = v
+            renwin.SetSize(max(self._surface.winfo_width(), 1),
+                           max(self._surface.winfo_height(), 1))
+            renwin.Render()
 
     # ---- public API -------------------------------------------------------
     def clear(self):
         self._scenes.clear()
         self._active = None
-        self._built_view = None
         for b in self._btns.values():
             b.config(state="disabled")
-        self._photo = None
-        self.canvas.config(image="", text="3D preview\n\nselect an STL to begin")
-        self.info.config(text="")
-
-    def show_message(self, text: str):
-        self.canvas.config(image="", text=text)
-        self._photo = None
+        if self._vtk:
+            self._vtk[1].RemoveAllViewProps()
+            self._vtk[0].Render()
+        self._hint.config(text="Select an STL to preview")
 
     def show_stl(self, stl_path: str, problem_points=None):
-        """Show the input mesh immediately (data load is cheap, done inline)."""
-        pv = self._pv()
-        if pv is None:
-            self.show_message("3D preview unavailable\n(pyvista not installed)")
-            return
-        self.show_message("Loading mesh…")
-        self.update_idletasks()
+        self._hint.config(text="Loading mesh…")
 
         def work():
             try:
+                import pyvista as pv
                 mesh = pv.read(stl_path)
-                meshes = [(mesh, dict(color="#cbd5e1", opacity=1.0,
-                                      smooth_shading=True, show_edges=False))]
+                specs = [dict(poly=mesh, color="#cbd5e1")]
                 npts = 0
                 if problem_points:
                     import numpy as np
                     pts = np.asarray(problem_points, dtype=float)
                     if pts.size:
                         npts = len(pts)
-                        meshes.append((pv.PolyData(pts),
-                                       dict(color="#ef4444", render_points_as_spheres=True,
-                                            point_size=10.0)))
-                self._scenes["stl"] = {
-                    "meshes": meshes,
-                    "hint": (f"input STL — {mesh.n_points:,} pts, {mesh.n_cells:,} tris"
-                             + (f"   ⚠ {npts} defect markers" if npts else "")),
-                }
-                self._q.put(lambda: self._on_scene_ready("stl"))
+                        specs.append(dict(poly=pv.PolyData(pts), color="#ef4444", points=True))
+                hint = (f"input STL — {mesh.n_points:,} pts, {mesh.n_cells:,} tris"
+                        + (f"   ⚠ {npts} defect markers" if npts else ""))
+                self._q.put(lambda: self._install("stl", specs, hint, reset=True))
             except Exception as exc:  # noqa: BLE001
-                self._q.put(lambda e=exc: self.show_message(f"Could not load mesh:\n{e}"))
+                self._q.put(lambda e=exc: self._hint.config(text=f"Could not load mesh: {e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
     def show_result(self, stl_path: str, step_path: str):
-        """Tessellate the STEP + compute deviation on a thread, then show it."""
-        pv = self._pv()
-        if pv is None:
-            return
         fc = self._get_fc()
-        self.info.config(text="Building STEP preview…")
+        self._hint.config(text="Building STEP preview…")
 
         def work():
             try:
-                from .viewer import build_scene  # reuse the proven tessellate+deviation path
+                from .viewer import build_scene
                 stl_poly, step_poly, stats = build_scene(stl_path, step_path, 0.1, fc)
                 hi = max(stats["p95"], stats["max"] * 0.5, 1e-6)
-                self._scenes["step"] = {
-                    "meshes": [(step_poly, dict(color="#7dd3fc", smooth_shading=True))],
-                    "hint": f"output STEP — {step_poly.n_cells:,} tris",
-                }
-                self._scenes["heatmap"] = {
-                    "meshes": [
-                        (stl_poly, dict(color="#334155", opacity=0.12)),
-                        (step_poly, dict(scalars="deviation", cmap="jet", clim=[0.0, hi],
-                                         scalar_bar_args={"title": "dev (mm)"})),
-                    ],
-                    "hint": (f"deviation (mm)  max={stats['max']:.3f}  rms={stats['rms']:.3f}  "
-                             f"p95={stats['p95']:.3f}  mean={stats['mean']:.3f}"),
-                }
-                self._q.put(lambda: self._on_result_ready())
+                step_specs = [dict(poly=step_poly, color="#7dd3fc")]
+                heat_specs = [dict(poly=stl_poly, color="#334155", opacity=0.12),
+                              dict(poly=step_poly, scalars="deviation", clim=(0.0, hi))]
+                step_hint = f"output STEP — {step_poly.n_cells:,} tris"
+                heat_hint = (f"deviation (mm)  max={stats['max']:.3f}  rms={stats['rms']:.3f}  "
+                             f"p95={stats['p95']:.3f}  mean={stats['mean']:.3f}")
+
+                def apply():
+                    self._install("step", step_specs, step_hint, reset=False, activate=False)
+                    self._install("heatmap", heat_specs, heat_hint, reset=False, activate=True)
+                self._q.put(apply)
             except Exception as exc:  # noqa: BLE001
-                self._q.put(lambda e=exc: self.info.config(text=f"STEP preview failed: {e}"))
+                self._q.put(lambda e=exc: self._hint.config(text=f"STEP preview failed: {e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- internal ---------------------------------------------------------
-    def _on_scene_ready(self, name: str):
-        self._btns[name].config(state="normal")
-        # Reset orientation for a fresh part, then show it.
-        self._azim = self._elev = 0.0
-        self._zoom = 1.0
-        self.set_view(name)
+    # ---- scene assembly (main thread) ------------------------------------
+    def _make_actor(self, spec):
+        import vtkmodules.all as vtk
 
-    def _on_result_ready(self):
-        for name in ("step", "heatmap"):
-            if name in self._scenes:
-                self._btns[name].config(state="normal")
-        self.set_view("heatmap")
+        poly = spec["poly"]
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        scalars = spec.get("scalars")
+        if scalars is not None:
+            poly.GetPointData().SetActiveScalars(scalars)
+            lut = vtk.vtkLookupTable()
+            lut.SetHueRange(0.667, 0.0)   # blue (low) -> red (high)
+            lut.SetNumberOfTableValues(256)
+            lut.Build()
+            mapper.SetLookupTable(lut)
+            mapper.SetScalarRange(*spec.get("clim", (0.0, 1.0)))
+            mapper.SetScalarModeToUsePointData()
+            mapper.ScalarVisibilityOn()
+        else:
+            mapper.ScalarVisibilityOff()
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        pr = actor.GetProperty()
+        if spec.get("color"):
+            pr.SetColor(*_hex_rgb(spec["color"]))
+        pr.SetOpacity(spec.get("opacity", 1.0))
+        if spec.get("points"):
+            pr.SetRepresentationToPoints()
+            pr.SetPointSize(9)
+            try:
+                pr.RenderPointsAsSpheresOn()
+            except Exception:  # noqa: BLE001
+                pass
+            actor._is_points = True  # tag so display-mode skips it
+        return actor
 
-    def set_view(self, name: str):
-        if name not in self._scenes:
+    def _install(self, name, specs, hint, reset, activate=True):
+        v = self._ensure_vtk()
+        if v is None:
+            # No GPU surface yet; stash specs to build on activation/configure.
+            self._scenes[name] = specs
+            self._btns[name].config(state="normal")
+            if activate:
+                self._active = name
+                self._hint.config(text=hint + "   (preview initialising…)")
+                self.after(120, lambda: self.set_view(name))
             return
+        actors = [self._make_actor(s) for s in specs]
+        self._scenes[name] = actors
+        self._scene_hint = getattr(self, "_scene_hint", {})
+        self._scene_hint[name] = hint
+        self._btns[name].config(state="normal")
+        if activate:
+            self._show_actors(name, reset=reset)
+
+    def _show_actors(self, name, reset):
+        v = self._ensure_vtk()
+        if v is None:
+            return
+        renwin, ren, _iren = v
+        actors = self._scenes.get(name)
+        if actors and isinstance(actors[0], dict):   # stashed specs -> build now
+            actors = [self._make_actor(s) for s in actors]
+            self._scenes[name] = actors
+        if not actors:
+            return
+        ren.RemoveAllViewProps()
+        for a in actors:
+            self._apply_mode_actor(a)
+            ren.AddActor(a)
+        if reset:
+            ren.ResetCamera()
         self._active = name
         for n, b in self._btns.items():
             b.state(["pressed"] if n == name else ["!pressed"])
-        self._render()
+        self._hint.config(text=getattr(self, "_scene_hint", {}).get(name, ""))
+        renwin.Render()
+
+    # ---- view controls ----------------------------------------------------
+    def set_view(self, name: str):
+        if name in self._scenes:
+            self._show_actors(name, reset=False)
 
     def reset_view(self):
-        self._azim = self._elev = 0.0
-        self._zoom = 1.0
-        self._render()
+        v = self._ensure_vtk()
+        if v is not None:
+            v[1].ResetCamera()
+            v[0].Render()
 
     def _on_mode(self, _e=None):
         self._mode = {"Shaded": "shaded", "Shaded + edges": "edges",
                       "Wireframe": "wire"}.get(self._mode_var.get(), "shaded")
-        self._built_view = None  # style is set when actors are added → rebuild
-        self._render()
+        v = self._ensure_vtk()
+        if v is None or self._active is None:
+            return
+        for a in self._scenes.get(self._active, []):
+            if not isinstance(a, dict):
+                self._apply_mode_actor(a)
+        v[0].Render()
 
-    def _apply_mode(self, kwargs: dict) -> dict:
-        """Overlay the current display mode (shaded / edges / wireframe) onto a
-        mesh's render kwargs. Point-marker clouds are left untouched."""
-        kw = dict(kwargs)
-        if "render_points_as_spheres" in kw:
-            return kw
+    def _apply_mode_actor(self, actor):
+        if getattr(actor, "_is_points", False):
+            return
+        pr = actor.GetProperty()
         if self._mode == "wire":
-            kw["style"] = "wireframe"
-            kw.setdefault("line_width", 1)
-        elif self._mode == "edges":
-            kw["style"] = "surface"
-            kw["show_edges"] = True
+            pr.SetRepresentationToWireframe()
+            pr.SetLineWidth(1)
         else:
-            kw["style"] = "surface"
-            kw["show_edges"] = False
-        return kw
-
-    def _ensure_plotter(self, w: int, h: int):
-        pv = self._pv()
-        if pv is None:
-            return None
-        if self._plotter is None or self._plotter_size != (w, h):
-            if self._plotter is not None:
-                try:
-                    self._plotter.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            self._plotter = pv.Plotter(off_screen=True, window_size=[w, h])
-            self._plotter.set_background(BG)
-            self._plotter_size = (w, h)
-            self._built_view = None
-        return self._plotter
-
-    def _render(self):
-        if self._active is None:
-            return
-        w = max(self.canvas.winfo_width(), 64)
-        h = max(self.canvas.winfo_height(), 64)
-        pl = self._ensure_plotter(w, h)
-        if pl is None:
-            return
-        try:
-            if self._built_view != self._active:
-                pl.clear()
-                for poly, kwargs in self._scenes[self._active]["meshes"]:
-                    pl.add_mesh(poly, **self._apply_mode(kwargs))
-                self._built_view = self._active
-            # Absolute camera each frame: reset to iso, then apply orbit + zoom.
-            pl.camera_position = "iso"
-            cam = pl.camera
-            cam.Azimuth(self._azim)
-            cam.Elevation(self._elev)
-            cam.OrthogonalizeViewUp()
-            cam.Zoom(self._zoom)
-            pl.renderer.ResetCameraClippingRange()
-            img = pl.screenshot(return_img=True)
-            self._show_array(img)
-            self.info.config(text=self._scenes[self._active].get("hint", ""))
-        except Exception as exc:  # noqa: BLE001
-            self.show_message(f"render error:\n{exc}")
-
-    def _show_array(self, img):
-        try:
-            from PIL import Image, ImageTk
-            photo = ImageTk.PhotoImage(Image.fromarray(img))
-        except Exception:  # noqa: BLE001 - PIL absent: hand Tk a PPM it can read natively
-            photo = self._array_to_ppm_photo(img)
-        self._photo = photo  # keep a ref so Tk doesn't garbage-collect the image
-        self.canvas.config(image=photo, text="")
-
-    @staticmethod
-    def _array_to_ppm_photo(img):
-        import os
-        import tempfile
-        h, w = img.shape[:2]
-        path = os.path.join(tempfile.gettempdir(), "mesh2step_preview.ppm")
-        with open(path, "wb") as fh:
-            fh.write(b"P6\n%d %d\n255\n" % (w, h))
-            fh.write(img[:, :, :3].astype("uint8").tobytes())
-        return tk.PhotoImage(file=path)
-
-    # ---- interaction ------------------------------------------------------
-    def _on_press(self, e):
-        self._drag = (e.x, e.y)
-
-    def _on_drag(self, e):
-        if self._drag is None or self._active is None:
-            return
-        dx = e.x - self._drag[0]
-        dy = e.y - self._drag[1]
-        self._drag = (e.x, e.y)
-        self._azim -= dx * 0.5
-        self._elev = max(-89.0, min(89.0, self._elev + dy * 0.5))
-        self._render()
-
-    def _on_wheel(self, e):
-        if self._active is None:
-            return
-        self._zoom *= 1.1 if e.delta > 0 else (1 / 1.1)
-        self._zoom = max(0.2, min(8.0, self._zoom))
-        self._render()
-
-    def _on_resize(self, _e):
-        # Debounce: re-render shortly after the user stops dragging the border.
-        if self._resize_job is not None:
-            self.after_cancel(self._resize_job)
-        self._resize_job = self.after(150, self._render)
+            pr.SetRepresentationToSurface()
+            pr.SetEdgeVisibility(1 if self._mode == "edges" else 0)
+            pr.SetEdgeColor(0.20, 0.24, 0.30)

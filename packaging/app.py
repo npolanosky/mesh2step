@@ -66,10 +66,30 @@ def _run() -> int:
         import mesh2step.gui  # noqa: F401
         import mesh2step.viewer  # noqa: F401
         import pyvista  # noqa: F401
+        import vtkmodules.all  # noqa: F401  (the embedded viewer needs the full VTK)
         from PIL import Image, ImageTk  # noqa: F401
 
         print("selfcheck ok")
         return 0
+    if "--vtkcheck" in sys.argv:
+        # Actually create the embedded GPU render window (needs a display) so the
+        # build can confirm the in-window 3D preview works when frozen.
+        import tkinter as tk
+        from tkinter import ttk
+
+        from mesh2step.embedded_viewer import EmbeddedViewer
+
+        root = tk.Tk()
+        root.geometry("420x320")
+        ttk.Style().configure("Bg.TFrame", background="#0f172a")
+        viewer = EmbeddedViewer(root)
+        viewer.pack(fill="both", expand=True)
+        for _ in range(40):
+            root.update()
+        ok = viewer._vtk is not None
+        print("vtkcheck ok" if ok else f"vtkcheck FAILED (failed={viewer._vtk_failed})")
+        root.destroy()
+        return 0 if ok else 1
     if "--view" in sys.argv:
         i = sys.argv.index("--view")
         from mesh2step.viewer import main as viewer_main
