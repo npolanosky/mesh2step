@@ -76,7 +76,23 @@ def run_convert(job: dict) -> dict:
     }
 
 
-_HANDLERS = {"inspect": run_inspect, "convert": run_convert}
+def run_tessellate(job: dict) -> dict:
+    """Tessellate a STEP/BREP shape to a mesh file (for the deviation viewer)."""
+    import FreeCAD  # type: ignore  # noqa: F401
+    import Mesh  # type: ignore
+    import Part  # type: ignore
+
+    shape = Part.Shape()
+    shape.read(job["input"])
+    pts, tris = shape.tessellate(float(job.get("deflection", 0.1)))
+    mesh = Mesh.Mesh()
+    mesh.addFacets([(pts[a], pts[b], pts[c]) for a, b, c in tris])
+    mesh.write(job["output"])
+    return {"ok": True, "mode": "tessellate", "output": job["output"],
+            "facets": int(mesh.CountFacets)}
+
+
+_HANDLERS = {"inspect": run_inspect, "convert": run_convert, "tessellate": run_tessellate}
 
 
 def run_job(job: dict) -> dict:

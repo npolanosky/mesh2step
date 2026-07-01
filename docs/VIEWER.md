@@ -1,10 +1,28 @@
-# Viewer & deviation heatmap (planned, parallelizable)
+# Viewer & deviation heatmap (IMPLEMENTED — `mesh2step.viewer`)
 
 A 3D viewer that shows the **input STL** and overlays the **output STEP**, with a
 **deviation heatmap** colouring the STEP by its geometric distance from the mesh.
-This is both a user feature ("see the result quality") and a **development/QA
-tool** — it would directly show *which* holes/faces failed or drifted (e.g. the
-intersecting corner holes), so it is worth building in parallel with the core.
+Both a user feature ("see the result quality") and a **development/QA tool** — it
+shows *which* holes/faces failed or drifted.
+
+## Usage (implemented)
+
+```bash
+pip install -e ".[viewer]"          # pyvista
+mesh2step-view input.stl output.step                 # interactive window
+mesh2step-view input.stl output.step --screenshot dev.png   # off-screen PNG
+```
+
+`viewer.build_scene()` returns `(stl_poly, step_poly, stats)` with per-point
+deviation and `{max, rms, p95, mean}` (mm) — usable headlessly for automated QA.
+On the real Blank Topper part it reports max ≈ 0.82 mm with ~2.4% of STEP points
+deviating, pinpointing the imperfect regions.
+
+Architecture: FreeCAD's Python tessellates the STEP (worker `tessellate` mode);
+pyvista reads both meshes and computes point-to-surface distance
+(`compute_implicit_distance`) for the heatmap.
+
+## Original design notes
 
 ## Why it helps development
 

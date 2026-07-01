@@ -96,13 +96,22 @@ def convert(
     if config.full_closed and method == "reconstructed":
         solids = getattr(shape, "Solids", [])
         if not (solids and solids[0].isValid()):
-            progress("Fully-closed requested: building watertight faceted solid")
-            fshape = builder.build_faceted_solid(vertices, faces)
+            progress("Fully-closed: building watertight faceted solid (slow on large meshes)")
+            # Build from the ORIGINAL welded mesh — repair (fixSelfIntersections
+            # etc.) can leave the mesh non-watertight, which breaks the faceted
+            # solid; the raw manifold mesh yields a valid closed solid.
+            fverts, ffaces = load_stl(input_path, weld_tol=config.weld_tol)
+            if scale != 1.0:
+                fverts = fverts * scale
+            fshape = builder.build_faceted_solid(fverts, ffaces)
             fsolids = getattr(fshape, "Solids", [])
             if fsolids and fsolids[0].isValid():
                 shape = fshape
                 method = "faceted-closed"
                 stats["closed_fallback"] = True
+            else:
+                stats.setdefault("warnings_extra", []).append(
+                    "Fully-closed fallback could not produce a watertight solid.")
 
     _assess_quality(shape, input_dims, method, stats)
 
