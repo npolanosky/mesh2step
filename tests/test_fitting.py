@@ -44,6 +44,28 @@ def test_hole_vs_boss_classification():
     assert cyls[9].outward is False   # central bore = hole
 
 
+@pytest.mark.skipif(not SAMPLES, reason="samples not generated")
+def test_countersink_cone_detected():
+    from mesh2step.fitting import detect_cones
+
+    vertices, faces = load_stl(DATA / "countersink_plate.stl")
+    cfg = ConversionConfig()
+    cyls = detect_cylinders(vertices, faces, cfg)
+    cones = detect_cones(vertices, faces, cyls, cfg)
+    assert len(cones) == 1
+    assert cones[0].half_angle_deg == pytest.approx(45.0, abs=2.0)
+
+
+@pytest.mark.skipif(not SAMPLES, reason="samples not generated")
+def test_no_false_cones_on_plain_holes():
+    from mesh2step.fitting import detect_cones
+
+    for name in ("plate_with_holes", "flanged_pipe", "cylinder"):
+        vertices, faces = load_stl(DATA / f"{name}.stl")
+        cyls = detect_cylinders(vertices, faces, ConversionConfig())
+        assert detect_cones(vertices, faces, cyls, ConversionConfig()) == []
+
+
 def test_harmonize_snaps_near_equal_radii():
     from mesh2step.fitting import Cylinder, _harmonize_radii
 

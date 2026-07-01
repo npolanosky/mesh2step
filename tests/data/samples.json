@@ -103,5 +103,60 @@
     ],
     "file": "flanged_pipe.stl",
     "triangles": 1008
+  },
+  {
+    "kind": "countersink_plate",
+    "dims_mm": [
+      40,
+      40,
+      10
+    ],
+    "cylinders": [
+      {
+        "radius": 2.5,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "through": true
+      }
+    ],
+    "cones": [
+      {
+        "r_large": 5.0,
+        "r_small": 2.5,
+        "half_angle_deg": 45.0,
+        "axis": [
+          0,
+          0,
+          1
+        ]
+      }
+    ],
+    "file": "countersink_plate.stl",
+    "triangles": 1150
+  },
+  {
+    "kind": "angled_hole_plate",
+    "dims_mm": [
+      50,
+      40,
+      20
+    ],
+    "cylinders": [
+      {
+        "radius": 4.0,
+        "axis": [
+          0.5,
+          0,
+          0.866
+        ],
+        "through": true,
+        "angled": true
+      }
+    ],
+    "file": "angled_hole_plate.stl",
+    "triangles": 616
   }
 ]

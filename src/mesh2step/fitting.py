@@ -58,6 +58,33 @@ class Cylinder:
         }
 
 
+@dataclass
+class Cone:
+    """A best-fit (right circular) cone, e.g. a countersink coaxial with a hole."""
+
+    axis_point: np.ndarray   # a point on the axis (the paired cylinder's centre)
+    axis_dir: np.ndarray
+    r_small: float
+    r_large: float
+    half_angle_deg: float
+    axial_min: float
+    axial_max: float
+    rms: float
+    face_indices: list[int]
+    outward: bool = False
+
+    def as_dict(self) -> dict:
+        return {
+            "r_small": float(self.r_small),
+            "r_large": float(self.r_large),
+            "half_angle_deg": float(self.half_angle_deg),
+            "axis_dir": [float(x) for x in self.axis_dir],
+            "rms": float(self.rms),
+            "facets": len(self.face_indices),
+            "role": "countersink",
+        }
+
+
 def _connected_components(
     pool: list[int], neighbors: list[list[int]]
 ) -> list[list[int]]:
@@ -263,6 +290,91 @@ def detect_cylinders(
     if config.harmonize_radii:
         _harmonize_radii(found, config)
     return found
+
+
+def detect_cones(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    cylinders: list[Cylinder],
+    config: ConversionConfig | None = None,
+) -> list[Cone]:
+    """Detect cones coaxial with detected cylinders (countersinks/chamfers).
+
+    A cone's surface normals make a constant non-zero angle with the axis
+    (|n·axis| = sin(half-angle)), and its radius grows linearly along the axis.
+    We look, around each cylinder's axis, for a connected ring of such facets
+    and fit radius-vs-axial to recover the half-angle and end radii.
+    """
+    config = config or ConversionConfig()
+    if not config.detect_cylinders or not cylinders:
+        return []
+
+    normals, _ = face_normals_and_areas(vertices, faces)
+    adjacency = build_edge_adjacency(faces)
+    neighbors: list[list[int]] = [[] for _ in range(len(faces))]
+    for incident in adjacency.values():
+        for i in incident:
+            for j in incident:
+                if i != j:
+                    neighbors[i].append(j)
+
+    centroids = vertices[faces].mean(axis=1)
+    ndot_axis = np.empty(len(faces))
+    claimed: set[int] = set(i for c in cylinders for i in c.face_indices)
+    cones: list[Cone] = []
+
+    for cyl in cylinders:
+        axis, p = cyl.axis_dir, cyl.axis_point
+        rel = centroids - p
+        axial = rel @ axis
+        rho = np.linalg.norm(rel - axial[:, None] * axis, axis=1)
+        np.abs(normals @ axis, out=ndot_axis)
+        # Cone facets: normal tilted (not perpendicular, not flat), coaxial ring
+        # a bit wider than the bore, close to it axially.
+        mask = (
+            (ndot_axis > 0.2) & (ndot_axis < 0.98)
+            & (rho > 0.6 * cyl.radius) & (rho < 6.0 * cyl.radius)
+            & (np.abs(axial - cyl.axial_min) < 4 * cyl.radius)
+        ) | (
+            (ndot_axis > 0.2) & (ndot_axis < 0.98)
+            & (rho > 0.6 * cyl.radius) & (rho < 6.0 * cyl.radius)
+            & (np.abs(axial - cyl.axial_max) < 4 * cyl.radius)
+        )
+        candidates = [i for i in np.where(mask)[0] if i not in claimed]
+        if len(candidates) < config.min_cylinder_facets:
+            continue
+        for cluster in _connected_components(candidates, neighbors):
+            cone = _fit_cone(cluster, axis, p, axial, rho, centroids, config)
+            if cone is not None:
+                cones.append(cone)
+                claimed.update(cone.face_indices)
+    return cones
+
+
+def _fit_cone(cluster, axis, p, axial, rho, centroids, config) -> Cone | None:
+    if len(cluster) < config.min_cylinder_facets:
+        return None
+    z = axial[cluster]
+    r = rho[cluster]
+    # Linear radius-vs-axial fit: r = slope*z + intercept; slope = tan(half-angle).
+    A = np.column_stack((z, np.ones_like(z)))
+    (slope, intercept), *_ = np.linalg.lstsq(A, r, rcond=None)
+    resid = r - (slope * z + intercept)
+    rms = float(np.sqrt(np.mean(resid**2)))
+    if abs(slope) < 0.15 or rms > 3 * config.cylinder_tol:
+        return None  # too flat to be a cone, or not a clean cone
+    if _angular_coverage(centroids[cluster], axis, p) < config.min_cylinder_coverage:
+        return None
+    zmin, zmax = float(z.min()), float(z.max())
+    r_at = lambda zz: float(slope * zz + intercept)  # noqa: E731
+    r0, r1 = r_at(zmin), r_at(zmax)
+    return Cone(
+        axis_point=p, axis_dir=axis,
+        r_small=min(r0, r1), r_large=max(r0, r1),
+        half_angle_deg=float(np.degrees(np.arctan(abs(slope)))),
+        axial_min=zmin, axial_max=zmax, rms=rms,
+        face_indices=list(cluster),
+    )
 
 
 def _harmonize_radii(cylinders: list[Cylinder], config: ConversionConfig) -> None:

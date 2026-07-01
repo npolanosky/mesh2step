@@ -393,6 +393,11 @@ class App:
         self._log(f"   method={result['method']}  faces {s.get('faces_in')}→{s.get('faces_out')} "
                   f"({s.get('planar_faces',0)} planar, {s.get('cylinder_faces',0)} cyl)", "muted")
         self._log(f"   holes={holes}  bosses={len(cyls)-holes}  diameters(mm)={radii}", "muted")
+        cones = s.get("cones", [])
+        if cones:
+            angles = sorted({round(c["half_angle_deg"], 1) for c in cones})
+            self._log(f"   countersinks detected: {len(cones)} (half-angles {angles}°) — "
+                      f"reported; left faceted for now", "muted")
         bi, bo = s.get("bbox_input_mm"), s.get("bbox_output_mm")
         if bi and bo:
             self._log(f"   bbox in {bi} → out {bo}  (Δ{s.get('bbox_delta_pct',0)}%)", "muted")

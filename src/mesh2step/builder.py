@@ -15,7 +15,7 @@ import numpy as np
 
 from .boundary import FaceLoops, extract_face_loops
 from .config import ConversionConfig
-from .fitting import Cylinder, detect_cylinders
+from .fitting import Cylinder, detect_cones, detect_cylinders
 from .segmentation import segment_planar
 
 
@@ -122,6 +122,11 @@ def build_reconstructed_solid(
     cylinders = detect_cylinders(vertices, faces, config)
     holes = sum(1 for c in cylinders if not c.outward)
     progress(f"Found {len(cylinders)} cylinders ({holes} holes)")
+    # Cones (countersinks) are detected and reported; analytic cone faces are a
+    # follow-up, so their facets are left to the surrounding reconstruction.
+    cones = detect_cones(vertices, faces, cylinders, config)
+    if cones:
+        progress(f"Found {len(cones)} countersink cone(s)")
     claimed: set[int] = set()
     for cyl in cylinders:
         claimed.update(cyl.face_indices)
@@ -172,6 +177,8 @@ def build_reconstructed_solid(
         "cylinders_detected": len(cylinders),
         "faces_out": reconstructed + cyl_faces_ok,
         "cylinders": [c.as_dict() for c in cylinders],
+        "cones_detected": len(cones),
+        "cones": [c.as_dict() for c in cones],
         "skipped_facets": skipped,
         "is_solid": is_solid,
     }

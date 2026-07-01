@@ -100,9 +100,44 @@ def flanged_pipe():
     )
 
 
+def countersink_plate():
+    # 40 x 40 x 10 plate; through hole r=2.5 with a 90-degree countersink
+    # (cone from r=2.5 at z=7.5 up to r=5 at the z=10 surface => 45deg half-angle).
+    plate = Part.makeBox(40, 40, 10)
+    hole = Part.makeCylinder(2.5, 10, App.Vector(20, 20, 0))
+    csink = Part.makeCone(5, 2.5, 2.5, App.Vector(20, 20, 10), App.Vector(0, 0, -1))
+    part = plate.cut(hole).cut(csink)
+    return save(
+        part,
+        "countersink_plate",
+        {"kind": "countersink_plate", "dims_mm": [40, 40, 10],
+         "cylinders": [{"radius": 2.5, "axis": [0, 0, 1], "through": True}],
+         "cones": [{"r_large": 5.0, "r_small": 2.5, "half_angle_deg": 45.0, "axis": [0, 0, 1]}]},
+    )
+
+
+def angled_hole_plate():
+    import math
+    # 50 x 40 x 20 plate with a hole drilled at 30deg from vertical (axis in xz).
+    plate = Part.makeBox(50, 40, 20)
+    a = math.radians(30)
+    axis = App.Vector(math.sin(a), 0, math.cos(a))
+    base = App.Vector(25, 20, 20) - axis * 30
+    hole = Part.makeCylinder(4, 60, base, axis)
+    part = plate.cut(hole)
+    return save(
+        part,
+        "angled_hole_plate",
+        {"kind": "angled_hole_plate", "dims_mm": [50, 40, 20],
+         "cylinders": [{"radius": 4.0, "axis": [round(axis.x, 4), 0, round(axis.z, 4)],
+                        "through": True, "angled": True}]},
+    )
+
+
 def main():
     print(f"Writing samples to {OUT} (deflection={DEFLECTION} mm)")
-    truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe()]
+    truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe(),
+              countersink_plate(), angled_hole_plate()]
     (OUT / "samples.json").write_text(json.dumps(truths, indent=2))
     print(f"Wrote {len(truths)} samples + samples.json")
 
