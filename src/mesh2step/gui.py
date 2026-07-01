@@ -31,7 +31,48 @@ try:
 except Exception:  # noqa: BLE001
     _DND = False
 
+# Whether drag-and-drop is actually usable on the live root (the tkinterdnd2
+# import can succeed while the native tkdnd library fails to load at runtime,
+# especially in a packaged macOS app — set once the root is created).
+DND_ACTIVE = False
+
 UNIT_CHOICES = ["mm", "cm", "m", "in"]
+
+
+def _log_dir() -> Path:
+    """Per-user, writable log directory (so a windowed app still leaves a log)."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Logs" / "mesh2step"
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mesh2step" / "logs"
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "mesh2step"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        base = Path(tempfile.gettempdir())
+    return base
+
+
+def _make_root() -> "tk.Tk":
+    """Create the Tk root, using drag-and-drop if it actually loads, else plain.
+
+    tkinterdnd2's ``Tk()`` loads a native library; if that fails (common in a
+    frozen macOS app) we must not let it take the whole app down — fall back to
+    a normal Tk window with drag-and-drop disabled.
+    """
+    global DND_ACTIVE
+    if _DND:
+        try:
+            root = TkinterDnD.Tk()
+            DND_ACTIVE = True
+            return root
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("mesh2step").warning(
+                "drag-and-drop backend failed to load; using a plain window", exc_info=True)
+    return tk.Tk()
 
 # Run child processes without flashing a console window on Windows.
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -184,14 +225,17 @@ class App:
         # --- Input card ---
         c1 = self._card(body, "1  ·  Input mesh")
         self.drop = tk.Label(
-            c1, text="Drag an STL here" + ("" if _DND else "  (or use Browse)"),
+            c1, text="Drag an STL here" + ("" if DND_ACTIVE else "  (or use Browse)"),
             bg="#f8fafc", fg=MUTED, font=("Segoe UI", 10),
             relief="flat", height=3, bd=1, highlightbackground=BORDER, highlightthickness=1,
         )
         self.drop.pack(fill="x")
-        if _DND:
-            self.drop.drop_target_register(DND_FILES)
-            self.drop.dnd_bind("<<Drop>>", self._on_drop)
+        if DND_ACTIVE:
+            try:
+                self.drop.drop_target_register(DND_FILES)
+                self.drop.dnd_bind("<<Drop>>", self._on_drop)
+            except Exception:  # noqa: BLE001 - drag-drop is a convenience, not required
+                self.drop.config(text="Drag an STL here  (or use Browse)")
         row = ttk.Frame(c1, style="Card.TFrame"); row.pack(fill="x", pady=(8, 0))
         ttk.Entry(row, textvariable=self.input_var).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Browse…", command=self._browse_input).pack(side="left", padx=(6, 0))
@@ -543,11 +587,54 @@ class App:
         self.log.config(state="disabled")
 
 
+def _setup_logging():
+    """Log to a per-user file so a windowed (no-console) crash is still findable."""
+    import logging
+
+    logpath = _log_dir() / "mesh2step.log"
+    handlers = [logging.FileHandler(str(logpath), encoding="utf-8")]
+    if sys.stderr is not None:  # None under a frozen windowed app
+        handlers.append(logging.StreamHandler(sys.stderr))
+    logging.basicConfig(level=logging.INFO, handlers=handlers,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    return logpath
+
+
+def _show_fatal_dialog(message: str, logpath) -> None:
+    """Best-effort error dialog; safe to call even if the GUI is broken."""
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox
+
+        r = _tk.Tk()
+        r.withdraw()
+        messagebox.showerror(
+            "mesh2step failed to start",
+            f"{message}\n\nDetails were written to:\n{logpath}")
+        r.destroy()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> int:
-    root = TkinterDnD.Tk() if _DND else tk.Tk()
-    App(root)
-    root.mainloop()
-    return 0
+    import logging
+    import traceback
+
+    logpath = _setup_logging()
+    log = logging.getLogger("mesh2step")
+    log.info("starting (frozen=%s, platform=%s)", getattr(sys, "frozen", False), sys.platform)
+    try:
+        root = _make_root()
+        App(root)
+        log.info("GUI up (drag-and-drop=%s)", DND_ACTIVE)
+        root.mainloop()
+        return 0
+    except Exception:  # noqa: BLE001 - top-level guard: log + surface, never silent-crash
+        tb = traceback.format_exc()
+        log.error("fatal error\n%s", tb)
+        last = tb.strip().splitlines()[-1] if tb.strip() else "unknown error"
+        _show_fatal_dialog(last, logpath)
+        return 1
 
 
 if __name__ == "__main__":
