@@ -1,0 +1,8 @@
+# Normalize line endings so scripts work across Windows/macOS/Linux.
+# Shell scripts MUST be LF or macOS/Linux can't run them (CRLF breaks the
+# shebang). Python is kept LF for consistency.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.step binary
+*.stl binary
