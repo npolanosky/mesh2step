@@ -40,10 +40,11 @@ def _tessellate_step(step_path: str, out_mesh: str, deflection: float,
         env = dict(os.environ)
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = _package_src() + (os.pathsep + existing if existing else "")
+        no_window = 0x08000000 if sys.platform == "win32" else 0
         proc = subprocess.run(
             [freecad_python, "-m", "mesh2step.worker",
              "--job", str(job), "--result", str(res)],
-            env=env, capture_output=True, text=True,
+            env=env, capture_output=True, text=True, creationflags=no_window,
         )
         if not res.exists():
             raise RuntimeError(

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
@@ -31,6 +32,20 @@ except Exception:  # noqa: BLE001
     _DND = False
 
 UNIT_CHOICES = ["mm", "cm", "m", "in"]
+
+# Run child processes without flashing a console window on Windows.
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+# Map a progress message substring to a percent, for a determinate progress bar.
+_MILESTONES = [
+    ("Locating FreeCAD", 4), ("Preparing mesh", 8), ("Loading", 12),
+    ("Scaling", 16), ("Detecting cylinders", 28), ("Found", 34),
+    ("countersink", 38), ("Segmenting", 48), ("Building", 62),
+    ("Sewing", 82), ("faceted solid", 88), ("Exporting", 94), ("Done", 100),
+]
+
+# If the worker emits no output for this long, warn that it may be stalled.
+_STALL_SECONDS = 25.0
 
 # Palette — a clean flat light theme with a blue accent and a console-style log.
 BG = "#eef1f5"
@@ -72,7 +87,7 @@ def run_worker(job: dict, freecad_python: str, on_line=None, timeout: float = 18
             [freecad_python, "-m", "mesh2step.worker",
              "--job", str(job_file), "--result", str(res_file)],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, creationflags=_NO_WINDOW,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -104,6 +119,11 @@ class App:
         self.closed_var = tk.BooleanVar(value=False)
         self.freecad_var = tk.StringVar(value=find_freecad_python() or "")
         self._longest_mm = None
+        self._t0 = 0.0
+        self._last_line_t = 0.0
+        self._stall_noted = False
+        self.last_stl = None
+        self.last_step = None
 
         self._init_style()
         self._build()
@@ -176,7 +196,7 @@ class App:
         # mesh info grid
         self.info = ttk.Frame(c1, style="Card.TFrame"); self.info.pack(fill="x", pady=(10, 0))
         self._info_labels = {}
-        for i, key in enumerate(["Triangles", "AABB (mm-units)", "OBB (oriented)", "Mesh health"]):
+        for i, key in enumerate(["Triangles", "AABB X·Y·Z", "OBB (oriented)", "Mesh health"]):
             ttk.Label(self.info, text=key, style="Muted.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 10))
             v = ttk.Label(self.info, text="—", style="Value.TLabel")
             v.grid(row=i, column=1, sticky="w")
@@ -217,15 +237,26 @@ class App:
         self.convert_btn = ttk.Button(body, text="Convert  →  STEP",
                                       style="Accent.TButton", command=self._convert)
         self.convert_btn.pack(fill="x")
-        self.progress = ttk.Progressbar(body, mode="indeterminate",
+        prow = ttk.Frame(body, style="Bg.TFrame"); prow.pack(fill="x", pady=(8, 4))
+        self.progress = ttk.Progressbar(prow, mode="determinate", maximum=100,
                                         style="Accent.Horizontal.TProgressbar")
-        self.progress.pack(fill="x", pady=(8, 4))
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.elapsed = tk.Label(prow, text="0.0s", bg=BG, fg=MUTED, width=8,
+                                font=("Consolas", 9))
+        self.elapsed.pack(side="left", padx=(8, 0))
         self.status = tk.Label(body, text="Ready", bg=BG, fg=MUTED, anchor="w",
                                font=("Segoe UI", 9))
         self.status.pack(fill="x")
         self.quality = tk.Label(body, text="", bg=BG, fg=MUTED, anchor="w",
                                 font=("Segoe UI Semibold", 11))
         self.quality.pack(fill="x", pady=(2, 6))
+
+        # --- Result actions ---
+        arow = ttk.Frame(body, style="Bg.TFrame"); arow.pack(fill="x", pady=(0, 6))
+        self.view_btn = ttk.Button(arow, text="View 3D deviation", state="disabled",
+                                   command=self._view_result)
+        self.view_btn.pack(side="left")
+        ttk.Button(arow, text="Save log…", command=self._save_log).pack(side="left", padx=6)
 
         # --- Log ---
         logcard = self._card(body, "Log")
@@ -334,15 +365,35 @@ class App:
                     self._on_convert(payload)
         except queue.Empty:
             pass
+        if self.busy:
+            now = time.monotonic()
+            self.elapsed.config(text=f"{now - self._t0:.1f}s")
+            quiet = now - self._last_line_t
+            if quiet > _STALL_SECONDS:
+                # No worker output for a while — flag as possibly stalled (a big
+                # mesh sew/faceted build can genuinely be quiet for minutes).
+                self.status.config(
+                    text=f"⏳ still working — no update for {quiet:.0f}s "
+                         f"(large meshes can be slow; watch the log)", fg="#b45309")
+                self._stall_noted = True
+            elif self._stall_noted:
+                self._stall_noted = False
         self.root.after(80, self._drain_queue)
 
     def _on_log_line(self, line: str):
+        self._last_line_t = time.monotonic()
         if line.startswith("PROGRESS:"):
             msg = line[len("PROGRESS:"):].strip()
-            self.status.config(text=msg)
+            self.status.config(text=msg, fg=MUTED)
+            for key, pct in _MILESTONES:
+                if key in msg:
+                    self.progress["value"] = max(self.progress["value"], pct)
+                    break
             self._log(msg, "stage")
         else:
             self._log(line, "muted")
+            if "Traceback" in line or "Error" in line:
+                self._log("   (worker reported an error — see above)", "err")
 
     def _on_inspect(self, result: dict):
         self._stop()
@@ -350,15 +401,16 @@ class App:
             self._log(f"Inspect failed: {result.get('error','')}", "err")
             return
         aabb = result["aabb"]["dimensions"]
+        xyz = result["aabb"].get("extents_xyz", aabb)
         obb = result["obb"]["dimensions"]
         self._longest_mm = aabb[0]
         self._refresh_units()
         self._info_labels["Triangles"].config(
             text=f"{result['triangle_count']:,}   ({result['vertex_count']:,} verts)")
-        self._info_labels["AABB (mm-units)"].config(
-            text=f"{aabb[0]:.2f} × {aabb[1]:.2f} × {aabb[2]:.2f}")
+        self._info_labels["AABB X·Y·Z"].config(
+            text=f"X {xyz[0]:.2f}   Y {xyz[1]:.2f}   Z {xyz[2]:.2f}  mm-units")
         self._info_labels["OBB (oriented)"].config(
-            text=f"{obb[0]:.2f} × {obb[1]:.2f} × {obb[2]:.2f}")
+            text=f"{obb[0]:.2f} × {obb[1]:.2f} × {obb[2]:.2f}  (principal)")
 
         health = result.get("health", {})
         issues = []
@@ -380,10 +432,13 @@ class App:
         self.status.config(text="Mesh inspected — set units and convert.")
 
     def _on_convert(self, result: dict):
+        took = time.monotonic() - self._t0
         self._stop()
         if not result.get("ok"):
-            self._log(f"✖  Conversion failed: {result.get('error','unknown error')}", "err")
-            self.status.config(text="Conversion failed.")
+            self._log(f"✖  Conversion failed after {took:.1f}s: "
+                      f"{result.get('error','unknown error')}", "err")
+            self.status.config(text="Conversion failed.", fg=ERR_RED)
+            self.quality.config(text="✖  FAILED", fg=ERR_RED)
             return
         s = result.get("stats", {})
         cyls = s.get("cylinders", [])
@@ -411,19 +466,61 @@ class App:
         # Prominent quality verdict.
         self.quality.config(text=f"{badge[0]}   ·   {result['method']}, {len(cyls)} cylinders, "
                                  f"watertight={s.get('is_solid')}", fg=badge[1])
-        self.status.config(text=f"Done → {Path(result['output']).name}", fg=badge[1])
+        self.status.config(text=f"Done in {took:.1f}s → {Path(result['output']).name}", fg=badge[1])
+
+        # Enable the deviation viewer for this result.
+        self.last_stl = self.input_var.get().strip()
+        self.last_step = result["output"]
+        self.view_btn.config(state="normal")
+
+    # ---- result actions ---------------------------------------------------
+    def _view_result(self):
+        if not (self.last_stl and self.last_step and Path(self.last_step).exists()):
+            self._log("⚠  No result to view yet.", "err")
+            return
+        self._log("Opening 3D deviation viewer…", "muted")
+        self._launch_viewer(self.last_stl, self.last_step)
+
+    def _launch_viewer(self, stl: str, step: str):
+        """Launch the pyvista deviation viewer as its own process."""
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--view", stl, step]
+            env = None
+        else:
+            env = dict(os.environ)
+            env["PYTHONPATH"] = _package_src() + os.pathsep + env.get("PYTHONPATH", "")
+            cmd = [sys.executable, "-m", "mesh2step.viewer", stl, step]
+        try:
+            subprocess.Popen(cmd, env=env, creationflags=_NO_WINDOW)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"⚠  Could not open viewer: {exc}", "err")
+
+    def _save_log(self):
+        text = self.log.get("1.0", "end").strip()
+        if not text:
+            return
+        p = filedialog.asksaveasfilename(defaultextension=".txt",
+                                         filetypes=[("Text", "*.txt")])
+        if p:
+            Path(p).write_text(text, encoding="utf-8")
+            self._log(f"Log saved to {p}", "muted")
 
     # ---- ui helpers -------------------------------------------------------
     def _start(self, text: str):
         self.busy = True
+        self._t0 = time.monotonic()
+        self._last_line_t = self._t0
+        self._stall_noted = False
         self.convert_btn.config(state="disabled")
         self.status.config(text=text, fg=MUTED)
-        self.progress.start(12)
+        self.progress.config(mode="determinate")
+        self.progress["value"] = 2
 
     def _stop(self):
         self.busy = False
         self.convert_btn.config(state="normal")
-        self.progress.stop()
+        self.progress["value"] = 100 if not self._stall_noted else self.progress["value"]
+        self.elapsed.config(text=f"{time.monotonic() - self._t0:.1f}s")
 
     def _log(self, text: str, tag: str = ""):
         self.log.config(state="normal")

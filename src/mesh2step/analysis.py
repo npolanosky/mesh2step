@@ -21,6 +21,8 @@ class BoundingBox:
     # box centre (both None for the axis-aligned box, which uses world axes).
     axes: np.ndarray | None = None
     center: np.ndarray | None = None
+    # World X/Y/Z extents (axis-aligned box only; None for the oriented box).
+    extents_xyz: np.ndarray | None = None
 
     def as_dict(self) -> dict:
         d = {
@@ -31,6 +33,8 @@ class BoundingBox:
             d["center"] = [float(x) for x in self.center]
         if self.axes is not None:
             d["axes"] = self.axes.tolist()
+        if self.extents_xyz is not None:
+            d["extents_xyz"] = [float(x) for x in self.extents_xyz]
         return d
 
 
@@ -43,6 +47,7 @@ def axis_aligned_bbox(vertices: np.ndarray) -> BoundingBox:
         dimensions=np.sort(dims)[::-1],
         volume=float(np.prod(dims)),
         center=(lo + hi) / 2.0,
+        extents_xyz=dims,  # world X, Y, Z extents (unsorted)
     )
 
 
