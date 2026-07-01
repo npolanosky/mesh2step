@@ -106,6 +106,7 @@ def build_reconstructed_solid(
     vertices: np.ndarray,
     faces: np.ndarray,
     config: ConversionConfig,
+    on_progress=None,
 ):
     """Reconstruct planar + cylindrical faces, sew them, return ``(shape, stats)``.
 
@@ -113,7 +114,14 @@ def build_reconstructed_solid(
     """
     import Part  # type: ignore
 
+    def progress(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
+
+    progress("Detecting cylinders/holes")
     cylinders = detect_cylinders(vertices, faces, config)
+    holes = sum(1 for c in cylinders if not c.outward)
+    progress(f"Found {len(cylinders)} cylinders ({holes} holes)")
     claimed: set[int] = set()
     for cyl in cylinders:
         claimed.update(cyl.face_indices)
@@ -123,7 +131,9 @@ def build_reconstructed_solid(
     keep = [i for i in range(len(faces)) if i not in claimed]
     faces_sub = faces[keep]
 
+    progress("Segmenting planar regions")
     regions = segment_planar(vertices, faces_sub, config)
+    progress(f"Building {len(regions):,} planar faces")
     occ_faces = []
     reconstructed = 0
     skipped = 0
@@ -152,6 +162,7 @@ def build_reconstructed_solid(
     if not occ_faces:
         raise RuntimeError("no faces could be reconstructed")
 
+    progress(f"Sewing {len(occ_faces):,} faces into a solid")
     shape, is_solid = _faces_to_solid(occ_faces, Part)
 
     stats = {

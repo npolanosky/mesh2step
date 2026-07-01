@@ -47,13 +47,18 @@ def run_inspect(job: dict) -> dict:
     return {"ok": True, "mode": "inspect", **info}
 
 
+def _emit(msg: str) -> None:
+    """Stream a progress line the GUI can pick up from stdout."""
+    print(f"PROGRESS: {msg}", flush=True)
+
+
 def run_convert(job: dict) -> dict:
     """Full STL -> STEP conversion."""
     from .pipeline import convert
 
     cfg = _config_from(job.get("config", {}))
     out = job.get("output") or str(Path(job["input"]).with_suffix(".step"))
-    result = convert(job["input"], out, cfg)
+    result = convert(job["input"], out, cfg, on_progress=_emit)
     return {
         "ok": True,
         "mode": "convert",
