@@ -15,8 +15,8 @@ import numpy as np
 
 from .boundary import FaceLoops, extract_face_loops
 from .config import ConversionConfig
-from .fitting import Cylinder, detect_cones, detect_cylinders
-from .segmentation import segment_planar
+from .fitting import Cylinder, _connected_components, detect_cones, detect_cylinders
+from .segmentation import build_edge_adjacency, segment_planar
 
 
 def _vec(p):
@@ -114,6 +114,26 @@ def _cylinder_face(cyl: Cylinder, Part):
     return face if cyl.outward else face.reversed()
 
 
+def _faceted_faces(all_points: list, tri_faces: np.ndarray, Part):
+    """Build merged faces for one local patch of facets.
+
+    Wraps the patch as a raw mesh shape, then ``removeSplitter`` coalesces
+    adjacent coplanar triangles within the patch into single faces — so a flat
+    region inside an otherwise-unmergeable pocket still collapses to one face,
+    and only genuine curvature stays faceted. ``all_points`` is the full
+    pre-built FreeCAD Vector list for the mesh (shared across patches so it is
+    only built once); ``tri_faces`` indexes into it.
+    """
+    topo = [(int(a), int(b), int(c)) for a, b, c in tri_faces]
+    shape = Part.Shape()
+    shape.makeShapeFromMesh((all_points, topo), 0.1)
+    try:
+        shape = shape.removeSplitter()
+    except Exception:  # noqa: BLE001 - merge is an optimization, not required
+        pass
+    return list(shape.Faces)
+
+
 def _cone_face(cone, Part):
     """Build an analytic conical face (countersink) from makeCone's lateral face."""
     base = cone.axis_point + cone.axial_min * cone.axis_dir
@@ -168,19 +188,24 @@ def build_reconstructed_solid(
     occ_faces = []
     reconstructed = 0
     skipped = 0
+    gap_rows: list[int] = []  # faces_sub rows we couldn't merge — emit faceted
     for region in regions:
+        rows = region.face_indices  # rows into faces_sub
         if region.size < config.min_region_facets:
             skipped += region.size
+            gap_rows.extend(rows)
             continue
         loops = extract_face_loops(vertices, faces_sub, region, config)
         if loops is None:
             skipped += region.size
+            gap_rows.extend(rows)
             continue
         try:
             occ_faces.append(_planar_face(loops, circles, Part))
             reconstructed += 1
         except Exception:  # noqa: BLE001 - OCC raises bare RuntimeErrors
             skipped += region.size
+            gap_rows.extend(rows)
 
     cyl_faces_ok = 0
     for cyl in cylinders:
@@ -198,19 +223,55 @@ def build_reconstructed_solid(
         except Exception:  # noqa: BLE001
             pass
 
+    # Gap-fill: patch the facets that couldn't be reconstructed so the shell has
+    # no holes and sews watertight (manifold). Facets are grouped into connected
+    # local patches (genuinely separate pockets stay separate — sharp edges
+    # between them are preserved) and each patch is merged with removeSplitter,
+    # so flat sub-regions inside a pocket still collapse to one face and only
+    # real curvature stays faceted. Keeps the face count far below a fully
+    # faceted solid, which is what made the naive per-triangle version hang.
+    gap_faces = 0
+    gap_patches = 0
+    if config.fill_faceted_gaps and gap_rows:
+        progress(f"Gap-filling {len(gap_rows):,} facets to close the solid")
+        adjacency = build_edge_adjacency(faces_sub)
+        neighbors: list[list[int]] = [[] for _ in range(len(faces_sub))]
+        for incident in adjacency.values():
+            for i in incident:
+                for j in incident:
+                    if i != j:
+                        neighbors[i].append(j)
+        components = _connected_components(gap_rows, neighbors)
+        components.sort(key=len, reverse=True)
+        sizes = [len(c) for c in components]
+        progress(f"  {len(components):,} local patch(es); largest={sizes[:5]}")
+        all_points = [_vec(p) for p in vertices]
+        for idx, comp in enumerate(components):
+            if len(comp) > 500:
+                progress(f"  merging large patch {idx + 1}/{len(components)} "
+                         f"({len(comp):,} facets)...")
+            patch_faces = _faceted_faces(all_points, faces_sub[comp], Part)
+            occ_faces.extend(patch_faces)
+            gap_faces += len(patch_faces)
+        gap_patches = len(components)
+        progress(f"  gap patches merged to {gap_faces:,} faces "
+                 f"(from {len(gap_rows):,} facets)")
+
     if not occ_faces:
         raise RuntimeError("no faces could be reconstructed")
 
     progress(f"Sewing {len(occ_faces):,} faces into a solid")
-    shape, is_solid = _faces_to_solid(occ_faces, Part)
+    shape, is_solid = _faces_to_solid(occ_faces, Part, config.sew_tolerance, on_progress)
 
     stats = {
         "faces_in": int(len(faces)),
         "planar_faces": reconstructed,
         "cylinder_faces": cyl_faces_ok,
         "cone_faces": cone_faces_ok,
+        "gap_faces": gap_faces,
+        "gap_patches": gap_patches,
         "cylinders_detected": len(cylinders),
-        "faces_out": reconstructed + cyl_faces_ok + cone_faces_ok,
+        "faces_out": reconstructed + cyl_faces_ok + cone_faces_ok + gap_faces,
         "cylinders": [c.as_dict() for c in cylinders],
         "cones_detected": len(cones),
         "cones": [c.as_dict() for c in cones],
@@ -220,15 +281,35 @@ def build_reconstructed_solid(
     return shape, stats
 
 
-def _faces_to_solid(occ_faces, Part):
-    """Sew faces into a (hopefully) closed solid. Returns ``(shape, is_solid)``."""
-    # Sewing tolerates the tiny gaps between analytic circles and the planar
-    # loops they replace; a raw Part.Shell often won't close cleanly.
+def _safe_remove_splitter(shape, Part):
+    """removeSplitter is an optimization (merge coplanar faces); never let a
+    malformed edge/curve in a huge shell crash the whole reconstruction."""
+    try:
+        return shape.removeSplitter()
+    except Exception:  # noqa: BLE001
+        return shape
+
+
+def _faces_to_solid(occ_faces, Part, tolerance: float = 1e-3, on_progress=None):
+    """Sew faces into a (hopefully) closed solid. Returns ``(shape, is_solid)``.
+
+    ``tolerance`` (mm) lets sewing bridge faces whose shared edges are
+    coordinate-identical in theory (same source vertices) but differ by FP
+    noise in practice — e.g. an analytic circle vs. the mesh-derived patch
+    boundary it replaced, or two independently-built local patches.
+    """
+    def progress(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
+
     shell = Part.Shell(occ_faces)
     sewn = shell.copy()
     try:
-        sewn.sewShape()
+        progress("  sewShape...")
+        sewn.sewShape(tolerance)
+        progress("  sewShape done")
     except Exception:  # noqa: BLE001
+        progress("  sewShape failed; using un-sewn shell")
         sewn = shell
 
     for candidate in (sewn, shell):
@@ -237,10 +318,12 @@ def _faces_to_solid(occ_faces, Part):
         except Exception:  # noqa: BLE001
             continue
         if solid.isValid():
-            return solid.removeSplitter(), True
+            progress("  solid valid; simplifying")
+            return _safe_remove_splitter(solid, Part), True
 
     # No closed solid; hand back the sewn shell so the caller can still export.
-    return sewn.removeSplitter(), False
+    progress("  no valid solid; returning open shell")
+    return _safe_remove_splitter(sewn, Part), False
 
 
 def build_faceted_solid(vertices: np.ndarray, faces: np.ndarray):

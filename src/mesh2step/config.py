@@ -61,6 +61,17 @@ class ConversionConfig:
     # holes stay faceted on organic parts — but the body is closed.
     full_closed: bool = False
 
+    # Emit un-mergeable facets as locally-merged patches so the reconstructed
+    # shell has no gaps and sews watertight — keeping merged planar faces +
+    # analytic holes while staying manifold. Enabled by the fully-closed path.
+    fill_faceted_gaps: bool = False
+
+    # Sewing tolerance (mm) when stitching faces into a solid. Analytic faces
+    # (exact circles/planes) and raw mesh-derived patches meet at edges that are
+    # coordinate-identical in theory but can differ by FP noise; a small nonzero
+    # tolerance lets OCC bridge that without needing bit-exact vertices.
+    sew_tolerance: float = 1e-3
+
     # Explicit path to FreeCAD's bin/ directory (overrides auto-detection).
     freecad_bin: str | None = None
 

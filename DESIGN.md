@@ -99,12 +99,26 @@ so the tool never fails to produce *a* watertight result.
       hole; junction snapped to the cylinder end so it sews watertight)
 - [x] Fast / fully-closed toggle — fully-closed falls back to a watertight
       faceted solid when analytic reconstruction can't close (organic parts)
+- [x] Gap-fill (hybrid subdivision): unreconstructed regions are grouped into
+      connected local patches and merged with `removeSplitter` (not emitted as
+      thousands of raw per-triangle faces) — keeps merged planar faces + analytic
+      holes while patching the shell closed, instead of falling straight to a
+      fully-faceted rebuild. All `removeSplitter`/sew calls are now guarded so a
+      malformed edge degrades gracefully instead of crashing/hanging.
+      **Known limit**: on a mesh with many *intersecting* holes (Blank Topper:
+      38 holes, several pairs crossing near the corners), gap-fill sewing
+      (~40k faces) does not converge to a single valid solid even after local
+      merging — it still falls back to tier 3 (full faceted, ~233MB), just
+      slower (~140s wasted first). The default *fast* path (no gap-fill) already
+      gives all holes as real analytic cylinders with no faceting, at ~62MB vs.
+      the 233MB fully-faceted export — just not a single watertight solid
+      (1,188 open shells on that part).
+- [ ] Close the remaining intersecting-hole regions cleanly (real topology
+      repair — e.g. explicit edge stitching at hole intersections — rather than
+      relying on OCC's global sewShape over tens of thousands of faces)
 - [ ] Effective decimation — FreeCAD's scripted `Mesh.decimate` barely reduces
       these meshes; needs pymeshlab/open3d or a numpy vertex-clustering pass
-- [ ] Intersecting / partial-arc holes (repair recovers some; the rest need the
-      viewer to diagnose why specific walls don't cluster)
 - [ ] Angled holes (arbitrary axis not perpendicular to a flat face)
-- [ ] Fully-closed WITH analytic holes on organic parts (transition faces)
 - [ ] Sphere fitting
 - [ ] Viewer + deviation heatmap (see docs/VIEWER.md) — also a dev/QA tool
 - [ ] Curved-surface face rebuild (B-spline fallback for free-form regions)

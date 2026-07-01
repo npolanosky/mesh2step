@@ -41,7 +41,10 @@ _MILESTONES = [
     ("Locating FreeCAD", 4), ("Preparing mesh", 8), ("Loading", 12),
     ("Scaling", 16), ("Detecting cylinders", 28), ("Found", 34),
     ("countersink", 38), ("Segmenting", 48), ("Building", 62),
-    ("Sewing", 82), ("faceted solid", 88), ("Exporting", 94), ("Done", 100),
+    ("Gap-filling", 68), ("local patch", 70), ("merging large patch", 72),
+    ("gap patches merged", 76), ("Sewing", 82), ("sewShape", 86),
+    ("watertight faceted solid", 88), ("faceted solid", 88),
+    ("Exporting", 94), ("Done", 100),
 ]
 
 # If the worker emits no output for this long, warn that it may be stalled.
@@ -453,6 +456,9 @@ class App:
         self._log(f"   method={result['method']}  faces {s.get('faces_in')}→{s.get('faces_out')} "
                   f"({s.get('planar_faces',0)} planar, {s.get('cylinder_faces',0)} cyl)", "muted")
         self._log(f"   holes={holes}  bosses={len(cyls)-holes}  diameters(mm)={radii}", "muted")
+        if s.get("gap_faces"):
+            self._log(f"   gap-fill: {s.get('gap_patches', 0)} local patch(es) "
+                      f"merged to {s['gap_faces']:,} faces (closing the solid)", "muted")
         cones = s.get("cones", [])
         if cones:
             angles = sorted({round(c["half_angle_deg"], 1) for c in cones})
