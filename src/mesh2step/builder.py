@@ -446,6 +446,11 @@ def _boolean_clean_cylinder(solid, cyl: Cylinder, Part, radius: float | None = N
     center = np.asarray(cyl.axis_point, dtype=float)
     zmin, zmax = cyl.axial_min, cyl.axial_max
     if cyl.outward:
+        # Plain (unguarded) fuse: a boss legitimately swallows any nested bore
+        # (flanged_pipe's flange fills its own bore, which the bore's later cut
+        # re-opens), so the added-volume guard used for cones would reject it.
+        # Cylinder detection has tight guards (coverage/centroid/rms), so
+        # mis-detected bosses are rare here — unlike cone fits.
         fill = _boolean_cut_tool_cylinder(center, axis, R + eps, zmin, zmax, Part)
         return solid.fuse(fill)
     pad = _cut_pad(zmax - zmin)
@@ -453,18 +458,44 @@ def _boolean_clean_cylinder(solid, cyl: Cylinder, Part, radius: float | None = N
     return solid.cut(cut)
 
 
+def _guarded_fuse(solid, tool, max_added_frac: float = 0.30):
+    """Fuse a boss tool, but refuse if it would ADD real material.
+
+    A correct boss fuse mostly overlaps existing material — the only volume it
+    adds is the sliver between the inscribed faceted polygon and the true
+    circle (a few percent even for coarse tessellations). A mis-detected boss
+    (wrong radius/axis/extent) sticks out into open air instead, adding a large
+    share of the tool's volume; that would silently distort the part while
+    remaining a perfectly valid solid, so validity checks alone can't catch it.
+    """
+    fused = solid.fuse(tool)
+    added = fused.Volume - solid.Volume
+    if added > max_added_frac * tool.Volume:
+        raise ValueError(
+            f"boss fuse rejected: would add {added:.2f} of the tool's "
+            f"{tool.Volume:.2f} volume (mis-detected boss)")
+    return fused
+
+
 def _boolean_clean_cone(solid, cone, Part, **_):
     """Exact-cut analogue of :func:`_boolean_clean_cylinder` for a countersink
     cone. The faceted cone is inscribed the same way, so cutting the exact cone
     (extended a hair past each end along its own taper so it passes cleanly
     through the surfaces) clears the facets and leaves an analytic conical wall
-    at the fitted radii — no oversize ring."""
+    at the fitted radii — no oversize ring. A boss cone (tapered neck/chamfer,
+    material inside) is the mirror image: fuse the exact solid cone over the
+    feature's exact extent instead — cutting it would carve the boss off."""
     r_base = float(cone.r_base)
     r_top = float(cone.r_top)
     axis = np.asarray(cone.axis_dir, dtype=float)
     center = np.asarray(cone.axis_point, dtype=float)
     zmin, zmax = float(cone.axial_min), float(cone.axial_max)
     height = zmax - zmin
+    if getattr(cone, "outward", False):
+        eps = _clean_cut_eps(max(r_base, r_top))
+        fill = Part.makeCone(max(r_base + eps, 1e-4), max(r_top + eps, 1e-4), height,
+                             _vec(center + zmin * axis), _vec(axis))
+        return _guarded_fuse(solid, fill)
     pad = _cut_pad(height)
     # Nudge the radii out a hair (as for cylinders) so the cut clears the faceted
     # vertices instead of pinching the abutting faces into slivers, then extend

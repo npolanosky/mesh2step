@@ -476,6 +476,18 @@ def _fit_cone(cluster, cyl, axis, p, vertices, faces, centroids, config) -> Cone
         return None
 
     zmin, zmax = float(z.min()), float(z.max())
+    # Boss vs hole, exactly as for cylinders: outward normals pointing away from
+    # the axis mean material inside (a tapered boss/neck); pointing toward it
+    # mean a countersink-style hole. Getting this wrong turns the boolean
+    # clean-up destructive — cutting a boss cone carves the boss off the part.
+    tri = vertices[faces[cluster]]
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
+    crel = centroids[cluster] - p
+    radial = crel - (crel @ axis)[:, None] * axis
+    radial /= np.linalg.norm(radial, axis=1, keepdims=True) + 1e-12
+    outward = bool(np.mean(np.sum(n * radial, axis=1)) > 0)
+
     # Snap the cone's near end exactly to the paired cylinder's end circle, so
     # the two analytic faces share an identical junction edge and sew closed.
     junction_z = min((cyl.axial_min, cyl.axial_max),
@@ -495,6 +507,7 @@ def _fit_cone(cluster, cyl, axis, p, vertices, faces, centroids, config) -> Cone
         axial_min=axial_min, axial_max=axial_max, rms=rms,
         face_indices=list(cluster),
         r_base=float(r_base), r_top=float(r_top),
+        outward=outward,
     )
 
 
