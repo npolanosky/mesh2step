@@ -164,9 +164,10 @@ class App:
         self.units_var = tk.StringVar(value="mm")
         self.detect_var = tk.BooleanVar(value=True)
         self.faceted_var = tk.BooleanVar(value=False)
-        self.repair_var = tk.BooleanVar(value=False)
-        self.closed_var = tk.BooleanVar(value=False)
+        self.repair_var = tk.BooleanVar(value=True)
+        self.closed_var = tk.BooleanVar(value=True)
         self.freecad_var = tk.StringVar(value=find_freecad_python() or "")
+        self.output_dir = None  # user-chosen output folder; None = use input's folder
         self._longest_mm = None
         self._t0 = 0.0
         self._last_line_t = 0.0
@@ -303,8 +304,12 @@ class App:
         # --- Output ---
         c3 = self._card(body, "3  ·  Output")
         orow = ttk.Frame(c3, style="Card.TFrame"); orow.pack(fill="x")
-        ttk.Entry(orow, textvariable=self.output_var).pack(side="left", fill="x", expand=True)
-        ttk.Button(orow, text="Browse…", command=self._browse_output).pack(side="left", padx=(6, 0))
+        ttk.Entry(orow, textvariable=self.output_var, state="readonly").pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(orow, text="Choose folder…", command=self._browse_output).pack(
+            side="left", padx=(6, 0))
+        ttk.Label(c3, text="File name follows the input; pick a folder to change where it lands.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         frow = ttk.Frame(c3, style="Card.TFrame"); frow.pack(fill="x", pady=(8, 0))
         ttk.Label(frow, text="FreeCAD Python", style="Muted.TLabel").pack(side="left")
         ttk.Entry(frow, textvariable=self.freecad_var).pack(side="left", fill="x", expand=True, padx=6)
@@ -353,10 +358,13 @@ class App:
             self._set_input(p)
 
     def _browse_output(self):
-        p = filedialog.asksaveasfilename(defaultextension=".step",
-                                         filetypes=[("STEP", "*.step *.stp")])
-        if p:
-            self.output_var.set(p)
+        # Pick a destination FOLDER; the file name is derived from the input.
+        start = self.output_dir or (str(Path(self.input_var.get()).parent)
+                                    if self.input_var.get().strip() else None)
+        d = filedialog.askdirectory(title="Choose output folder", initialdir=start or None)
+        if d:
+            self.output_dir = d
+            self._update_output_path()
 
     def _browse_freecad(self):
         p = filedialog.askopenfilename(title="FreeCAD's python executable")
@@ -367,11 +375,51 @@ class App:
     def _on_drop(self, event):
         self._set_input(event.data.strip().strip("{}"))
 
+    @staticmethod
+    def _validate_stl(path: str) -> str | None:
+        """Return an error message if ``path`` is not a usable STL, else None."""
+        p = Path(path)
+        if not p.is_file():
+            return "File not found."
+        if p.suffix.lower() != ".stl":
+            got = p.suffix or "no extension"
+            return f"Not an STL file ({got}). Please choose a .stl file."
+        try:
+            size = p.stat().st_size
+            if size < 84:
+                return "File is too small to be a valid STL."
+            with open(p, "rb") as fh:
+                head = fh.read(80)
+                n = int.from_bytes(fh.read(4), "little")
+            if head[:5].lower() == b"solid":          # ASCII STL
+                return None
+            if size == 84 + 50 * n:                    # binary STL
+                return None
+            return "File does not look like a valid STL (bad header/size)."
+        except Exception:  # noqa: BLE001 - sniff is best-effort; don't block on IO quirks
+            return None
+
+    def _update_output_path(self):
+        """Derive the output .step path from the current input + chosen folder."""
+        inp = self.input_var.get().strip()
+        if not inp:
+            return
+        folder = self.output_dir or str(Path(inp).parent)
+        self.output_var.set(str(Path(folder) / (Path(inp).stem + ".step")))
+
     def _set_input(self, path: str):
+        path = path.strip().strip('"')
+        err = self._validate_stl(path)
+        if err:
+            self._log(f"✖  {err}", "err")
+            self.status.config(text=err, fg=ERR_RED)
+            return
         self.input_var.set(path)
         self.drop.config(text=Path(path).name, fg=TEXT)
-        if not self.output_var.get():
-            self.output_var.set(str(Path(path).with_suffix(".step")))
+        # Always re-derive the output path from the new input (into the chosen
+        # output folder if one was set), so converting a second file doesn't
+        # keep writing to the first file's name.
+        self._update_output_path()
         self._inspect(path)
 
     def _refresh_units(self):
