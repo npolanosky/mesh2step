@@ -186,5 +186,29 @@
     ],
     "file": "fillet_chamfer_plate.stl",
     "triangles": 144
+  },
+  {
+    "kind": "swept_wavy_wall",
+    "dims_mm": [
+      40,
+      40,
+      50.0
+    ],
+    "cylinders": [],
+    "swept": [
+      {
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "extent": 50.0,
+        "profile": "line+arc+line",
+        "arc_radius": 10.0,
+        "thickness": 3.0
+      }
+    ],
+    "file": "swept_wavy_wall.stl",
+    "triangles": 212
   }
 ]

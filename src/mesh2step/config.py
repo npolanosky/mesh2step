@@ -218,6 +218,63 @@ class ConversionConfig:
     # (above this it is a real, near-full cylinder that detect_cylinders owns).
     max_fillet_coverage: float = 0.6
 
+    # --- Swept / extruded curved-wall reconstruction (M4). See
+    # docs/CURVED_FEATURES.md §6a — 60%+ of residual facetedness on the corpus.
+    # A swept wall is a constant-cross-section extrusion: its facet normals are
+    # all perpendicular to one direction d, and the profile repeats along d. It
+    # arrives tessellated as a fan of thin planar strips (a smooth chain). We
+    # detect the region (fixed-d chain growth), fit the 2D profile (line + arc +
+    # B-spline with 2D tangency snapping), and extrude it along d.
+
+    # Detect and rebuild swept curved walls. Behind this flag so the whole
+    # feature can be disabled if it ever regresses a part.
+    detect_swept_walls: bool = True
+
+    # A member strip's normal must stay within this |cos| of perpendicular to the
+    # fixed sweep direction d (|n·d| <= this) to join the sweep. Small so end
+    # caps (n parallel to d) and non-swept curvature are excluded.
+    swept_axis_perp_tol: float = 0.08
+
+    # Minimum planar strips (arc rows) a swept chain must contain, and minimum
+    # total facets — below these it is noise, not a genuine tessellated sweep.
+    swept_min_regions: int = 4
+    swept_min_facets: int = 12
+
+    # The sweep must span a meaningful extent along d (mm) — a sub-millimetre
+    # "sweep" is a sliver, not a wall. Also expressed relative to the profile
+    # size so a tiny feature isn't rebuilt as an extrusion.
+    swept_min_extent: float = 1.0
+
+    # Max RMS (mm) of the fitted 2D profile curve to the region's rail points,
+    # resolution-scaled the same way as fillets (max of this and
+    # curve_fit_tol_rel * local_edge). Above it the sweep is left faceted.
+    swept_profile_tol_abs: float = 0.05
+
+    # 2D tangency snap: where a fitted arc/spline meets a straight profile segment
+    # within this angle (deg, resolution-scaled by median dihedral) of tangency,
+    # snap to exact tangency — the product-owner rule applied in 2D. Reuses the
+    # same near/far policy as fillets (tangency_floor_deg / tangency_k).
+
+    # Minimum profile-segment length (mm) to fit as its own line/arc; shorter
+    # runs are folded into the B-spline. Keeps micro-noise from spawning
+    # segments.
+    swept_min_segment_len: float = 0.8
+
+    # Arc acceptance: a run of profile points is an arc when the circle fit RMS
+    # is below swept_profile_tol_abs + this fraction of the radius. Rail points
+    # sit ON the true circle, so this is noise-scale (NOT chord-error scale — a
+    # loose relative tolerance would let one giant circle "fit" a whole
+    # line+arc+line profile). Otherwise the run goes to a line/B-spline.
+    swept_arc_tol_rel: float = 0.001
+
+    # After the swept lens ops, remove micro-sliver planar faces (below this
+    # area, mm^2) that drag a large flat into a smooth chain — decimation and
+    # boolean-seam wedges of negligible area that read as residual tessellation.
+    # Only chains of one dominant face plus a few such slivers are touched, via
+    # OCC defeaturing with validity/volume guards (reverts wholesale).
+    swept_defeature_slivers: bool = True
+    swept_sliver_max_area: float = 0.5
+
     # --- RTAF: Residual Tessellation Area Fraction (post-conversion quality
     # metric). See docs/CURVED_FEATURES.md §6a. Fraction of the output solid's
     # surface AREA that sits in "smooth chains" — runs of >=3 connected planar

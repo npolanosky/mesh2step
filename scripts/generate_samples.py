@@ -177,10 +177,59 @@ def fillet_chamfer_plate():
     )
 
 
+def swept_wavy_wall():
+    """A constant-cross-section extruded wall with a known profile: a straight
+    run, a tangent circular arc, and another straight run (line + arc + line with
+    tangent joins), extruded along Z. Ground truth for M4 swept-wall
+    reconstruction — the fitted profile must recover the arc radius and the
+    extrusion, and RTAF must drop to ~0.
+
+    Profile (in the XY plane): start at (0,0), go +X to (30,0); a tangent arc of
+    radius R=10 turning the direction upward by 90deg (center at (30,10), ending
+    at (40,10)); then +Y to (40,40). The wall is that profile given a 3 mm
+    thickness (offset) and extruded 50 mm in Z. The outer edge is the line+arc+
+    line curve; tangency at both joins is exact by construction.
+    """
+    import math
+
+    R, T, HZ = 10.0, 3.0, 50.0
+    # Outer profile points (fine): line (0,0)->(30,0), arc r=10 center (30,10)
+    # from angle -90deg to 0deg, line (40,10)->(40,40).
+    outer = [App.Vector(0, 0, 0), App.Vector(30, 0, 0)]
+    steps = 24
+    for k in range(1, steps + 1):
+        a = math.radians(-90 + 90 * k / steps)
+        outer.append(App.Vector(30 + R * math.cos(a), 10 + R * math.sin(a), 0))
+    outer.append(App.Vector(40, 40, 0))
+    # Inner profile: offset the outer curve inward (toward +Y for the first line,
+    # toward -X for the last line) by T. Build via a simple parallel offset:
+    # first line y=0 -> y=T; arc radius R-T same center; last line x=40 -> x=40-T.
+    inner = [App.Vector(40 - T, 40, 0), App.Vector(40 - T, 10, 0)]
+    for k in range(steps, -1, -1):
+        a = math.radians(-90 + 90 * k / steps)
+        inner.append(App.Vector(30 + (R - T) * math.cos(a), 10 + (R - T) * math.sin(a), 0))
+    inner.append(App.Vector(30, T, 0))
+    inner.append(App.Vector(0, T, 0))
+    pts = outer + inner + [outer[0]]
+    wire = Part.makePolygon(pts)
+    face = Part.Face(wire)
+    solid = face.extrude(App.Vector(0, 0, HZ))
+    return save(
+        solid,
+        "swept_wavy_wall",
+        {"kind": "swept_wavy_wall", "dims_mm": [40, 40, HZ],
+         "cylinders": [],
+         "swept": [{"axis": [0, 0, 1], "extent": HZ,
+                    "profile": "line+arc+line", "arc_radius": R,
+                    "thickness": T}]},
+    )
+
+
 def main():
     print(f"Writing samples to {OUT} (deflection={DEFLECTION} mm)")
     truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe(),
-              countersink_plate(), angled_hole_plate(), fillet_chamfer_plate()]
+              countersink_plate(), angled_hole_plate(), fillet_chamfer_plate(),
+              swept_wavy_wall()]
     (OUT / "samples.json").write_text(json.dumps(truths, indent=2))
     print(f"Wrote {len(truths)} samples + samples.json")
 

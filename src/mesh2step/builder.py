@@ -17,16 +17,20 @@ from .boundary import FaceLoops, extract_face_loops
 from .config import ConversionConfig
 from .fitting import (
     Cylinder,
+    SweptProfile,
     _connected_components,
     detect_cones,
     detect_cylinders,
     detect_fillets_straight,
+    detect_swept_walls,
 )
 from .segmentation import (
     build_edge_adjacency,
+    face_normals_and_areas,
     mesh_resolution,
     segment_planar,
     segment_smooth_bands,
+    segment_swept_walls,
 )
 
 
@@ -211,6 +215,331 @@ def _cone_face(cone, Part):
     return lateral if cone.outward else lateral.reversed()
 
 
+# --------------------------------------------------------------------------- #
+# Swept / extruded curved walls (Milestone 4). Each fitted profile segment
+# becomes one extruded face: a line extrudes to a plane, an arc to an analytic
+# cylinder sector, a spline to an extruded-B-spline surface — replacing the fan
+# of thin planar strips the tessellation shipped.
+# --------------------------------------------------------------------------- #
+
+
+def _arc_mid_point2(seg) -> np.ndarray:
+    """2D midpoint ON the fitted arc, halfway along its traversal direction."""
+    c, r = seg.center, seg.radius
+    a0 = math.atan2(seg.p0[1] - c[1], seg.p0[0] - c[0])
+    a1 = math.atan2(seg.p1[1] - c[1], seg.p1[0] - c[0])
+    if seg.ccw:
+        while a1 <= a0:
+            a1 += 2.0 * math.pi
+    else:
+        while a1 >= a0:
+            a1 -= 2.0 * math.pi
+    am = 0.5 * (a0 + a1)
+    return np.array([c[0] + r * math.cos(am), c[1] + r * math.sin(am)])
+
+
+def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
+                          max_ops: int = 200) -> tuple:
+    """Apply one boolean lens op per fitted swept-arc segment to a valid solid.
+
+    Shared by both tiers: the sew tier runs it on the closed reconstructed
+    solid, the boolean tier on the faceted base. Cut for concave walls, guarded
+    fuse for convex; every op goes through ``_try_boolean_step`` so a bad lens
+    reverts and can never cost watertightness. Wide arcs are skipped (their
+    chord<->arc lens grows fat enough to reach unrelated geometry), as is
+    anything beyond the op budget on pathological meshes.
+
+    Returns ``(solid, ops_attempted, ops_succeeded)``.
+    """
+    try:
+        bb0 = solid.BoundBox
+        bounds0 = (bb0.XMin, bb0.YMin, bb0.ZMin, bb0.XMax, bb0.YMax, bb0.ZMax)
+    except Exception:  # noqa: BLE001
+        bounds0 = None
+
+    def guarded(s, p, g, deep):
+        candidate = _boolean_clean_swept(s, p, g, Part)
+        # Bounding-box guard: a lens op trues an existing wall, so it can never
+        # legitimately grow the part beyond the chord-sagitta scale. A fuse
+        # whose material-side classification was wrong bulges outward instead —
+        # a valid solid the volume guard alone can miss on fat lenses.
+        if bounds0 is not None:
+            bb = candidate.BoundBox
+            grow = max(bounds0[0] - bb.XMin, bounds0[1] - bb.YMin,
+                       bounds0[2] - bb.ZMin, bb.XMax - bounds0[3],
+                       bb.YMax - bounds0[4], bb.ZMax - bounds0[5])
+            if grow > 0.2:
+                raise ValueError(f"swept lens op rejected: bbox grew {grow:.2f} mm")
+        if deep:
+            _check_no_self_intersection(candidate)
+        return candidate
+
+    # Distinct arc ops (duplicate rails — the min/max copies of the same wall
+    # profile — fit identical arcs; one op per distinct arc suffices).
+    todo: list[tuple] = []
+    seen: set[tuple] = set()
+    for prof in profiles:
+        for seg in prof.segments:
+            if seg.kind != "arc" or seg.outward is None:
+                continue
+            c3 = prof.point3d(seg.center)
+            key = (tuple(np.round(c3, 2)), tuple(np.round(prof.axis, 2)),
+                   round(float(seg.radius), 2),
+                   round(math.degrees(_arc_span_rad(seg)), 0), bool(seg.outward))
+            if key in seen:
+                continue
+            seen.add(key)
+            todo.append((prof, seg))
+    todo = todo[:max_ops]
+    if not todo:
+        return solid, 0, 0
+
+    def run(start_solid, deep):
+        s = start_solid
+        n_ok = 0
+        for prof, seg in todo:
+            s, ok = _try_boolean_step(
+                s, lambda cur, p=prof, g=seg: guarded(cur, p, g, deep))
+            n_ok += ok
+        return s, n_ok
+
+    # Fast pass with cheap per-op guards, then ONE deep BOP self-intersection
+    # check of the final result: OCC booleans occasionally produce a shape that
+    # passes isValid() in memory yet re-reads invalid from the exported STEP
+    # (seen on a convex lens fuse). The deep check catches those, but at ~1 s a
+    # call it must not run per op in the common case — so it runs per-op only
+    # in the retry pass, and only when the fast pass's result fails it.
+    baseline = solid.copy()
+    # The deep gate is only informative when the BASE passes it: some meshes
+    # arrive with (benign, tolerated) self-intersections that every candidate
+    # would inherit, and rejecting on those would veto all ops. For such parts
+    # the per-op isValid/bbox/volume guards plus the pipeline's export
+    # re-validation remain the safety net.
+    try:
+        _check_no_self_intersection(baseline)
+        base_clean = True
+    except Exception:  # noqa: BLE001
+        base_clean = False
+    result, ok_count = run(solid, deep=False)
+    if ok_count and base_clean:
+        try:
+            _check_no_self_intersection(result)
+        except Exception:  # noqa: BLE001 - retry, filtering the offending op(s)
+            progress("  swept result failed deep check; retrying with per-op checks")
+            result, ok_count = run(baseline, deep=True)
+    progress(f"  swept-wall arcs cleaned {ok_count}/{len(todo)}")
+    return result, len(todo), ok_count
+
+
+def _check_no_self_intersection(shape) -> None:
+    """Raise if OCC's BOP check reports a self-intersection.
+
+    ``shape.check(True)`` reports several error classes; benign ones
+    (TooSmallEdge, InvalidCurveOnSurface) occur even on solids that export and
+    re-read perfectly, but a BOPAlgo SelfIntersect passes ``isValid()`` in
+    memory and then re-reads INVALID from the exported STEP. Only the fatal
+    class rejects.
+    """
+    try:
+        shape.check(True)
+    except Exception as exc:  # noqa: BLE001 - inspect the error classes
+        if "SelfIntersect" in str(exc):
+            raise ValueError("BOP check: self-intersection") from exc
+
+
+def _arc_span_rad(seg) -> float:
+    """Angular span (rad, positive) of a fitted arc segment."""
+    c = seg.center
+    a0 = math.atan2(seg.p0[1] - c[1], seg.p0[0] - c[0])
+    a1 = math.atan2(seg.p1[1] - c[1], seg.p1[0] - c[0])
+    if seg.ccw:
+        while a1 <= a0:
+            a1 += 2.0 * math.pi
+        return a1 - a0
+    while a1 >= a0:
+        a1 -= 2.0 * math.pi
+    return a0 - a1
+
+
+def _annotate_profile(vertices, faces_sub, profile: SweptProfile, normals, areas) -> None:
+    """Annotate each arc segment with its material side + facet coverage.
+
+    ``outward``: the member facets' normals point away from the arc centre —
+    a convex wall whose inscribed facets stop short of the true surface (fuse
+    the sliver); ``False`` is a concave wall whose chords overshoot (cut).
+    ``covered``: the segment's parametric rectangle (arc span x axial extent)
+    is essentially fully covered by facet area; ``False`` means cutouts pierce
+    the wall there and a fuse would bridge them (only cuts stay safe).
+    """
+    idx = np.asarray(profile.face_indices, dtype=int)
+    if idx.size == 0:
+        return
+    cent = vertices[faces_sub[idx]].mean(axis=1)
+    rel = cent - profile.origin
+    c2 = np.column_stack((rel @ profile.e1, rel @ profile.e2))
+    n2 = np.column_stack((normals[idx] @ profile.e1, normals[idx] @ profile.e2))
+    n2n = np.linalg.norm(n2, axis=1)
+    n2u = n2 / (n2n[:, None] + 1e-12)
+    ar = areas[idx]
+    extent = profile.axial_max - profile.axial_min
+    for seg in profile.segments:
+        if seg.kind != "arc" or seg.radius <= 1e-9:
+            continue
+        c = seg.center
+        span = _arc_span_rad(seg)
+        a0 = math.atan2(seg.p0[1] - c[1], seg.p0[0] - c[0])
+        d = c2 - c
+        rho = np.linalg.norm(d, axis=1)
+        ang = np.arctan2(d[:, 1], d[:, 0])
+        off = (ang - a0) if seg.ccw else (a0 - ang)
+        off = np.mod(off, 2.0 * math.pi)
+        # Radial band capped by half the radius: a thin panel's two opposite
+        # surfaces both project near the profile curve, and a loose band would
+        # mix their (opposite) normals into a coin-flip classification.
+        band = min(1.5, max(0.3, 0.5 * seg.radius))
+        in_zone = (off <= span) & (np.abs(rho - seg.radius) <= band)
+        radial = d / (rho[:, None] + 1e-12)
+        align = np.sum(n2u * radial, axis=1)
+        # An arc-band facet's normal is radial about the arc centre; tangent
+        # wall facets near the join and opposite-side panel facets are not.
+        mask = in_zone & (np.abs(align) > 0.8) & (n2n > 0.3)
+        if mask.sum() < 1:
+            seg.outward = None
+            continue
+        mean_align = float(np.mean(align[mask]))
+        if abs(mean_align) < 0.6:
+            # Mixed population (both material sides in the band): unsafe.
+            seg.outward = None
+            continue
+        seg.outward = bool(mean_align > 0)
+        expected = span * seg.radius * extent
+        seg.covered = bool(expected > 1e-9
+                           and float(ar[in_zone].sum()) >= 0.8 * expected)
+
+
+def _fit_swepts(vertices, faces_sub, regions, config: ConversionConfig, progress):
+    """Detect + fit + annotate swept walls on an (unclaimed) face subset.
+
+    Best-effort: any failure returns no profiles and leaves the strips faceted.
+    """
+    if not config.detect_swept_walls:
+        return []
+    try:
+        resolution = mesh_resolution(vertices, faces_sub, config)
+        sweeps = segment_swept_walls(vertices, faces_sub, set(), regions, config)
+        profiles = detect_swept_walls(vertices, faces_sub, sweeps, config, resolution)
+        normals, areas = face_normals_and_areas(vertices, faces_sub)
+        for pr in profiles:
+            _annotate_profile(vertices, faces_sub, pr, normals, areas)
+    except Exception as exc:  # noqa: BLE001 - swept detection is best-effort
+        progress(f"Swept-wall detection skipped ({exc})")
+        return []
+    if profiles:
+        snaps = sum(p.tangency_snaps for p in profiles)
+        arcs = sum(p.n_arcs for p in profiles)
+        progress(f"Found {len(profiles)} swept wall(s) "
+                 f"({arcs} arc segment(s), {snaps} tangency-snapped joins)")
+    return profiles
+
+
+def _swept_arc_lens_tool(profile: SweptProfile, seg, Part, pad: float):
+    """Boolean tool for one swept arc segment: the chord<->arc lens, extruded.
+
+    The lens is the 2D region between the arc (pushed out by a cut-eps so the
+    surface clears the on-circle vertices instead of pinching them) and its full
+    chord, lifted to 3D and extruded along the sweep axis over the wall's axial
+    extent (+/- ``pad``). Material-side logic (design §4 boolean pattern):
+
+    - Convex wall (facets inscribed): material stops at the chords; FUSING the
+      lens adds the sliver up to the true curve. The part of the lens between
+      the big chord and the faceted surface already overlaps material — a fuse
+      is idempotent there.
+    - Concave wall (chords overshoot): the sliver between the faceted surface
+      and the true curve is excess material; CUTTING the lens removes exactly
+      it. The rest of the lens is void, where a cut is a no-op.
+    """
+    R = float(seg.radius)
+    eps = _clean_cut_eps(R)
+    scale = (R + eps) / R
+    c2 = seg.center
+    p0s = c2 + (seg.p0 - c2) * scale
+    p1s = c2 + (seg.p1 - c2) * scale
+    pms = c2 + (_arc_mid_point2(seg) - c2) * scale
+    axis = profile.axis
+    shift = -pad * axis
+    P0 = profile.point3d(p0s) + shift
+    P1 = profile.point3d(p1s) + shift
+    Pm = profile.point3d(pms) + shift
+    chord = Part.makeLine(_vec(P0), _vec(P1))
+    arc = Part.Arc(_vec(P1), _vec(Pm), _vec(P0)).toShape()
+    wire = Part.Wire([chord, arc])
+    face = Part.Face(wire)
+    extent = profile.axial_max - profile.axial_min
+    return face.extrude(_vec(axis * (extent + 2.0 * pad)))
+
+
+def _guarded_cut(solid, tool, max_removed_frac: float = 0.5):
+    """Cut a tool, but refuse if it would remove a large share of the tool.
+
+    A correct swept-lens cut removes only the thin sagitta sliver between the
+    faceted wall and the true curve — a small fraction of the lens volume. A
+    mis-fitted lens that lands inside solid material would remove ~its whole
+    volume; that would silently carve the part while staying a valid solid, so
+    validity checks alone cannot catch it.
+    """
+    cut = solid.cut(tool)
+    removed = solid.Volume - cut.Volume
+    if removed > max_removed_frac * tool.Volume:
+        raise ValueError(
+            f"swept lens cut rejected: would remove {removed:.2f} of the tool's "
+            f"{tool.Volume:.2f} volume (mis-fitted profile)")
+    return cut
+
+
+def _swept_arc_cylinder_tool(profile: SweptProfile, seg, Part, pad: float):
+    """Boolean tool for a wide (>178 deg) swept arc: the full cylinder.
+
+    A wall-end bead (rounded free edge of a thin wall) or a rounded groove
+    wraps more than half the circle, so the chord<->arc lens degenerates; the
+    full cylinder at the fitted centre is the natural tool — exactly the
+    hole/boss treatment, with the axis being the sweep direction.
+    """
+    R = float(seg.radius) + _clean_cut_eps(float(seg.radius))
+    axis = profile.axis
+    base = profile.point3d(seg.center) - pad * axis
+    extent = profile.axial_max - profile.axial_min
+    return Part.makeCylinder(R, float(extent + 2.0 * pad), _vec(base), _vec(axis))
+
+
+def _boolean_clean_swept(solid, profile: SweptProfile, seg, Part):
+    """Replace one faceted swept-arc wall band with the analytic surface via a
+    boolean op: a chord<->arc lens for partial arcs, the full cylinder for
+    beads/grooves wrapping more than half the circle. Cut for concave walls,
+    guarded fuse for convex."""
+    wide = _arc_span_rad(seg) > math.radians(178.0)
+    if seg.outward:
+        if not seg.covered:
+            raise ValueError("swept fuse skipped: wall pierced by cutouts")
+        if wide:
+            # Rounded wall-end bead: fuse the full cylinder over the exact
+            # extent. Coarse beads add up to ~a third of the tool (polygon-to-
+            # circle sliver), so the guard is looser than the lens's.
+            tool = _swept_arc_cylinder_tool(profile, seg, Part, pad=0.0)
+            return _guarded_fuse(solid, tool, max_added_frac=0.45)
+        tool = _swept_arc_lens_tool(profile, seg, Part, pad=0.0)
+        # A correct fuse adds only the sagitta sliver (~4-15% of the lens even
+        # on coarse 3-chord arcs); a mis-classified convex wall would add most
+        # of the lens, so the cap is deliberately tight.
+        return _guarded_fuse(solid, tool, max_added_frac=0.25)
+    pad = _cut_pad(profile.axial_max - profile.axial_min)
+    if wide:
+        # Rounded groove / slot end: cut the full cylinder, like a bore.
+        tool = _swept_arc_cylinder_tool(profile, seg, Part, pad=pad)
+        return _guarded_cut(solid, tool, max_removed_frac=0.6)
+    tool = _swept_arc_lens_tool(profile, seg, Part, pad=pad)
+    return _guarded_cut(solid, tool, max_removed_frac=0.5)
+
+
 def build_reconstructed_solid(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -261,6 +590,15 @@ def build_reconstructed_solid(
 
     progress("Segmenting planar regions")
     regions = segment_planar(vertices, faces_sub, config)
+
+    # Swept/extruded curved walls (M4): fit profiles for chains of thin strips
+    # perpendicular to a common extrusion direction. The strips are still built
+    # and sewn as before (their chordal edges are what closes the shell); once
+    # the solid is closed and valid, each fitted arc segment is replaced by the
+    # analytic surface via a boolean lens op below — booleans recompute the
+    # intersection geometry, so no analytic-vs-chordal edge matching is needed.
+    swept_profiles = _fit_swepts(vertices, faces_sub, regions, config, progress)
+
     progress(f"Building {len(regions):,} planar faces")
     occ_faces = []
     reconstructed = 0
@@ -344,6 +682,24 @@ def build_reconstructed_solid(
     progress(f"Sewing {len(occ_faces):,} faces into a solid")
     shape, is_solid = _faces_to_solid(occ_faces, Part, config.sew_tolerance, on_progress)
 
+    # Swept-wall lens ops (M4): on a closed, valid solid, replace each fitted
+    # arc segment's chordal strip fan with the analytic surface via a boolean
+    # cut/fuse. Every op reverts on invalidity, so this can only improve the
+    # surface, never cost watertightness.
+    swept_ops = 0
+    swept_built = 0
+    if is_solid and swept_profiles:
+        shape, swept_ops, swept_built = _apply_swept_lens_ops(
+            shape, swept_profiles, Part, progress)
+        if swept_built:
+            # Simplify a snapshot: the OCC call can corrupt its input in place.
+            backup = shape.copy()
+            simplified = _safe_remove_splitter(shape, Part)
+            shape = simplified if _is_valid_solid(simplified) else backup
+            shape, _slivers = _defeature_sliver_chains(shape, config, Part, progress)
+            solids = getattr(shape, "Solids", [])
+            is_solid = bool(solids) and solids[0].isValid()
+
     stats = {
         "faces_in": int(len(faces)),
         "planar_faces": reconstructed,
@@ -361,6 +717,11 @@ def build_reconstructed_solid(
         "fillets_detected": len(fillets),
         "fillets": [f.as_dict() for f in fillets],
         "fillet_radius_source": _radius_source_breakdown(fillets),
+        "swept_walls_detected": len(swept_profiles),
+        "swept_walls_built": swept_built,
+        "swept_arc_ops": swept_ops,
+        "swept_tangency_snaps": sum(p.tangency_snaps for p in swept_profiles),
+        "swept_detail": [p.as_dict() for p in swept_profiles],
         "skipped_facets": skipped,
         "is_solid": is_solid,
     }
@@ -826,6 +1187,22 @@ def build_boolean_clean_solid(
     for c in cones:
         claimed.update(c.face_indices)
     fillets = _detect_fillets(vertices, faces, claimed, config, progress)
+    for f in fillets:
+        claimed.update(f.face_indices)
+
+    # Swept/extruded curved walls (M4), after fillets in the detector ladder.
+    # Fitted on the facets no other detector claimed; each arc segment becomes a
+    # boolean lens op (cut/fuse) against the faceted base below.
+    swept_profiles: list[SweptProfile] = []
+    if config.detect_swept_walls:
+        keep_sw = [i for i in range(len(faces)) if i not in claimed]
+        faces_sw = faces[keep_sw]
+        try:
+            regions_sw = segment_planar(vertices, faces_sw, config)
+        except Exception:  # noqa: BLE001 - detection is best-effort
+            regions_sw = []
+        if regions_sw:
+            swept_profiles = _fit_swepts(vertices, faces_sw, regions_sw, config, progress)
 
     progress("Building faceted watertight solid (base)")
     solid = build_faceted_solid(vertices, faces)
@@ -891,12 +1268,43 @@ def build_boolean_clean_solid(
     if fillets:
         progress(f"  fillets cleaned {fillet_ok}/{len(fillets)}")
 
-    total = len(cylinders) + len(cones) + len(fillets)
-    cleaned = cyl_ok + cone_ok + fillet_ok
+    # Swept walls last: one lens op (cut for concave, guarded fuse for convex)
+    # per fitted arc segment, each reverting on invalidity. If the whole batch
+    # introduces artifact radii the pre-swept solid didn't have (seen when lens
+    # ops nibble at a spherical dome's latitude rows — M3 geometry), the batch
+    # is rolled back wholesale: swept reconstruction must never turn an
+    # artifact-free part into a dual-output one.
+    detected_r = sorted({round(c.radius, 3) for c in cylinders}
+                        | {round(f.radius, 3) for f in fillets}
+                        | {round(seg.radius, 3) for p in swept_profiles
+                           for seg in p.segments if seg.kind == "arc"})
+    pre_swept = solid.copy()
+    pre_rogue = set(_rogue_radii(solid, detected_r))
+    solid, swept_ops, swept_ok = _apply_swept_lens_ops(
+        solid, swept_profiles, Part, progress)
+
+    # removeSplitter is an optimization; on shells dense with fresh boolean
+    # seams it can occasionally produce an invalid solid — AND the underlying
+    # OCC call can corrupt the *input* shape in place (shared internal shape
+    # data), so simplify a snapshot and keep whichever is a valid solid.
+    backup = solid.copy()
+    simplified = _safe_remove_splitter(solid, Part)
+    solid = simplified if _is_valid_solid(simplified) else backup
+    solid, slivers_removed = _defeature_sliver_chains(solid, config, Part, progress)
+
+    if swept_ok and set(_rogue_radii(solid, detected_r)) - pre_rogue:
+        progress("  swept ops introduced artifact radii; rolling back swept ops")
+        swept_ok = 0
+        backup = pre_swept.copy()
+        simplified = _safe_remove_splitter(pre_swept, Part)
+        solid = simplified if _is_valid_solid(simplified) else backup
+        solid, slivers_removed = _defeature_sliver_chains(solid, config, Part, progress)
+
+    total = len(cylinders) + len(cones) + len(fillets) + swept_ops
+    cleaned = cyl_ok + cone_ok + fillet_ok + swept_ok
     progress(f"Boolean clean-up: {cleaned}/{total} features replaced with analytic geometry "
              f"({total - cleaned} left faceted)")
 
-    solid = _safe_remove_splitter(solid, Part)
     solids = getattr(solid, "Solids", [])
     is_solid = bool(solids) and solids[0].isValid()
 
@@ -905,14 +1313,7 @@ def build_boolean_clean_solid(
     # by booleans on intersecting holes show up as faces at *other* radii — those
     # cause downstream CAD issues, so we flag them and the caller rejects the
     # result rather than shipping artifacts.
-    detected_r = sorted({round(c.radius, 3) for c in cylinders}
-                        | {round(f.radius, 3) for f in fillets})
-    rogue = []
-    for fc in solid.Faces:
-        if fc.Surface.TypeId == "Part::GeomCylinder":
-            r = fc.Surface.Radius
-            if not any(abs(r - d) <= 0.05 * d + 0.05 for d in detected_r):
-                rogue.append(round(r, 3))
+    rogue = _rogue_radii(solid, detected_r)
     artifact_free = len(rogue) == 0
 
     stats = {
@@ -928,6 +1329,12 @@ def build_boolean_clean_solid(
         "cylinders": [c.as_dict() for c in cylinders],
         "cones": [c.as_dict() for c in cones],
         "fillets": [f.as_dict() for f in fillets],
+        "swept_walls_detected": len(swept_profiles),
+        "swept_walls_built": swept_ok,
+        "swept_arc_ops": swept_ops,
+        "swept_tangency_snaps": sum(p.tangency_snaps for p in swept_profiles),
+        "swept_slivers_removed": slivers_removed,
+        "swept_detail": [p.as_dict() for p in swept_profiles],
         "boolean_cleaned": cleaned,
         "boolean_failed": total - cleaned,
         "artifact_free": artifact_free,
@@ -937,11 +1344,110 @@ def build_boolean_clean_solid(
     return solid, stats
 
 
+def _rogue_radii(solid, detected_r) -> list:
+    """Cylinder-face radii in ``solid`` that match no detected feature radius."""
+    rogue = []
+    try:
+        for fc in solid.Faces:
+            if fc.Surface.TypeId == "Part::GeomCylinder":
+                r = fc.Surface.Radius
+                if not any(abs(r - d) <= 0.05 * d + 0.05 for d in detected_r):
+                    rogue.append(round(r, 3))
+    except Exception:  # noqa: BLE001 - a scan failure must not break the build
+        pass
+    return sorted(set(rogue))
+
+
 def _face_plane_normal(face) -> np.ndarray:
     """Unit normal of a planar face's surface (its plane Axis)."""
     n = face.Surface.Axis
     v = np.array([n.x, n.y, n.z], float)
     return v / (np.linalg.norm(v) or 1.0)
+
+
+def _defeature_sliver_chains(solid, config: ConversionConfig, Part, progress):
+    """Remove micro-sliver planar faces that drag large flats into smooth
+    chains (M4 cleanup; see docs/CURVED_FEATURES.md §6a).
+
+    Decimation and boolean seams leave near-zero-area planar wedges tilted a
+    few degrees off an adjacent big flat. Geometrically they are noise, but
+    the RTAF smooth-chain construction (correctly) links them to the flat —
+    one 0.05 mm^2 sliver can mark a 20,000 mm^2 wall as residual tessellation.
+    OCC defeaturing removes the sliver faces and heals the gap by extending
+    their neighbours; since only chains consisting of ONE dominant face plus a
+    handful of sub-``swept_sliver_max_area`` slivers are touched, the healed
+    geometry differs by a sliver-sized amount (volume-guarded, reverts
+    wholesale on any doubt).
+
+    Returns ``(solid, n_removed)``.
+    """
+    if not (config.detect_swept_walls and config.swept_defeature_slivers):
+        return solid, 0
+    try:
+        faces = list(solid.Faces)
+    except Exception:  # noqa: BLE001
+        return solid, 0
+    n = len(faces)
+    if n == 0 or n > 20000:
+        return solid, 0
+    try:
+        is_plane = [f.Surface.TypeId == "Part::GeomPlane" for f in faces]
+        normals = [_face_plane_normal(faces[i]) if is_plane[i] else None
+                   for i in range(n)]
+        edge_map: dict = {}
+        for fi, f in enumerate(faces):
+            for e in f.Edges:
+                k = _rtaf_edge_key(e)
+                if k is not None:
+                    edge_map.setdefault(k, set()).add(fi)
+        lo, hi = float(config.rtaf_angle_lo), float(config.rtaf_angle_hi)
+        adj: dict[int, set[int]] = {i: set() for i in range(n)}
+        for fs in edge_map.values():
+            fl = sorted(fs)
+            for a_i in range(len(fl)):
+                for b_i in range(a_i + 1, len(fl)):
+                    a, b = fl[a_i], fl[b_i]
+                    if not (is_plane[a] and is_plane[b]):
+                        continue
+                    d = min(abs(float(normals[a] @ normals[b])), 1.0)
+                    ang = math.degrees(math.acos(d))
+                    if lo < ang < hi:
+                        adj[a].add(b)
+                        adj[b].add(a)
+        seen: set[int] = set()
+        slivers: list[int] = []
+        max_area = float(config.swept_sliver_max_area)
+        for i in range(n):
+            if i in seen or not adj[i]:
+                continue
+            comp, stack = [], [i]
+            seen.add(i)
+            while stack:
+                x = stack.pop()
+                comp.append(x)
+                for y in adj[x]:
+                    if y not in seen:
+                        seen.add(y)
+                        stack.append(y)
+            if len(comp) < config.rtaf_min_chain:
+                continue
+            small = [x for x in comp if faces[x].Area < max_area]
+            # Only the unambiguous case: one dominant face + a few slivers.
+            if 0 < len(small) <= 4 and len(small) == len(comp) - 1:
+                slivers.extend(small)
+        if not slivers or len(slivers) > 80:
+            return solid, 0
+        candidate = solid.defeaturing([faces[i] for i in slivers])
+        solids = getattr(candidate, "Solids", [])
+        if len(solids) != 1 or not solids[0].isValid():
+            return solid, 0
+        if abs(candidate.Volume - solid.Volume) > 5.0:
+            return solid, 0
+        _check_no_self_intersection(candidate)
+        progress(f"  defeatured {len(slivers)} sliver face(s) off smooth chains")
+        return candidate, len(slivers)
+    except Exception:  # noqa: BLE001 - cleanup is best-effort; keep the solid
+        return solid, 0
 
 
 def _rtaf_edge_key(edge, ndig: int = 4):

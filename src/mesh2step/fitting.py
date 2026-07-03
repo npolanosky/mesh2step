@@ -11,14 +11,17 @@ Pure numpy; no FreeCAD. The builder consumes the :class:`Cylinder` results.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from .config import ConversionConfig
+from .boundary import _chain_loops, _directed_boundary_edges
 from .segmentation import (
     MeshResolution,
     Region,
+    SweptRegion,
     build_edge_adjacency,
     face_normals_and_areas,
     mesh_resolution,
@@ -910,3 +913,550 @@ def detect_fillets_straight(
             fillets.append(cyl)
             claimed.update(cyl.face_indices)
     return fillets
+
+
+# --------------------------------------------------------------------------- #
+# Swept / extruded curved walls (Milestone 4). Given a SweptRegion (a set of
+# planar strips whose normals are all perpendicular to a common extrusion axis),
+# recover the 2D profile curve so the builder can extrude it into a single
+# analytic/B-spline face instead of a fan of thin planar strips.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ProfileSegment:
+    """One fitted piece of a swept profile, in 2D profile-plane coordinates.
+
+    ``kind`` is ``"line"``, ``"arc"``, or ``"spline"``.
+    Lines: ``p0``, ``p1`` endpoints (2,).
+    Arcs: ``p0``, ``p1`` endpoints plus ``center`` (2,) and ``radius``, with
+    ``ccw`` giving the sweep sense.
+    Splines: ``points`` (k,2) interpolation points.
+    """
+
+    kind: str
+    p0: np.ndarray | None = None
+    p1: np.ndarray | None = None
+    center: np.ndarray | None = None
+    radius: float = 0.0
+    ccw: bool = True
+    points: np.ndarray | None = None
+    tangent_start: bool = False   # snapped tangent to the previous segment
+    tangent_end: bool = False
+    # Builder annotations (set by the builder from the mesh, arcs only):
+    # ``outward``: facet normals point away from the arc centre (convex wall —
+    # facets inscribed, fuse the sliver) vs toward it (concave — overshoot, cut).
+    # ``covered``: the segment's parametric rectangle (arc span x axial extent)
+    # is fully covered by facets — False when cutouts pierce the wall, which
+    # makes a fuse unsafe (it would bridge the holes).
+    outward: bool | None = None
+    covered: bool = True
+
+
+@dataclass
+class SweptProfile:
+    """A fitted swept wall: an ordered list of 2D profile segments in the plane
+    perpendicular to ``axis``, plus the plane basis and axial extent so the
+    builder can lift each 2D point back to 3D and extrude.
+    """
+
+    axis: np.ndarray            # (3,) unit extrusion direction
+    origin: np.ndarray          # (3,) plane origin (a point on the min-axial rail)
+    e1: np.ndarray              # (3,) profile-plane basis vector 1
+    e2: np.ndarray              # (3,) profile-plane basis vector 2
+    segments: list[ProfileSegment]
+    axial_min: float
+    axial_max: float
+    closed: bool
+    rms: float                  # RMS of the fit to the rail points (mm)
+    face_indices: list[int]
+    n_arcs: int = 0
+    n_lines: int = 0
+    n_splines: int = 0
+    tangency_snaps: int = 0
+    member_regions: list[int] = field(default_factory=list)
+
+    def point3d(self, p2: np.ndarray) -> np.ndarray:
+        return self.origin + float(p2[0]) * self.e1 + float(p2[1]) * self.e2
+
+    def as_dict(self) -> dict:
+        return {
+            "axis": [float(x) for x in self.axis],
+            "extent": float(self.axial_max - self.axial_min),
+            "segments": len(self.segments),
+            "lines": self.n_lines, "arcs": self.n_arcs, "splines": self.n_splines,
+            "tangency_snaps": self.tangency_snaps,
+            "closed": self.closed, "rms": float(self.rms),
+            "facets": len(self.face_indices),
+        }
+
+
+def _swept_plane_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return _plane_basis(axis)
+
+
+def _extract_rails(
+    vertices: np.ndarray, faces: np.ndarray, face_indices: list[int], axis: np.ndarray,
+) -> tuple[list[tuple[np.ndarray, bool]], float, float] | None:
+    """Extract the swept region's profile rails as ordered 3D polylines.
+
+    Every boundary loop of the region lies ON the swept surface, so any
+    contiguous run of *profile-like* boundary edges (edge direction
+    perpendicular to the sweep axis) projects onto the true profile curve —
+    regardless of the run's height along the axis, because the profile is
+    height-invariant on a sweep. Classifying by edge direction (rather than
+    keeping only the lower-axial half of each loop) matters on real parts:
+    a wall's boundary weaves up and over crossing features (e.g. a shelf
+    joining mid-height), and a height cut-off would fragment or drop exactly
+    the corner-blend arcs those junctions carry. Side edges (running along the
+    axis) separate the runs.
+
+    A loop consisting entirely of profile-like edges is a closed rail (a tube
+    profile / a wall end at constant height). Rails describing the same curve
+    at two heights fit identical segments; the builder de-duplicates ops.
+
+    Returns ``([(rail_pts (k,3), closed), ...], axial_min, axial_max)`` over
+    the region, or ``None`` when no boundary exists.
+    """
+    edges = _directed_boundary_edges(faces, list(face_indices))
+    if not edges:
+        return None
+    loops = _chain_loops(edges)
+    if not loops:
+        return None
+    vids = np.unique(faces[np.asarray(list(face_indices))].reshape(-1))
+    ax_all = vertices[vids] @ axis
+    amin, amax = float(ax_all.min()), float(ax_all.max())
+    if amax - amin < 1e-9:
+        return None
+
+    rails: list[tuple[np.ndarray, bool]] = []
+    for loop in loops:
+        n = len(loop)
+        if n < 3:
+            continue
+        P = vertices[np.asarray(loop)]
+        E = P[(np.arange(n) + 1) % n] - P
+        elen = np.linalg.norm(E, axis=1)
+        ok = elen > 1e-12
+        along = np.zeros(n)
+        along[ok] = np.abs(E[ok] @ axis) / elen[ok]
+        prof_like = ok & (along < 0.35)
+        if prof_like.all():
+            rails.append((P, True))
+            continue
+        if not prof_like.any():
+            continue
+        # Maximal cyclic runs of consecutive profile-like edges; edge i joins
+        # vertex i to i+1, so a run of edges s..e yields vertices s..e+1.
+        starts = [i for i in range(n) if prof_like[i] and not prof_like[(i - 1) % n]]
+        for s in starts:
+            run_v = [loop[s]]
+            i = s
+            while prof_like[i % n] and len(run_v) <= n:
+                run_v.append(loop[(i + 1) % n])
+                i += 1
+            if len(run_v) >= 3:
+                rails.append((vertices[np.asarray(run_v)], False))
+    if not rails:
+        return None
+    return rails, amin, amax
+
+
+def _resample_polyline(pts2d: np.ndarray, closed: bool) -> np.ndarray:
+    """Drop near-duplicate consecutive points from a 2D polyline.
+
+    A rail run can include a stub of the wall's vertical side edge; its points
+    all project onto (nearly) the same 2D spot, so consecutive points closer
+    than a micron-to-milli scale epsilon collapse to one.
+    """
+    out = [pts2d[0]]
+    for p in pts2d[1:]:
+        if np.linalg.norm(p - out[-1]) > 1e-3:
+            out.append(p)
+    arr = np.asarray(out)
+    if closed and len(arr) > 1 and np.linalg.norm(arr[0] - arr[-1]) < 1e-3:
+        arr = arr[:-1]
+    return arr
+
+
+def _line_reach(pts2d: np.ndarray, i0: int, line_tol: float) -> int:
+    """Furthest index a straight run from ``i0`` stays within ``line_tol``."""
+    n = len(pts2d)
+    j = i0 + 1
+    while j + 1 < n:
+        seg = pts2d[j + 1] - pts2d[i0]
+        L = np.linalg.norm(seg)
+        if L < 1e-9:
+            j += 1
+            continue
+        u = seg / L
+        rel = pts2d[i0:j + 2] - pts2d[i0]
+        perp = np.abs(rel[:, 0] * (-u[1]) + rel[:, 1] * u[0])
+        if perp.max() > line_tol:
+            break
+        j += 1
+    return j
+
+
+def _segment_profile(
+    pts2d: np.ndarray, config: ConversionConfig, local_edge: float,
+) -> list[tuple[str, int, int]]:
+    """Partition an ordered 2D polyline into runs of ``line`` / ``arc`` / ``spline``.
+
+    Line-first, curvature-gated: at each position we take the longest straight
+    run that stays within ``line_tol``. Only when a straight run cannot even
+    reach the next point (the profile genuinely bends there) do we try to fit a
+    circular arc — and accept it only if it has a bounded radius (real curvature,
+    not a near-line mega-circle) and covers >= 3 points. Everything else becomes a
+    short ``spline`` run. Returns inclusive ``(kind, i0, i1)`` spans.
+
+    A line is preferred over an arc because a straight segment is algebraically a
+    circle of huge radius; a greedy arc-first walk would otherwise swallow the
+    whole profile as one bogus arc (seen on the ground-truth line+arc+line wall).
+    """
+    n = len(pts2d)
+    runs: list[tuple[str, int, int]] = []
+    # Rail vertices sit ON the true profile curve (they are mesh vertices, not
+    # chord midpoints), so the collinearity tolerance is weld/decimation-noise
+    # scale — NOT the chord-error scale used for surface fits. A loose (edge-
+    # scaled) tolerance would let a straight run swallow the start of an
+    # adjacent arc and mis-place the junction (seen on the ground-truth wall,
+    # whose coarse strips pushed the edge-scaled tolerance to millimetres).
+    line_tol = float(config.swept_profile_tol_abs)
+    # Cap arc radius so a nearly-straight run is not accepted as a giant arc.
+    span = float(np.linalg.norm(pts2d.max(axis=0) - pts2d.min(axis=0)))
+    max_arc_radius = 4.0 * span + 1.0
+    i = 0
+    while i < n - 1:
+        jline = _line_reach(pts2d, i, line_tol)
+        # Always evaluate the arc too: on a tessellated arc every 2-3 consecutive
+        # chords also pass the line test (their sagitta is below tolerance), so a
+        # line-only-first rule would shred the arc into mini-lines. The arc wins
+        # when it explains materially more of the polyline than the line.
+        ka, radius = _extend_arc(pts2d, i, config, max_arc_radius)
+        if ka - i >= 3 and radius <= max_arc_radius and ka >= jline + 2:
+            runs.append(("arc", i, ka))
+            i = ka
+            continue
+        if jline > i + 1 or (jline == i + 1
+                             and np.linalg.norm(pts2d[jline] - pts2d[i]) > line_tol):
+            runs.append(("line", i, jline))
+            i = jline
+            continue
+        # Neither a clean line nor arc: accumulate a spline run until a straight
+        # or arc run becomes possible again.
+        k = i + 1
+        while k < n - 1:
+            if _line_reach(pts2d, k, line_tol) > k + 1:
+                break
+            ka2, _ = _extend_arc(pts2d, k, config, max_arc_radius)
+            if ka2 - k >= 3:
+                break
+            k += 1
+        runs.append(("spline", i, max(k, i + 1)))
+        i = max(k, i + 1)
+    return runs
+
+
+def _extend_arc(
+    pts2d: np.ndarray, i0: int, config: ConversionConfig, max_radius: float,
+) -> tuple[int, float]:
+    """Greedily extend a circular arc from ``i0``; return ``(i_end, radius)``.
+
+    Grows the run while the circle fit RMS stays within tolerance AND the radius
+    stays below ``max_radius`` (a near-straight run fits a huge circle and must be
+    rejected in favour of a line). Rail points sit ON the true circle, so the
+    accepted RMS is noise-scale — ``swept_profile_tol_abs`` plus a *small*
+    relative term (``swept_arc_tol_rel`` of the radius); a chord-error-sized
+    relative tolerance would let one giant circle "fit" a whole line+arc+line
+    profile. ``radius`` is the last accepted fit's radius (``inf`` if none).
+    """
+    n = len(pts2d)
+    best_end = i0
+    best_radius = float("inf")
+    j = i0 + 3
+    while j < n:
+        seg = pts2d[i0:j + 1]
+        center, radius, rms = _fit_circle_2d(seg)
+        tol = config.swept_profile_tol_abs + config.swept_arc_tol_rel * radius
+        if radius <= 1e-6 or radius > max_radius or rms > tol:
+            break
+        # Chord-uniformity guard: a genuine tessellated arc has roughly evenly
+        # spaced vertices; a run that swallowed a long straight segment has one
+        # huge chord among small ones (a circle passes near-exactly through a
+        # handful of sparse points, so RMS alone cannot catch this).
+        chords = np.linalg.norm(np.diff(seg, axis=0), axis=1)
+        med = float(np.median(chords))
+        if med > 1e-9 and float(chords.max()) > 4.0 * med:
+            break
+        best_end = j
+        best_radius = float(radius)
+        j += 1
+    return best_end, best_radius
+
+
+def _fit_line(seg: np.ndarray) -> ProfileSegment:
+    return ProfileSegment(kind="line", p0=seg[0].copy(), p1=seg[-1].copy())
+
+
+def _fit_arc(seg: np.ndarray) -> ProfileSegment | None:
+    center, radius, _ = _fit_circle_2d(seg)
+    if radius <= 1e-6:
+        return None
+    p0, p1 = seg[0], seg[-1]
+    mid = seg[len(seg) // 2]
+    # Sweep sense from the cross product of (p0-center) x (mid-center).
+    v0 = p0 - center
+    vm = mid - center
+    ccw = bool((v0[0] * vm[1] - v0[1] * vm[0]) > 0)
+    return ProfileSegment(kind="arc", p0=p0.copy(), p1=p1.copy(),
+                          center=center.copy(), radius=float(radius), ccw=ccw)
+
+
+def _apply_tangency(
+    segments: list[ProfileSegment], resolution: MeshResolution, config: ConversionConfig,
+) -> int:
+    """Snap arc<->line joins to exact tangency in 2D (design §1.2, product-owner
+    rule applied to the profile plane).
+
+    At a join where a line meets an arc, tangency means the line is perpendicular
+    to the arc's centre->join radius. If the measured angle defect is within the
+    resolution-scaled threshold, the join is moved to the arc's *true tangent
+    point with the line* — the foot of the perpendicular from the arc centre onto
+    the line, radially projected onto the circle. Besides making the join exactly
+    tangent, this *extends the arc back to where the blend really starts*: the
+    greedy line run steals the first chord or two of a tessellated arc (their
+    sagitta is under the line tolerance), and without the extension those strips
+    would sit outside the fitted arc's span and stay faceted.
+    Returns the number of joins snapped.
+    """
+    thresh = max(config.tangency_floor_deg,
+                 config.tangency_k * resolution.median_dihedral_deg)
+    snaps = 0
+    m = len(segments)
+    for k in range(m):
+        a = segments[k]
+        b = segments[k + 1] if k + 1 < m else None
+        if b is None:
+            break
+        # Line-arc or arc-line join.
+        line, arc, line_first = None, None, None
+        if a.kind == "line" and b.kind == "arc":
+            line, arc, line_first = a, b, True
+        elif a.kind == "arc" and b.kind == "line":
+            line, arc, line_first = b, a, False
+        else:
+            continue
+        join = a.p1  # shared point
+        radial = join - arc.center
+        rn = np.linalg.norm(radial)
+        if rn < 1e-9:
+            continue
+        radial_u = radial / rn
+        ldir = (line.p1 - line.p0)
+        ln = np.linalg.norm(ldir)
+        if ln < 1e-9:
+            continue
+        ldir_u = ldir / ln
+        # Tangent condition: line direction perpendicular to the radius.
+        dotv = abs(float(ldir_u @ radial_u))
+        defect = float(np.degrees(np.arcsin(min(1.0, dotv))))
+        if defect > thresh:
+            continue
+        # True tangent point: foot of the perpendicular from the arc centre onto
+        # the line (kept ON the line), projected radially onto the circle (kept
+        # ON the arc). The two coincide up to the tangency defect distance.
+        foot = line.p0 + float((arc.center - line.p0) @ ldir_u) * ldir_u
+        f_radial = foot - arc.center
+        fn = float(np.linalg.norm(f_radial))
+        if fn < 1e-9:
+            continue
+        tangent_pt = arc.center + f_radial / fn * arc.radius
+        if line_first:
+            line.p1 = foot.copy()
+            arc.p0 = tangent_pt.copy()
+            a.p1 = foot.copy()
+            b.p0 = tangent_pt.copy()
+        else:
+            arc.p1 = tangent_pt.copy()
+            line.p0 = foot.copy()
+            a.p1 = tangent_pt.copy()
+            b.p0 = foot.copy()
+        a.tangent_end = True
+        b.tangent_start = True
+        snaps += 1
+    return snaps
+
+
+def fit_swept_profile(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    swept: SweptRegion,
+    config: ConversionConfig,
+    resolution: MeshResolution,
+) -> SweptProfile | None:
+    """Fit the 2D profile of a swept region (design §2, §3, M4).
+
+    Extracts the profile rails (one per boundary-loop run — a merged multi-wall
+    sweep or a wall with cutouts yields several), projects each into the plane
+    perpendicular to the sweep axis, partitions it into line + arc runs
+    (B-spline for the rest), and snaps near-tangent line<->arc joins to exact
+    tangency in 2D. Returns a :class:`SweptProfile` whose segments the builder
+    turns into extruded surfaces / boolean lens tools, or ``None`` when the
+    region is too small / no rail can be recovered / the fit RMS is too high.
+    """
+    if swept.size < config.swept_min_facets:
+        return None
+    extracted = _extract_rails(vertices, faces, swept.face_indices, swept.axis)
+    if extracted is None:
+        return None
+    rails, amin, amax = extracted
+    if amax - amin < config.swept_min_extent:
+        return None
+
+    axis = swept.axis / (np.linalg.norm(swept.axis) or 1.0)
+    e1, e2 = _swept_plane_basis(axis)
+    origin = rails[0][0].mean(axis=0)
+    origin = origin - float(origin @ axis) * axis + amin * axis
+    local_edge = resolution.edge_for(swept.face_indices)
+    tol = max(config.swept_profile_tol_abs, config.curve_fit_tol_rel * local_edge)
+
+    segments: list[ProfileSegment] = []
+    snaps = 0
+    devs_sq_sum = 0.0
+    devs_n = 0
+    any_closed = False
+    for rail_pts, closed in rails:
+        rel = rail_pts - origin
+        pts2d = _resample_polyline(np.column_stack((rel @ e1, rel @ e2)), closed)
+        if len(pts2d) < 3:
+            continue
+        if closed:
+            # Close the polyline so the last->first stretch is fitted too.
+            pts2d = np.vstack([pts2d, pts2d[:1]])
+            any_closed = True
+        runs = _segment_profile(pts2d, config, local_edge)
+        rail_segments: list[ProfileSegment] = []
+        for kind, i0, i1 in runs:
+            seg = pts2d[i0:i1 + 1]
+            if len(seg) < 2:
+                continue
+            if kind == "line" or len(seg) == 2:
+                # A 2-point "spline" is just a segment; keep the wire simple.
+                rail_segments.append(_fit_line(seg))
+            elif kind == "arc":
+                a = _fit_arc(seg)
+                rail_segments.append(a if a is not None else _fit_line(seg))
+            else:
+                rail_segments.append(ProfileSegment(kind="spline", points=seg.copy(),
+                                                    p0=seg[0].copy(), p1=seg[-1].copy()))
+        if not rail_segments:
+            continue
+        snaps += _apply_tangency(rail_segments, resolution, config)
+        # Per-rail RMS gate: a rail whose fit is poor contributes no segments
+        # (its strips stay faceted) without sinking the whole sweep.
+        rms_rail = _profile_rms(pts2d, rail_segments)
+        if rms_rail > 3.0 * tol:
+            continue
+        devs_sq_sum += rms_rail * rms_rail * len(pts2d)
+        devs_n += len(pts2d)
+        segments.extend(rail_segments)
+    if not segments:
+        return None
+    segments, snaps = _dedupe_segments(segments)
+    rms = math.sqrt(devs_sq_sum / devs_n) if devs_n else float("inf")
+    closed = any_closed
+
+    n_lines = sum(1 for s in segments if s.kind == "line")
+    n_arcs = sum(1 for s in segments if s.kind == "arc")
+    n_splines = sum(1 for s in segments if s.kind == "spline")
+    return SweptProfile(
+        axis=axis, origin=origin, e1=e1, e2=e2, segments=segments,
+        axial_min=amin, axial_max=amax, closed=closed, rms=float(rms),
+        face_indices=list(swept.face_indices),
+        n_arcs=n_arcs, n_lines=n_lines, n_splines=n_splines, tangency_snaps=snaps,
+        member_regions=list(swept.member_regions),
+    )
+
+
+def _dedupe_segments(
+    segments: list[ProfileSegment],
+) -> tuple[list[ProfileSegment], int]:
+    """Drop duplicate profile segments and recount tangency snaps.
+
+    The min- and max-axial rails of a sweep describe the *same* profile curve,
+    so both contribute identical segments (traversed in opposite directions).
+    One copy suffices; keys fold endpoint order (and arc geometry) so reversed
+    duplicates collapse. Snap count = joins marked tangent on kept segments.
+    """
+    def same_pt(a, b, tol=0.05) -> bool:
+        return a is not None and b is not None and float(np.linalg.norm(a - b)) <= tol
+
+    def same_seg(s, t) -> bool:
+        if s.kind != t.kind:
+            return False
+        ends_match = ((same_pt(s.p0, t.p0) and same_pt(s.p1, t.p1))
+                      or (same_pt(s.p0, t.p1) and same_pt(s.p1, t.p0)))
+        if not ends_match:
+            return False
+        if s.kind == "arc":
+            return (same_pt(s.center, t.center)
+                    and abs(s.radius - t.radius) <= 0.02 + 0.01 * s.radius)
+        return True
+
+    kept: list[ProfileSegment] = []
+    for s in segments:
+        if any(same_seg(s, t) for t in kept):
+            continue
+        kept.append(s)
+    snaps = sum(1 for s in kept if s.tangent_start)
+    return kept, snaps
+
+
+def _profile_rms(pts2d: np.ndarray, segments: list[ProfileSegment]) -> float:
+    """RMS distance of the rail points to the fitted profile segments."""
+    devs: list[float] = []
+    for p in pts2d:
+        best = float("inf")
+        for s in segments:
+            if s.kind == "line":
+                best = min(best, _dist_point_segment(p, s.p0, s.p1))
+            elif s.kind == "arc":
+                d = abs(float(np.linalg.norm(p - s.center) - s.radius))
+                best = min(best, d)
+            elif s.kind == "spline" and s.points is not None:
+                for q0, q1 in zip(s.points[:-1], s.points[1:]):
+                    best = min(best, _dist_point_segment(p, q0, q1))
+        devs.append(best)
+    return float(np.sqrt(np.mean(np.square(devs)))) if devs else float("inf")
+
+
+def _dist_point_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    ab = b - a
+    L2 = float(ab @ ab)
+    if L2 < 1e-18:
+        return float(np.linalg.norm(p - a))
+    t = max(0.0, min(1.0, float((p - a) @ ab) / L2))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def detect_swept_walls(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    swept_regions: list[SweptRegion],
+    config: ConversionConfig | None = None,
+    resolution: MeshResolution | None = None,
+) -> list[SweptProfile]:
+    """Fit swept profiles for every swept region (design §2, §3, M4)."""
+    config = config or ConversionConfig()
+    if not config.detect_swept_walls:
+        return []
+    if resolution is None:
+        resolution = mesh_resolution(vertices, faces, config)
+    out: list[SweptProfile] = []
+    for sw in swept_regions:
+        prof = fit_swept_profile(vertices, faces, sw, config, resolution)
+        if prof is not None:
+            out.append(prof)
+    return out

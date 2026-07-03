@@ -379,3 +379,162 @@ def _component_perimeter(faces, member_faces, adjacency, vertices) -> float:
             if any(k not in comp_set for k in incident) or len(incident) < 2:
                 perimeter += float(np.linalg.norm(vertices[u] - vertices[v]))
     return perimeter
+
+
+# --------------------------------------------------------------------------- #
+# Swept / extruded curved-wall regions (Milestone 4, design §2, CURVED_FEATURES
+# §6a). A swept wall is a constant-cross-section extrusion: every facet normal is
+# perpendicular to one common extrusion direction ``d`` and the profile (the
+# region seen looking down ``d``) repeats along ``d``. Tessellated, it arrives as
+# a fan of thin planar strips whose normals rotate about ``d`` — a smooth chain
+# that ``segment_planar`` split into one region per arc row.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class SweptRegion:
+    """A constant-cross-section (extruded) curved wall built from a chain of thin
+    planar strips whose normals all lie perpendicular to a common extrusion
+    direction ``axis`` (the sweep direction ``d``).
+
+    ``face_indices`` index the mesh the region was segmented from.
+    ``member_regions`` are the planar sub-region indices forming the sweep.
+    ``axis`` is the unit extrusion direction; the profile lives in the plane
+    perpendicular to it. ``axial_min``/``axial_max`` bound the sweep along
+    ``axis`` (from a chosen origin).
+    """
+
+    face_indices: list[int]
+    axis: np.ndarray
+    member_regions: list[int] = field(default_factory=list)
+    axial_min: float = 0.0
+    axial_max: float = 0.0
+    normal_dot_axis_max: float = 0.0  # worst |n·axis| over member facets (QA)
+
+    @property
+    def size(self) -> int:
+        return len(self.face_indices)
+
+    @property
+    def extent(self) -> float:
+        return self.axial_max - self.axial_min
+
+
+def segment_swept_walls(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    claimed: set[int],
+    regions: list[Region],
+    config: ConversionConfig | None = None,
+) -> list[SweptRegion]:
+    """Group planar strips into swept (extruded constant-cross-section) walls.
+
+    Each sweep is grown from a seed planar region: the extrusion direction ``d``
+    is fixed from the cross product of the seed's normal with a smooth neighbour's
+    (both perpendicular to ``d`` on a true sweep), then the region grows across
+    *smooth* dihedral steps only to neighbours whose normal stays perpendicular to
+    that fixed ``d``. Fixing ``d`` up front is what stops the chain drifting around
+    corners onto the end caps (whose normals are *parallel* to ``d``) and merging
+    the whole body into one blob — the failure mode of a plain smooth-chain walk.
+
+    Pure numpy. Returns sweeps with >= ``swept_min_regions`` member strips and a
+    consistent ``d``-extent; the builder fits a profile curve and extrudes it.
+    """
+    config = config or ConversionConfig()
+    n_faces = len(faces)
+    if n_faces == 0 or not regions:
+        return []
+
+    _, areas = face_normals_and_areas(vertices, faces)
+    adjacency = build_edge_adjacency(faces)
+
+    region_of = np.full(n_faces, -1, dtype=int)
+    for ri, region in enumerate(regions):
+        for fi in region.face_indices:
+            region_of[fi] = ri
+    n_regions = len(regions)
+    graph = _region_adjacency(faces, region_of, n_regions, adjacency)
+    rn = np.array([r.plane_normal / (np.linalg.norm(r.plane_normal) or 1.0)
+                   for r in regions])
+    rarea = np.array([float(areas[r.face_indices].sum()) for r in regions])
+
+    cos_flat = config.angle_tol_cos
+    cos_sharp = float(np.cos(np.radians(config.curve_max_deg)))
+
+    def smooth_step(a: int, b: int) -> bool:
+        d = float(np.clip(abs(rn[a] @ rn[b]), -1.0, 1.0))
+        return cos_sharp < d < cos_flat
+
+    # A region is unavailable to seed/grow a sweep if all its facets are already
+    # claimed (by cylinders/cones/fillets).
+    def region_free(ri: int) -> bool:
+        return any(fi not in claimed for fi in regions[ri].face_indices)
+
+    dtol = config.swept_axis_perp_tol
+    order = np.argsort(-rarea)  # largest strips seed first
+    assigned = np.full(n_regions, -1, dtype=int)
+    sweeps: list[SweptRegion] = []
+
+    for seed in order:
+        if assigned[seed] >= 0 or not region_free(seed):
+            continue
+        # Fix the extrusion direction from the seed + a smooth neighbour: on a
+        # true sweep both normals are perpendicular to d, so d = n_seed x n_nbr.
+        dvec = None
+        for nb in graph[seed]:
+            if assigned[nb] >= 0 or not smooth_step(seed, nb) or not region_free(nb):
+                continue
+            c = np.cross(rn[seed], rn[nb])
+            nc = float(np.linalg.norm(c))
+            if nc > 1e-6:
+                dvec = c / nc
+                break
+        if dvec is None:
+            continue
+
+        sid = len(sweeps)
+        comp = [seed]
+        assigned[seed] = sid
+        stack = [seed]
+        while stack:
+            r = stack.pop()
+            for nb in graph[r]:
+                if assigned[nb] >= 0 or not region_free(nb):
+                    continue
+                if not smooth_step(r, nb):
+                    continue
+                # Grow only onto strips whose plane stays perpendicular to the
+                # fixed sweep direction (rotating profile, constant section).
+                if abs(float(rn[nb] @ dvec)) > dtol:
+                    continue
+                assigned[nb] = sid
+                comp.append(nb)
+                stack.append(nb)
+
+        if len(comp) < config.swept_min_regions:
+            for r in comp:
+                assigned[r] = -1
+            continue
+
+        member_faces = [fi for r in comp for fi in regions[r].face_indices
+                        if fi not in claimed]
+        if len(member_faces) < config.swept_min_facets:
+            for r in comp:
+                assigned[r] = -1
+            continue
+
+        member_normals = rn[comp]
+        ndotd = float(np.abs(member_normals @ dvec).max())
+        vids = np.unique(faces[member_faces].reshape(-1))
+        ax = vertices[vids] @ dvec
+        sweeps.append(
+            SweptRegion(
+                face_indices=member_faces,
+                axis=dvec,
+                member_regions=sorted(comp),
+                axial_min=float(ax.min()),
+                axial_max=float(ax.max()),
+                normal_dot_axis_max=ndotd,
+            )
+        )
+    return sweeps
