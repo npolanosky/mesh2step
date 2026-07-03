@@ -1,0 +1,60 @@
+# mesh2step-web — Portainer-stack-ready compose.
+#
+# Two ways to deploy this in Portainer (see docker/README.md for the walk-through):
+#   A) Build from a Git repository: point the stack at this repo; Portainer runs
+#      the build using the `build:` block below.
+#   B) Use a prebuilt image: comment out `build:`, uncomment `image:` and set it
+#      to your registry tag.
+#
+# The service binds 0.0.0.0 inside the container (set via the image env) and is
+# published on the host at ${MESH2STEP_PORT:-8799}.
+
+services:
+  mesh2step-web:
+    # --- Option A: build from this repo (Portainer "Git repository" stack) ---
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # --- Option B: prebuilt image (comment out `build:` above to use this) ---
+    # image: your-registry.example/mesh2step-web:latest
+    image: mesh2step-web:latest
+    container_name: mesh2step-web
+    restart: unless-stopped
+
+    # Host:container port. Container listens on 8799 (MESH2STEP_WEB_PORT baked in
+    # the image). Override the host side with MESH2STEP_PORT in the stack env.
+    ports:
+      - "${MESH2STEP_PORT:-8799}:8799"
+
+    environment:
+      # Concurrency 1 keeps FreeCAD/OCC single-threaded per box; bump on a beefy
+      # server. All other knobs (data dir, corpus dir, host/port, FreeCAD python)
+      # are baked into the image with sensible container defaults.
+      MESH2STEP_WEB_CONCURRENCY: "${MESH2STEP_CONCURRENCY:-1}"
+      # Per-conversion wall-clock ceiling (seconds).
+      MESH2STEP_WEB_TIMEOUT: "${MESH2STEP_TIMEOUT:-1800}"
+      # Max upload size in bytes (default 200 MB).
+      MESH2STEP_WEB_MAX_UPLOAD: "${MESH2STEP_MAX_UPLOAD:-209715200}"
+
+    volumes:
+      # Job history + uploads + STEP outputs (survives restarts/upgrades).
+      - mesh2step-web-data:/data/web
+      # Failure corpus (flagged/failed meshes for regression). Kept separate so
+      # you can back it up or wipe job history independently.
+      - mesh2step-corpus:/data/corpus
+
+    # Liveness probe hits the cheap /healthz endpoint (no disk, no subprocess).
+    # Portainer shows the container as healthy/unhealthy from this.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8799/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Give FreeCAD-heavy startup room before the first probe counts against us.
+      start_period: 40s
+
+volumes:
+  mesh2step-web-data:
+    name: mesh2step-web-data
+  mesh2step-corpus:
+    name: mesh2step-corpus

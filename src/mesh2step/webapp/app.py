@@ -144,6 +144,17 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
     app.state.save_failures = save_failures
 
     # ---- meta ------------------------------------------------------------- #
+    @app.get("/healthz")
+    def healthz() -> JSONResponse:
+        """Cheap liveness probe for container/orchestrator healthchecks.
+
+        Always 200 while the process is serving; it deliberately does NOT gate on
+        FreeCAD (use ``/api/health`` -> ``freecad_ready`` for readiness) so a
+        transient FreeCAD detection miss doesn't make the orchestrator kill an
+        otherwise-healthy web process. Returns a tiny body, no disk/subprocess.
+        """
+        return JSONResponse({"status": "ok"})
+
     @app.get("/api/health")
     def health() -> dict:
         from .. import DISPLAY_VERSION

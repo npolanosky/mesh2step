@@ -1,0 +1,19 @@
+# Build context is the repo root (see docker/README.md: `docker build -f docker/Dockerfile .`).
+# Keep the context small + reproducible — only pyproject/README/LICENSE/src are COPYed.
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+*.egg-info
+build
+dist
+docs
+scripts
+tests
+docker
+.venv
+venv
+*.step
+*.STEP
