@@ -56,6 +56,19 @@ _ORBIT_DEG_PER_PX = 0.4     # drag sensitivity: degrees of orbit per pixel
 _ZOOM_PER_STEP = 1.05       # zoom factor per wheel step
 _DRAG_DOWNSCALE = 2         # render at 1/2 resolution while dragging
 
+# Meshes above this triangle count get a decimated PREVIEW copy used for drag
+# frames only; the settle frame and normal renders keep full quality.
+_DECIMATE_ABOVE = 150_000
+_DECIMATE_TARGET = 100_000
+
+# Render-server hygiene: liveness ping while idle, and a memory ceiling above
+# which the server is recycled between requests (VTK/allocator retention grows
+# its RSS over many large scenes; a respawn is cheap and invisible).
+_PING_INTERVAL_MS = 20_000
+_PING_TIMEOUT = 5.0
+_SERVER_RSS_CAP_MB = 900
+_RSS_CHECK_EVERY = 10       # requests between RSS checks
+
 # Whether this platform embeds a live VTK window (Windows) or renders static
 # preview images (everywhere else — reparenting VTK into Tk isn't workable).
 _LIVE_EMBED = sys.platform == "win32"
@@ -72,6 +85,20 @@ _RESIZE_THRESHOLD = 24
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 _log = logging.getLogger("mesh2step")
+
+
+class _ServerGone(RuntimeError):
+    """The render server died or closed its pipe mid-request (retryable)."""
+
+
+def _rss_mb(pid: int) -> float:
+    """Resident set size of ``pid`` in MB (0 on any failure)."""
+    try:
+        out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)],
+                                      text=True, creationflags=_NO_WINDOW)
+        return int(out.strip()) / 1024.0
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _hex_rgb(h: str):
@@ -116,6 +143,11 @@ class EmbeddedViewer(ttk.Frame):
         self._dragging = False
         self._drag_last: tuple | None = None
         self._interactive_render = False           # next render may be low-res
+        self._req_id = 0                           # render request counter
+        self._scene_gen = 0                        # bumped when a scene is replaced
+        self._load_seq = 0                         # bumped per file selection
+        self._reqs_since_rss_check = 0
+        self._retry_btn = None                     # recovery button (static path)
 
         # --- toolbar ---
         bar = ttk.Frame(self, style="Bg.TFrame")
@@ -169,15 +201,23 @@ class EmbeddedViewer(ttk.Frame):
                 lbl.bind(f"<B{btn}-Motion>", lambda e: self._drag_move(e, "pan"))
                 lbl.bind(f"<ButtonRelease-{btn}>", self._drag_end)
             lbl.bind("<MouseWheel>", self._on_zoom)
+            # Visible recovery affordance: shown centred over the panel when a
+            # render fails; never leaves the panel permanently dead.
+            self._retry_btn = ttk.Button(self._surface, text="Retry preview",
+                                         command=self._retry_render)
             # Pre-warm the render server at startup so the first preview only
             # costs the render, not the multi-second pyvista/frozen bootstrap.
-            self.after(300, self._prewarm_server)
+            self.after(50, self._prewarm_server)
+            # Watchdog: periodic liveness ping while idle; a dead/hung server is
+            # recycled so the next render Just Works (covers native crashes and
+            # processes killed across a sleep/wake).
+            self.after(_PING_INTERVAL_MS, self._watchdog)
 
         self._hint = tk.Label(self, text="Select an STL to preview", bg=BG_HEX, fg=MUTED,
                               anchor="w", font=("Consolas", 9))
         self._hint.pack(fill="x", padx=8, pady=(0, 6))
 
-        self.after(60, self._poll)
+        self.after(15, self._poll)  # snappy delivery of finished renders
 
     # ---- worker-thread handoff -------------------------------------------
     def _poll(self):
@@ -190,7 +230,7 @@ class EmbeddedViewer(ttk.Frame):
                     pass
         except queue.Empty:
             pass
-        self.after(60, self._poll)
+        self.after(15, self._poll)  # snappy delivery of finished renders
 
     # ---- VTK setup (Windows live-embed only) ------------------------------
     def _ensure_vtk(self):
@@ -274,12 +314,18 @@ class EmbeddedViewer(ttk.Frame):
             self._image_label.config(image="", text="Select an STL to preview")
         self._displayed = None
         self._last_render_size = None
+        self._load_seq += 1   # orphan any scene builds still in flight
         self._camera = {"azimuth": 0.0, "elevation": 0.0, "zoom": 1.0,
                         "pan": [0.0, 0.0]}
         self._hint.config(text="Select an STL to preview")
 
     def show_stl(self, stl_path: str, problem_points=None):
         self._hint.config(text="Loading mesh…")
+        # Load-sequence token: scene building runs on worker threads and can
+        # finish OUT OF ORDER (a big file selected first can land after a small
+        # file selected second). Installs from a superseded show_stl are dropped.
+        self._load_seq += 1
+        tok = self._load_seq
         if not _LIVE_EMBED:
             # Start the render server now so its cold start (frozen bootstrap +
             # pyvista import) overlaps with reading/writing the scene files.
@@ -289,7 +335,9 @@ class EmbeddedViewer(ttk.Frame):
             try:
                 import pyvista as pv
                 mesh = pv.read(stl_path)
-                specs = [dict(poly=mesh, color=STL_COLOR)]
+                # "path" alongside "poly": the renderer loads (and caches) the
+                # original STL directly — no .vtp copy of the full mesh needed.
+                specs = [dict(path=stl_path, poly=mesh, color=STL_COLOR)]
                 npts = 0
                 if problem_points:
                     import numpy as np
@@ -299,16 +347,23 @@ class EmbeddedViewer(ttk.Frame):
                         specs.append(dict(poly=pv.PolyData(pts), color="#ef4444", points=True))
                 hint = (f"input STL — {mesh.n_points:,} pts, {mesh.n_cells:,} tris"
                         + (f"   ⚠ {npts} defect markers" if npts else ""))
-                specs = self._materialise(specs, "stl")
-                self._q.put(lambda: self._install("stl", specs, hint, reset=True))
+                specs, decimated = self._materialise(specs, "stl")
+                if decimated:
+                    hint += "   · drag preview decimated"
+                self._q.put(lambda: self._install_if_current(
+                    tok, "stl", specs, hint, reset=True))
             except Exception as exc:  # noqa: BLE001
-                self._q.put(lambda e=exc: self._hint.config(text=f"Could not load mesh: {e}"))
+                self._q.put(lambda e=exc: (tok == self._load_seq and
+                                           self._hint.config(text=f"Could not load mesh: {e}")))
 
         threading.Thread(target=work, daemon=True).start()
 
     def show_result(self, stl_path: str, step_path: str):
         fc = self._get_fc()
         self._hint.config(text="Building STEP preview…")
+        # Complements the CURRENT input scene — don't bump the sequence, but do
+        # capture it so a result landing after the user switched files is dropped.
+        tok = self._load_seq
         if not _LIVE_EMBED:
             self._ensure_render_server()  # warm it during tessellation
 
@@ -318,40 +373,85 @@ class EmbeddedViewer(ttk.Frame):
                 stl_poly, step_poly, stats = build_scene(stl_path, step_path, 0.1, fc)
                 hi = max(stats["p95"], stats["max"] * 0.5, 1e-6)
                 step_specs = [dict(poly=step_poly, color=STEP_COLOR)]
-                heat_specs = [dict(poly=stl_poly, color=GHOST_COLOR, opacity=0.15),
+                heat_specs = [dict(path=stl_path, poly=stl_poly, color=GHOST_COLOR,
+                                   opacity=0.15),
                               dict(poly=step_poly, scalars="deviation", clim=(0.0, hi))]
                 step_hint = f"output STEP — {step_poly.n_cells:,} tris"
                 heat_hint = (f"deviation (mm)  max={stats['max']:.3f}  rms={stats['rms']:.3f}  "
                              f"p95={stats['p95']:.3f}  mean={stats['mean']:.3f}")
-                step_specs = self._materialise(step_specs, "step")
-                heat_specs = self._materialise(heat_specs, "heatmap")
+                step_specs, dec1 = self._materialise(step_specs, "step")
+                heat_specs, dec2 = self._materialise(heat_specs, "heatmap")
+                if dec1:
+                    step_hint += "   · drag preview decimated"
+                if dec2:
+                    heat_hint += "   · drag preview decimated"
 
                 def apply():
-                    self._install("step", step_specs, step_hint, reset=False, activate=False)
-                    self._install("heatmap", heat_specs, heat_hint, reset=False, activate=True)
+                    self._install_if_current(tok, "step", step_specs, step_hint,
+                                             reset=False, activate=False)
+                    self._install_if_current(tok, "heatmap", heat_specs, heat_hint,
+                                             reset=False, activate=True)
                 self._q.put(apply)
             except Exception as exc:  # noqa: BLE001
-                self._q.put(lambda e=exc: self._hint.config(text=f"STEP preview failed: {e}"))
+                self._q.put(lambda e=exc: (tok == self._load_seq and
+                                           self._hint.config(text=f"STEP preview failed: {e}")))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _install_if_current(self, tok: int, name, specs, hint, reset, activate=True):
+        """Install a built scene unless a newer file selection superseded it."""
+        if tok != self._load_seq:
+            _log.info("dropping stale scene install of %s (load %d != %d)",
+                      name, tok, self._load_seq)
+            return
+        self._install(name, specs, hint, reset, activate)
+
     # ---- scene assembly ---------------------------------------------------
     def _materialise(self, specs, name):
-        """On the static path, write each poly to a .vtp so the render
-        subprocess can load it; pass through untouched on the live path.
-        Runs on the producing worker thread (file IO off the UI thread)."""
+        """Prepare file-backed scene specs for the render subprocess.
+
+        Returns ``(specs, decimated)``. Polys that already have a source
+        ``path`` (the original STL) are passed by reference — the server loads
+        and caches the file itself, so no .vtp copy of the full mesh is
+        written. Computed polys (tessellated STEP, heatmap, defect markers) are
+        saved to .vtp. Very large meshes additionally get a decimated PREVIEW
+        copy (``path_low``) used only for drag frames; full quality is kept for
+        the settle frame. Runs on the producing worker thread (heavy work off
+        the UI thread). Pass-through on the live (Windows) path.
+        """
         if _LIVE_EMBED:
-            return specs
+            return specs, False
         if self._tmpdir is None:
             self._tmpdir = tempfile.mkdtemp(prefix="mesh2step_preview_")
-        out = []
+            atexit.register(self._cleanup_tmpdir)
+        out, decimated = [], False
         for i, spec in enumerate(specs):
             fspec = {k: v for k, v in spec.items() if k != "poly"}
-            path = os.path.join(self._tmpdir, f"{name}_{i}.vtp")
-            spec["poly"].save(path)
-            fspec["path"] = path
+            poly = spec.get("poly")
+            if (poly is not None and not spec.get("points")
+                    and spec.get("scalars") is None
+                    and poly.n_cells > _DECIMATE_ABOVE):
+                try:
+                    frac = 1.0 - (_DECIMATE_TARGET / float(poly.n_cells))
+                    low = poly.decimate(frac)
+                    low_path = os.path.join(self._tmpdir, f"{name}_{i}_low.vtp")
+                    low.save(low_path)
+                    fspec["path_low"] = low_path
+                    decimated = True
+                except Exception:  # noqa: BLE001 - decimation is best-effort
+                    pass
+            if "path" not in fspec:
+                path = os.path.join(self._tmpdir, f"{name}_{i}.vtp")
+                poly.save(path)
+                fspec["path"] = path
             out.append(fspec)
-        return out
+        return out, decimated
+
+    def _cleanup_tmpdir(self):
+        import shutil
+
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _install(self, name, specs, hint, reset, activate=True):
         self._scene_hint[name] = hint
@@ -359,6 +459,7 @@ class EmbeddedViewer(ttk.Frame):
         if not _LIVE_EMBED:
             self._specs[name] = specs      # file-based specs (see _materialise)
             self._images.pop(name, None)   # scene changed; drop any stale image
+            self._scene_gen += 1           # in-flight renders of the old scene are stale
             if activate:
                 self.set_view(name)
             return
@@ -387,19 +488,27 @@ class EmbeddedViewer(ttk.Frame):
 
         w = max(self._surface.winfo_width(), 320)
         h = max(self._surface.winfo_height(), 240)
-        # While a drag is in progress render at reduced resolution (the image is
-        # upscaled to the panel, then replaced by a full-res frame on release).
-        scale = _DRAG_DOWNSCALE if self._interactive_render else 1
+        interactive = self._interactive_render
+        # Drag frames: reduced resolution + JPEG (faster encode/decode) + the
+        # decimated preview copy of very large meshes. Settle frames and normal
+        # renders use full resolution, PNG, and the full mesh.
+        scale = _DRAG_DOWNSCALE if interactive else 1
+        meshes = specs
+        if interactive:
+            meshes = [dict(m, path=m["path_low"]) if "path_low" in m else m
+                      for m in specs]
+        ext = "jpg" if interactive else "png"
+        gen = self._scene_gen           # drop the result if the scene changes
         spec = {
             "width": int(w // scale), "height": int(h // scale), "background": BG_HEX,
-            "mode": self._mode, "meshes": specs,
+            "mode": self._mode, "meshes": meshes,
             # Snapshot the camera NOW — the dicts keep mutating during a drag.
             "camera": {"azimuth": self._camera["azimuth"],
                        "elevation": self._camera["elevation"],
                        "zoom": self._camera["zoom"],
                        "pan": list(self._camera["pan"])},
             "out": os.path.join(self._tmpdir or tempfile.gettempdir(),
-                                f"render_{name}.png"),
+                                f"render_{name}.{ext}"),
         }
 
         def work():
@@ -408,7 +517,8 @@ class EmbeddedViewer(ttk.Frame):
                 png = self._render_via_server(spec)
                 _log.info("preview render %s (%dx%d) took %.2fs",
                           name, spec["width"], spec["height"], time.monotonic() - t0)
-                self._q.put(lambda p=png: self._show_image(name, p, (int(w), int(h))))
+                self._q.put(lambda p=png: self._show_image(name, p, (int(w), int(h)),
+                                                           gen))
             except Exception as exc:  # noqa: BLE001
                 _log.warning("preview render %s failed after %.2fs: %s",
                              name, time.monotonic() - t0, exc)
@@ -451,15 +561,18 @@ class EmbeddedViewer(ttk.Frame):
                 pass
 
     def _render_via_server(self, spec: dict) -> str:
-        """Send one render request to the server; return the PNG path.
+        """Send one render request to the server; return the image path.
 
-        Serialised by a lock (the server handles one request at a time). A dead
-        server is restarted once; a request that exceeds the timeout kills the
-        server (it will be respawned on the next request) and raises.
+        Serialised by a lock (the server handles one request at a time). Every
+        request carries a fresh id and only the matching response is accepted —
+        anything else on the pipe (stray output, a leftover answer from a
+        recycled server) is dropped. A dead server is restarted once; a request
+        that exceeds the timeout kills the server (respawned on the next
+        request) and raises.
         """
-        import select
-
         with self._server_lock:
+            self._req_id += 1
+            spec = dict(spec, id=self._req_id)
             last_err = None
             for _attempt in (1, 2):
                 proc = self._ensure_render_server()
@@ -470,38 +583,121 @@ class EmbeddedViewer(ttk.Frame):
                     last_err = exc
                     self._kill_render_server()
                     continue
-                deadline = time.monotonic() + _RENDER_TIMEOUT
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        self._kill_render_server()
-                        raise RuntimeError(f"render timed out after {_RENDER_TIMEOUT}s")
-                    ready, _, _ = select.select([proc.stdout], [], [],
-                                                min(remaining, 1.0))
-                    if not ready:
-                        if proc.poll() is not None:
-                            last_err = RuntimeError("render server died")
-                            self._kill_render_server()
-                            break
-                        continue
-                    line = proc.stdout.readline()
-                    if not line:
-                        last_err = RuntimeError("render server closed its pipe")
-                        self._kill_render_server()
-                        break
-                    try:
-                        resp = json.loads(line)
-                    except ValueError:
-                        continue  # stray non-protocol output; keep reading
-                    if not isinstance(resp, dict) or "ok" not in resp:
-                        continue
-                    if not resp["ok"]:
-                        raise RuntimeError(resp.get("error", "render failed"))
-                    return resp["png"]
+                try:
+                    resp = self._read_response(proc, spec["id"], _RENDER_TIMEOUT)
+                except _ServerGone as exc:
+                    last_err = exc
+                    self._kill_render_server()
+                    continue
+                if not resp["ok"]:
+                    raise RuntimeError(resp.get("error", "render failed"))
+                self._maybe_recycle_server(proc)
+                return resp["png"]
             raise RuntimeError(f"render server unavailable ({last_err})")
 
-    def _show_image(self, name: str, png_path: str, size: tuple):
+    def _read_response(self, proc, req_id, timeout: float) -> dict:
+        """Read the response matching ``req_id``; raise on death or timeout."""
+        import select
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._kill_render_server()
+                raise RuntimeError(f"render timed out after {timeout:.0f}s")
+            ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 1.0))
+            if not ready:
+                if proc.poll() is not None:
+                    raise _ServerGone("render server died")
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                raise _ServerGone("render server closed its pipe")
+            try:
+                resp = json.loads(line)
+            except ValueError:
+                continue  # stray non-protocol output; keep reading
+            if not isinstance(resp, dict) or "ok" not in resp:
+                continue
+            if resp.get("id") is not None and resp["id"] != req_id:
+                continue  # stale response from an earlier (timed-out) request
+            return resp
+
+    def _maybe_recycle_server(self, proc) -> None:
+        """Recycle the server if its RSS crossed the cap (checked periodically).
+
+        VTK/allocator retention grows the server over many large scenes; a
+        respawn between requests is invisible (next render re-pays only the
+        import) and keeps memory bounded. Called with the lock held.
+        """
+        self._reqs_since_rss_check += 1
+        if self._reqs_since_rss_check < _RSS_CHECK_EVERY:
+            return
+        self._reqs_since_rss_check = 0
+        rss = _rss_mb(proc.pid)
+        if rss > _SERVER_RSS_CAP_MB:
+            _log.info("render server RSS %.0f MB > %d MB cap — recycling",
+                      rss, _SERVER_RSS_CAP_MB)
+            self._kill_render_server()
+
+    # ---- watchdog / recovery -----------------------------------------------
+    def _watchdog(self):
+        """Periodic liveness check; replaces a dead or hung idle server."""
+        try:
+            if self._render_proc is not None and self._server_lock.acquire(False):
+                try:
+                    proc = self._render_proc
+                    if proc is not None:
+                        if proc.poll() is not None:
+                            _log.warning("render server died while idle — respawning")
+                            self._kill_render_server()
+                            self._ensure_render_server()
+                        elif not self._ping_server(proc):
+                            _log.warning("render server unresponsive — recycling")
+                            self._kill_render_server()
+                            self._ensure_render_server()
+                finally:
+                    self._server_lock.release()
+            # If the lock is busy a render is in flight — its own timeout covers
+            # a hang, so the watchdog just skips this round.
+        except Exception:  # noqa: BLE001 - watchdog must never take the app down
+            pass
+        self.after(_PING_INTERVAL_MS, self._watchdog)
+
+    def _ping_server(self, proc) -> bool:
+        """True if the server answers a ping within _PING_TIMEOUT seconds."""
+        self._req_id += 1
+        try:
+            proc.stdin.write(json.dumps({"ping": True, "id": self._req_id}) + "\n")
+            proc.stdin.flush()
+            resp = self._read_response(proc, self._req_id, _PING_TIMEOUT)
+            return bool(resp.get("ok"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _retry_render(self):
+        """User-visible recovery: re-render the active view after a failure."""
+        if self._retry_btn is not None:
+            self._retry_btn.place_forget()
+        self._hint.config(text="Retrying preview…")
+        if self._active in self._specs:
+            self._render_static(self._active)
+        elif self._specs:
+            self._render_static(next(iter(self._specs)))
+
+    def _show_image(self, name: str, png_path: str, size: tuple, gen: int = -1):
         self._rendering = False
+        if gen >= 0 and gen != self._scene_gen:
+            # The scene changed while this frame rendered (new file selected) —
+            # never show a stale image for the wrong content. If the view is
+            # still wanted, re-render it against the fresh scene.
+            _log.info("dropping stale render of %s (gen %d != %d)",
+                      name, gen, self._scene_gen)
+            if name == self._active and name in self._specs:
+                self._render_static(name)
+            else:
+                self._kick_pending()
+            return
         try:
             from PIL import Image, ImageTk
 
@@ -516,6 +712,8 @@ class EmbeddedViewer(ttk.Frame):
             return
         self._images[name] = photo  # keep a ref so Tk doesn't GC it
         self._last_render_size = size
+        if self._retry_btn is not None:
+            self._retry_btn.place_forget()
         if self._active == name and self._image_label is not None:
             self._image_label.config(image=photo, text="")
             self._displayed = name
@@ -525,8 +723,10 @@ class EmbeddedViewer(ttk.Frame):
     def _on_render_error(self, exc):
         self._rendering = False
         if self._image_label is not None and not self._image_label.cget("image"):
-            self._image_label.config(text="Preview unavailable — use Pop out ↗")
-        self._hint.config(text=f"Preview render failed: {exc} — use Pop out ↗.")
+            self._image_label.config(text="Preview render failed")
+        if self._retry_btn is not None and self._specs:
+            self._retry_btn.place(relx=0.5, rely=0.5, anchor="center")
+        self._hint.config(text=f"Preview render failed: {exc} — Retry, or Pop out ↗.")
         self._kick_pending()
 
     def _kick_pending(self):

@@ -1,7 +1,7 @@
 """Off-screen preview renderer, run as a subprocess of the GUI.
 
-Renders JSON scene specs to PNGs with pyvista. The embedded viewer uses this
-instead of rendering in-process because creating a VTK off-screen render
+Renders JSON scene specs to image files with pyvista. The embedded viewer uses
+this instead of rendering in-process because creating a VTK off-screen render
 context from a background thread deadlocks on macOS (Cocoa wants the main
 thread) — a subprocess renders on *its* main thread, and a hung render is
 killable via a timeout instead of freezing the GUI.
@@ -9,23 +9,31 @@ killable via a timeout instead of freezing the GUI.
 Two modes:
 
 * one-shot: ``preview_render <spec.json>`` — render one spec and exit.
-* server: ``preview_render --serve`` — read one JSON spec per stdin line,
-  render, answer one JSON line (``{"ok": true, "png": ...}`` /
-  ``{"ok": false, "error": ...}``) on stdout, repeat until EOF. The GUI keeps
-  ONE server alive for its whole life, so the heavy pyvista/VTK import (plus a
-  frozen app's bootstrap — several seconds) is paid once; every render after
-  that costs only the render itself.
+* server: ``preview_render --serve`` — read one JSON request per stdin line,
+  answer one JSON line on stdout, repeat until EOF. The GUI keeps ONE server
+  alive for its whole life, so the heavy pyvista/VTK import (plus a frozen
+  app's bootstrap — several seconds) is paid once. Loaded meshes are cached
+  (LRU, keyed by path+mtime+size) so drag re-renders don't re-parse the file.
+
+Protocol (one JSON object per line):
+
+* render request — the spec below, plus optional ``"id"`` (echoed back).
+* ``{"ping": true, "id": n}`` — liveness probe; answered without rendering.
+* response — ``{"ok": true, "png": path, "id": n}`` or
+  ``{"ok": false, "error": msg, "id": n}``.
 
 Spec::
 
     {
+      "id": 7,
       "width": 800, "height": 600,
-      "background": "#0f172a",
+      "background": "#f0f2f5",
       "mode": "shaded" | "edges" | "wire",
-      "out": "preview.png",
+      "out": "preview.png",              # .jpg/.jpeg -> JPEG (fast drag frames)
+      "camera": {"azimuth": 0, "elevation": 0, "zoom": 1, "pan": [0, 0]},
       "meshes": [
         {"path": "scene.vtp",          # any pyvista-readable mesh file
-         "color": "#cbd5e1",           # ignored when "scalars" is set
+         "color": "#8b95a1",           # ignored when "scalars" is set
          "opacity": 1.0,
          "points": false,              # render as sphere markers
          "scalars": "deviation",       # active point-data array to colour by
@@ -38,14 +46,41 @@ Spec::
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
-
 
 # Light neutral background — model colours and the heatmap read much better on
 # it than on the app's dark panel, and scalar-bar text is dark to match.
 DEFAULT_BG = "#f0f2f5"
 SCALAR_TEXT = "#1f2937"
+
+# Server-side mesh cache: at most this many loaded polydata objects, LRU.
+# Bounds the server's memory while making drag re-renders parse-free.
+_CACHE_MAX = 6
+
+
+def _load_mesh(path: str, cache: dict | None):
+    """pyvista-read ``path`` through the LRU cache (keyed path+mtime+size)."""
+    import pyvista as pv
+
+    if cache is None:
+        return pv.read(path)
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return pv.read(path)
+    if key in cache:
+        cache[key] = cache.pop(key)      # bump to most-recent (dict is ordered)
+        return cache[key]
+    poly = pv.read(path)
+    for stale in [k for k in cache if k[0] == path]:
+        cache.pop(stale)                 # same file changed on disk
+    cache[key] = poly
+    while len(cache) > _CACHE_MAX:
+        cache.pop(next(iter(cache)))     # evict least-recent
+    return poly
 
 
 def _apply_camera(plotter, cam: dict) -> None:
@@ -92,7 +127,7 @@ def _apply_camera(plotter, cam: dict) -> None:
     plotter.renderer.ResetCameraClippingRange()
 
 
-def render(spec: dict) -> None:
+def render(spec: dict, cache: dict | None = None) -> None:
     import pyvista as pv
 
     plotter = pv.Plotter(off_screen=True,
@@ -101,7 +136,7 @@ def render(spec: dict) -> None:
     plotter.set_background(spec.get("background", DEFAULT_BG))
     mode = spec.get("mode", "shaded")
     for m in spec.get("meshes", []):
-        poly = pv.read(m["path"])
+        poly = _load_mesh(m["path"], cache)
         if m.get("points"):
             plotter.add_mesh(poly, color=m.get("color", "#ef4444"), style="points",
                              render_points_as_spheres=True, point_size=9)
@@ -124,12 +159,20 @@ def render(spec: dict) -> None:
     cam = spec.get("camera")
     if cam:
         _apply_camera(plotter, cam)
-    plotter.screenshot(spec["out"])
+    out = spec["out"]
+    if out.lower().endswith((".jpg", ".jpeg")):
+        # JPEG drag frames: smaller and faster to encode/decode than PNG.
+        from PIL import Image
+
+        img = plotter.screenshot(return_img=True)
+        Image.fromarray(img).save(out, quality=80)
+    else:
+        plotter.screenshot(out)
     plotter.close()
 
 
 def serve() -> int:
-    """Line-protocol render server: JSON spec in, JSON result out, until EOF.
+    """Line-protocol render server: JSON request in, JSON result out, until EOF.
 
     Imports pyvista up front so the first request already runs warm. Any
     exception is reported as a JSON error line — the server never dies from a
@@ -138,16 +181,24 @@ def serve() -> int:
     """
     import pyvista  # noqa: F401 - warm the heavy import once
 
+    cache: dict = {}
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
+        req_id = None
         try:
             spec = json.loads(line)
-            render(spec)
-            resp = {"ok": True, "png": spec["out"]}
+            req_id = spec.get("id")
+            if spec.get("ping"):
+                resp: dict = {"ok": True, "pong": True}
+            else:
+                render(spec, cache)
+                resp = {"ok": True, "png": spec["out"]}
         except Exception as exc:  # noqa: BLE001 - report, keep serving
             resp = {"ok": False, "error": str(exc)}
+        if req_id is not None:
+            resp["id"] = req_id
         print(json.dumps(resp), flush=True)
     return 0
 
