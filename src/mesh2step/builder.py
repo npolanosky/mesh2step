@@ -15,8 +15,19 @@ import numpy as np
 
 from .boundary import FaceLoops, extract_face_loops
 from .config import ConversionConfig
-from .fitting import Cylinder, _connected_components, detect_cones, detect_cylinders
-from .segmentation import build_edge_adjacency, segment_planar
+from .fitting import (
+    Cylinder,
+    _connected_components,
+    detect_cones,
+    detect_cylinders,
+    detect_fillets_straight,
+)
+from .segmentation import (
+    build_edge_adjacency,
+    mesh_resolution,
+    segment_planar,
+    segment_smooth_bands,
+)
 
 
 def _vec(p):
@@ -83,6 +94,26 @@ def _planar_face(loops: FaceLoops, circles, Part):
 
     Hole loops are wound opposite to the outer loop so OCC subtracts them; when
     a loop is replaced by an exact circle we flip its axis to match.
+
+    ``segment_planar`` admits facets within ``dist_tol`` (0.01 mm) of the fitted
+    plane, so a region's boundary-loop vertices can sit a few microns off any
+    single plane. ``Part.Face(wires)`` *infers* the plane from the wire and
+    rejects those loops with ``OCCError: Not planar`` even though they are
+    genuinely planar to well under a micron of design intent (measured max
+    deviation 0.0074 mm on the corpus). That single failure used to drop the
+    whole region to faceted gap-fill — ~20% of all residual facets, and enough
+    open regions to stop the sew tier ever closing on grille/slot parts.
+
+    Fix: when the inference path fails, rebuild the face on the *explicit* fitted
+    plane (``Part.Face(plane, wires)``) — OCC no longer has to infer planarity,
+    it just projects the wire onto the given surface. Crucially this keeps the
+    original 3-D wire vertices (shared with neighbouring faces at the sew tier),
+    so **no vertex moves** and the sewing gaps that plain projection would open
+    (deviation up to ``dist_tol`` 0.01 mm > ``sew_tolerance`` 0.001 mm) never
+    appear. The explicit-plane face reads ``isValid()==False`` at OCC's default
+    1e-7 tolerance (the wire sits microns off the surface), so ``.fix()`` widens
+    only the face/edge *tolerance* to absorb that deviation — it still moves no
+    vertices — making the face valid for sewing.
     """
     normal = loops.normal
 
@@ -97,20 +128,56 @@ def _planar_face(loops: FaceLoops, circles, Part):
     for hole in loops.holes:
         if len(hole) >= 3:
             wires.append(wire_for(hole, is_hole=True))
-    return Part.Face(wires)
+
+    try:
+        # Fast path: OCC infers the plane from the wire. Works for the vast
+        # majority of regions (loops that lie on one plane to ~1e-7).
+        face = Part.Face(wires)
+        if face.isValid() and face.Area > 1e-9:
+            return face
+    except Exception:  # noqa: BLE001 - OCCError: Not planar (and friends)
+        pass
+
+    # Robust path: build on the explicit fitted plane, then widen the face
+    # tolerance so OCC accepts the wire that sits a few microns off it. Vertices
+    # are untouched, so sewing with neighbours is unaffected.
+    n = np.asarray(normal, float)
+    n = n / (np.linalg.norm(n) or 1.0)
+    centroid = np.asarray(loops.outer, float).mean(axis=0)
+    plane = Part.Plane(_vec(centroid), _vec(n))
+    face = Part.Face(plane, wires)
+    if not face.isValid():
+        # Absorb the sub-dist_tol wire-vs-surface deviation into the face/edge
+        # tolerance (does not move vertices); sew_tolerance still bridges the
+        # shared edges between faces.
+        face = face.copy()
+        try:
+            face.fix(1e-3, 1e-3, 1e-3)
+        except Exception:  # noqa: BLE001 - fix is best-effort validation
+            pass
+    if face.Area <= 1e-9:
+        raise RuntimeError("planar face built with zero area")
+    return face
 
 
 def _cylinder_face(cyl: Cylinder, Part):
     """Build an analytic cylindrical face trimmed to the region's axial span.
 
     A boss keeps the surface's natural outward normal; a hole is reversed so the
-    solid's outward normal points into the material (out of the bore).
+    solid's outward normal points into the material (out of the bore). A fillet
+    is a partial arc: only its ``[u_start, u_start+u_span]`` angular sector is
+    built (a full cylinder uses the whole 0..2pi range).
     """
     surf = Part.Cylinder()
     surf.Center = _vec(cyl.axis_point)
     surf.Axis = _vec(cyl.axis_dir)
     surf.Radius = float(cyl.radius)
-    face = surf.toShape(0.0, 2.0 * math.pi, cyl.axial_min, cyl.axial_max)
+    if cyl.is_fillet:
+        u0 = float(cyl.u_start)
+        u1 = u0 + float(cyl.u_span)
+    else:
+        u0, u1 = 0.0, 2.0 * math.pi
+    face = surf.toShape(u0, u1, cyl.axial_min, cyl.axial_max)
     return face if cyl.outward else face.reversed()
 
 
@@ -173,6 +240,16 @@ def build_reconstructed_solid(
     for cone in cones:
         claimed.update(cone.face_indices)
 
+    # Straight-edge fillets: partial-arc cylinder sections between two planes.
+    # Detected here for reporting, but a partial-arc cylinder face does NOT sew
+    # to the faceted band it replaces (its straight side edges don't coincide
+    # with the neighbour planes), which would OPEN this sew-based shell. So in the
+    # sew tier the fillet band is left to the normal planar/gap-fill path (its
+    # arc rows build as thin planar faces, which sew). The analytic fillet
+    # surface is delivered by the boolean-clean tier via cut/fuse (design §4:
+    # "do NOT rely on sewing"), where a bad step reverts and stays watertight.
+    fillets: list[Cylinder] = _detect_fillets(vertices, faces, claimed, config, progress)
+
     # Exact end-circles of the analytic faces, used to replace matching faceted
     # boundary loops so their edges coincide and sew.
     circles = _analytic_circles(cylinders, cones)
@@ -223,6 +300,10 @@ def build_reconstructed_solid(
         except Exception:  # noqa: BLE001
             pass
 
+    # Fillet faces are NOT built in the sew tier (they don't sew — see above);
+    # the boolean-clean tier delivers them. Reported as detected only.
+    fillet_faces_ok = 0
+
     # Gap-fill: patch the facets that couldn't be reconstructed so the shell has
     # no holes and sews watertight (manifold). Facets are grouped into connected
     # local patches (genuinely separate pockets stay separate — sharp edges
@@ -268,17 +349,56 @@ def build_reconstructed_solid(
         "planar_faces": reconstructed,
         "cylinder_faces": cyl_faces_ok,
         "cone_faces": cone_faces_ok,
+        "fillet_faces": fillet_faces_ok,
         "gap_faces": gap_faces,
         "gap_patches": gap_patches,
         "cylinders_detected": len(cylinders),
-        "faces_out": reconstructed + cyl_faces_ok + cone_faces_ok + gap_faces,
+        "faces_out": reconstructed + cyl_faces_ok + cone_faces_ok
+        + fillet_faces_ok + gap_faces,
         "cylinders": [c.as_dict() for c in cylinders],
         "cones_detected": len(cones),
         "cones": [c.as_dict() for c in cones],
+        "fillets_detected": len(fillets),
+        "fillets": [f.as_dict() for f in fillets],
+        "fillet_radius_source": _radius_source_breakdown(fillets),
         "skipped_facets": skipped,
         "is_solid": is_solid,
     }
     return shape, stats
+
+
+def _radius_source_breakdown(fillets) -> dict:
+    """Count of fillet radii derived from tangency vs free fit (QA reporting)."""
+    out = {"tangency": 0, "fit": 0}
+    for f in fillets:
+        out[f.radius_source] = out.get(f.radius_source, 0) + 1
+    return out
+
+
+def _detect_fillets(vertices, faces, claimed: set, config: ConversionConfig, progress):
+    """Detect straight-edge fillets (design §2, §3). Returns a list of fillet
+    ``Cylinder`` objects; empty when ``detect_fillets`` is off or none found.
+
+    Runs planar segmentation + smooth-band grouping on the unclaimed facets, then
+    ``detect_fillets_straight`` on the ``band``-classed regions. Best-effort: any
+    failure leaves the bands faceted (never raises)."""
+    if not config.detect_fillets:
+        return []
+    try:
+        resolution = mesh_resolution(vertices, faces, config)
+        regions = segment_planar(vertices, faces, config)
+        bands = segment_smooth_bands(vertices, faces, claimed, regions, config)
+        n_band = sum(1 for b in bands if b.class_hint == "band")
+        fillets = detect_fillets_straight(
+            vertices, faces, bands, regions, set(claimed), config, resolution)
+    except Exception as exc:  # noqa: BLE001 - fillet detection is best-effort
+        progress(f"Fillet detection skipped ({exc})")
+        return []
+    if fillets:
+        tan = sum(1 for f in fillets if f.radius_source == "tangency")
+        progress(f"Found {len(fillets)} straight-edge fillet(s) "
+                 f"({tan} tangency-snapped) from {n_band} band(s)")
+    return fillets
 
 
 def _safe_remove_splitter(shape, Part):
@@ -458,6 +578,96 @@ def _boolean_clean_cylinder(solid, cyl: Cylinder, Part, radius: float | None = N
     return solid.cut(cut)
 
 
+def _fillet_wedge_tool(cyl: Cylinder, Part, eps: float, pad: float):
+    """The exact rounded-corner solid for a *convex* straight-edge fillet.
+
+    A convex fillet rounds an outer edge: the rounded corner solid is the
+    cylinder (radius R, on the interior axis) clipped to the material wedge
+    between the two tangent planes — i.e. only the sector the fillet actually
+    occupies. Fusing this adds just the thin sliver between the inscribed faceted
+    arc and the true arc, never the full disk (which would bulge into open air).
+    The sector is taken from the fitted ``[u_start, u_span]`` plus a small angular
+    pad so the tool fully clears the faceted rim.
+
+    The tool spans EXACTLY the fillet's axial extent (no ``pad``): a convex fuse
+    ADDS material, so an axial over-run would stick nubs of solid into open air
+    past the part's ends. The band's axial extent already equals the edge length.
+    """
+    axis = np.asarray(cyl.axis_dir, dtype=float)
+    center = np.asarray(cyl.axis_point, dtype=float)
+    zmin, zmax = cyl.axial_min, cyl.axial_max
+    R = float(cyl.radius) + eps
+    height = (zmax - zmin)
+    pad = 0.0
+    base = center + zmin * axis
+    full = Part.makeCylinder(R, height, _vec(base), _vec(axis))
+    # Clip to the angular sector [u_start-dpad, u_start+u_span+dpad]. A cylinder
+    # sector is the common of the solid cylinder and a prism spanning that wedge.
+    u, v = _plane_basis(axis)
+    dpad = math.radians(6.0)
+    a0 = cyl.u_start - dpad
+    a1 = cyl.u_start + cyl.u_span + dpad
+    span = a1 - a0
+    if span >= 2.0 * math.pi:
+        return full
+    # Build a wedge prism (fan of the sector) large enough to cover radius R.
+    big = 2.5 * R
+    steps = max(2, int(math.degrees(span) / 15) + 1)
+    pts2d = [(0.0, 0.0)]
+    for k in range(steps + 1):
+        a = a0 + span * k / steps
+        pts2d.append((big * math.cos(a), big * math.sin(a)))
+    poly3d = [center + (zmin - pad) * axis + p2 * u + p2v * v
+              for (p2, p2v) in pts2d]
+    vfrom = [_vec(p) for p in poly3d]
+    vfrom = vfrom + [vfrom[0]]
+    wire = Part.makePolygon(vfrom)
+    face = Part.Face(wire)
+    prism = face.extrude(_vec(axis * height))
+    try:
+        return full.common(prism)
+    except Exception:  # noqa: BLE001 - fall back to the full cylinder sector
+        return full
+
+
+def _plane_basis(axis):
+    """Two orthonormal in-plane axes for a unit axis (builder-local copy)."""
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(axis, ref)
+    u /= np.linalg.norm(u) or 1.0
+    v = np.cross(axis, u)
+    return u, v
+
+
+def _boolean_clean_fillet(solid, cyl: Cylinder, Part, **_):
+    """Replace a faceted straight-edge fillet with an exact analytic cylinder
+    sector via a boolean op.
+
+    Concave (inner corner, ``outward=False``): the faceted arc bulges toward the
+    axis (into open space), so the material overshoots the true arc — CUT a solid
+    cylinder of radius R on the interior axis to trim it back to the analytic
+    concave wall.
+
+    Convex (outer edge, ``outward=True``): the faceted arc is inscribed, so
+    material stops short of the true arc — FUSE the exact rounded-corner sector
+    (the cylinder clipped to the material wedge) to true it up. Guarded so a
+    mis-fit fillet that would bulge into open air is rejected.
+    """
+    R = float(cyl.radius)
+    eps = _clean_cut_eps(R)
+    axis = np.asarray(cyl.axis_dir, dtype=float)
+    center = np.asarray(cyl.axis_point, dtype=float)
+    zmin, zmax = cyl.axial_min, cyl.axial_max
+    pad = _cut_pad(zmax - zmin)
+    if cyl.outward:
+        tool = _fillet_wedge_tool(cyl, Part, eps, pad)
+        return _guarded_fuse(solid, tool, max_added_frac=0.5)
+    cut = _boolean_cut_tool_cylinder(center, axis, R + eps, zmin - pad, zmax + pad, Part)
+    return solid.cut(cut)
+
+
 def _guarded_fuse(solid, tool, max_added_frac: float = 0.30):
     """Fuse a boss tool, but refuse if it would ADD real material.
 
@@ -609,6 +819,14 @@ def build_boolean_clean_solid(
     cones = detect_cones(vertices, faces, cylinders, config)
     progress(f"Found {len(cylinders)} cylinders, {len(cones)} cones")
 
+    # Straight-edge fillets, after cylinders/cones (detector ladder, design §5).
+    claimed: set[int] = set()
+    for c in cylinders:
+        claimed.update(c.face_indices)
+    for c in cones:
+        claimed.update(c.face_indices)
+    fillets = _detect_fillets(vertices, faces, claimed, config, progress)
+
     progress("Building faceted watertight solid (base)")
     solid = build_faceted_solid(vertices, faces)
     if not _is_valid_solid(solid):
@@ -663,8 +881,18 @@ def build_boolean_clean_solid(
         solid, ok = _try_boolean_step(solid, lambda s, c=cone: _boolean_clean_cone(s, c, Part))
         cone_ok += ok
 
-    total = len(cylinders) + len(cones)
-    cleaned = cyl_ok + cone_ok
+    # Fillets last: a concave fillet cuts, a convex one fuses its rounded-corner
+    # sector, each reverting on invalidity so a bad fillet never breaks the solid.
+    fillet_ok = 0
+    for fl in fillets:
+        solid, ok = _try_boolean_step(
+            solid, lambda s, f=fl: _boolean_clean_fillet(s, f, Part))
+        fillet_ok += ok
+    if fillets:
+        progress(f"  fillets cleaned {fillet_ok}/{len(fillets)}")
+
+    total = len(cylinders) + len(cones) + len(fillets)
+    cleaned = cyl_ok + cone_ok + fillet_ok
     progress(f"Boolean clean-up: {cleaned}/{total} features replaced with analytic geometry "
              f"({total - cleaned} left faceted)")
 
@@ -677,7 +905,8 @@ def build_boolean_clean_solid(
     # by booleans on intersecting holes show up as faces at *other* radii — those
     # cause downstream CAD issues, so we flag them and the caller rejects the
     # result rather than shipping artifacts.
-    detected_r = sorted({round(c.radius, 3) for c in cylinders})
+    detected_r = sorted({round(c.radius, 3) for c in cylinders}
+                        | {round(f.radius, 3) for f in fillets})
     rogue = []
     for fc in solid.Faces:
         if fc.Surface.TypeId == "Part::GeomCylinder":
@@ -693,8 +922,12 @@ def build_boolean_clean_solid(
         "cylinder_faces": cyl_ok,
         "cones_detected": len(cones),
         "cone_faces": cone_ok,
+        "fillets_detected": len(fillets),
+        "fillet_faces": fillet_ok,
+        "fillet_radius_source": _radius_source_breakdown(fillets),
         "cylinders": [c.as_dict() for c in cylinders],
         "cones": [c.as_dict() for c in cones],
+        "fillets": [f.as_dict() for f in fillets],
         "boolean_cleaned": cleaned,
         "boolean_failed": total - cleaned,
         "artifact_free": artifact_free,
@@ -704,6 +937,177 @@ def build_boolean_clean_solid(
     return solid, stats
 
 
+def _face_plane_normal(face) -> np.ndarray:
+    """Unit normal of a planar face's surface (its plane Axis)."""
+    n = face.Surface.Axis
+    v = np.array([n.x, n.y, n.z], float)
+    return v / (np.linalg.norm(v) or 1.0)
+
+
+def _rtaf_edge_key(edge, ndig: int = 4):
+    """A tolerance-rounded key identifying an edge by its endpoints + midpoint.
+
+    Two faces share an edge when they contribute an edge with the same key; the
+    rounding bridges the FP noise between a face's copy of a shared edge and its
+    neighbour's. Mirrors the prototype (diagnosis/step_strips.py)."""
+    try:
+        vs = edge.Vertexes
+        if len(vs) >= 2:
+            a = (round(vs[0].X, ndig), round(vs[0].Y, ndig), round(vs[0].Z, ndig))
+            b = (round(vs[1].X, ndig), round(vs[1].Y, ndig), round(vs[1].Z, ndig))
+            lo, hi = (a, b) if a <= b else (b, a)
+        else:  # closed edge (full circle) — no endpoints
+            c = edge.CenterOfMass
+            lo = hi = (round(c.x, ndig), round(c.y, ndig), round(c.z, ndig))
+        m = edge.CenterOfMass
+        return (lo, hi, (round(m.x, ndig), round(m.y, ndig), round(m.z, ndig)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def compute_rtaf(shape, config: ConversionConfig) -> dict:
+    """Residual Tessellation Area Fraction of an output solid (design §6a).
+
+    RTAF = area(planar faces in smooth chains of length >= rtaf_min_chain) /
+           total face area, where a *smooth chain* is a connected component over
+           shared edges of planar faces whose pairwise normal angle is in
+           (rtaf_angle_lo, rtaf_angle_hi) degrees. This captures the area a human
+           reads as "faceted" — a tessellated curve arriving as a fan of
+           near-tangent flat panels — regardless of whether the pipeline counted
+           the underlying facets as skipped (gap-filled patches and built-as-thin
+           -strips both produce the signature, so one number catches both).
+
+    Returns a dict with ``rtaf`` (float in [0,1]) plus supporting counts, or
+    ``{"rtaf": None, "skipped": <reason>}`` when disabled/too large/failed. Never
+    raises — quality metrics must not break a conversion.
+    """
+    out: dict = {"rtaf": None}
+    if not config.compute_rtaf:
+        out["skipped"] = "disabled"
+        return out
+    try:
+        faces = list(shape.Faces)
+    except Exception as exc:  # noqa: BLE001
+        out["skipped"] = f"no faces ({exc})"
+        return out
+    n = len(faces)
+    if n == 0:
+        out["skipped"] = "no faces"
+        return out
+    cap = config.rtaf_max_faces
+    if cap is not None and n > cap:
+        out.update(skipped=f"face count {n} > rtaf_max_faces {cap}", faces=n)
+        return out
+
+    try:
+        is_plane = [f.Surface.TypeId == "Part::GeomPlane" for f in faces]
+        areas = [float(f.Area) for f in faces]
+        total_area = float(sum(areas))
+        normals = [_face_plane_normal(faces[i]) if is_plane[i] else None
+                   for i in range(n)]
+
+        # Build face adjacency by shared-edge key.
+        edge_map: dict = {}
+        for fi, f in enumerate(faces):
+            for e in f.Edges:
+                k = _rtaf_edge_key(e)
+                if k is not None:
+                    edge_map.setdefault(k, set()).add(fi)
+
+        lo = float(config.rtaf_angle_lo)
+        hi = float(config.rtaf_angle_hi)
+        adj: dict[int, set[int]] = {i: set() for i in range(n)}
+        for fs in edge_map.values():
+            fl = sorted(fs)
+            for a_i in range(len(fl)):
+                for b_i in range(a_i + 1, len(fl)):
+                    a, b = fl[a_i], fl[b_i]
+                    if not (is_plane[a] and is_plane[b]):
+                        continue
+                    d = min(abs(float(normals[a] @ normals[b])), 1.0)
+                    ang = math.degrees(math.acos(d))
+                    if lo < ang < hi:
+                        adj[a].add(b)
+                        adj[b].add(a)
+
+        # Connected components of smooth-linked planar faces; keep those >= min.
+        seen: set[int] = set()
+        chain_faces: set[int] = set()
+        n_chains = 0
+        largest = 0
+        for i in range(n):
+            if i in seen or not adj[i]:
+                continue
+            comp, stack = [], [i]
+            seen.add(i)
+            while stack:
+                x = stack.pop()
+                comp.append(x)
+                for y in adj[x]:
+                    if y not in seen:
+                        seen.add(y)
+                        stack.append(y)
+            if len(comp) >= config.rtaf_min_chain:
+                n_chains += 1
+                largest = max(largest, len(comp))
+                chain_faces.update(comp)
+
+        chain_area = float(sum(areas[i] for i in chain_faces))
+        rtaf = chain_area / total_area if total_area > 1e-12 else 0.0
+        out.update(
+            rtaf=round(rtaf, 4),
+            faces=n,
+            planar_faces=int(sum(is_plane)),
+            chain_faces=len(chain_faces),
+            smooth_chains=n_chains,
+            largest_chain=largest,
+            total_area_mm2=round(total_area, 1),
+        )
+    except Exception as exc:  # noqa: BLE001 - metric is best-effort
+        out.update(rtaf=None, skipped=f"error ({exc})")
+    return out
+
+
 def export_step(shape, out_path: str | Path) -> None:
     """Write ``shape`` to a STEP file."""
     shape.exportStep(str(out_path))
+
+
+def revalidate_step(out_path: str | Path, expected_solids: int | None = None) -> dict:
+    """Re-read an exported STEP and check the solid(s) survived the round-trip.
+
+    Some defects — most notably self-intersecting wires produced by sliver
+    triangles after aggressive decimation — pass ``isValid()`` in memory but
+    only manifest when OCC writes the shape to STEP and reads it back (the
+    write/read re-derives wire geometry). This re-reads the file and confirms:
+    it loads, has at least one solid, the first solid ``isValid()``, and — when
+    ``expected_solids`` is given — the solid count matches what we wrote.
+
+    Returns a dict with ``valid`` (bool) and, on failure, a ``reason`` string.
+    Never raises for geometry problems (they are reported via the dict); only a
+    genuinely unreadable file surfaces as ``valid=False`` with the read error.
+    """
+    import Part  # type: ignore
+
+    info: dict = {"path": str(out_path)}
+    try:
+        shape = Part.Shape()
+        shape.read(str(out_path))
+    except Exception as exc:  # noqa: BLE001
+        info.update(valid=False, reason=f"STEP unreadable: {exc}")
+        return info
+
+    solids = getattr(shape, "Solids", [])
+    info["num_solids"] = len(solids)
+    if not solids:
+        info.update(valid=False, reason="no solids in re-read STEP")
+        return info
+    if not solids[0].isValid():
+        info.update(valid=False, reason="re-read solid isValid() is False")
+        return info
+    if expected_solids is not None and len(solids) != expected_solids:
+        info.update(valid=False,
+                    reason=f"solid count changed ({expected_solids} -> {len(solids)})")
+        return info
+    info["valid"] = True
+    return info

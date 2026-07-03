@@ -63,17 +63,70 @@ def _make_root() -> "tk.Tk":
     a normal Tk window with drag-and-drop disabled.
     """
     global DND_ACTIVE
+    root: "tk.Tk"
     if _DND:
         try:
             root = TkinterDnD.Tk()
             DND_ACTIVE = True
+            _disable_mac_window_tabs(root)
             return root
         except Exception:  # noqa: BLE001
             import logging
 
             logging.getLogger("mesh2step").warning(
                 "drag-and-drop backend failed to load; using a plain window", exc_info=True)
-    return tk.Tk()
+            _destroy_zombie_default_root()
+    root = tk.Tk()
+    _disable_mac_window_tabs(root)
+    return root
+
+
+def _destroy_zombie_default_root() -> None:
+    """Tear down the half-built Tk left behind by a failed TkinterDnD.Tk().
+
+    TkinterDnD.Tk() runs the full ``tkinter.Tk.__init__`` (which registers the
+    new interp as ``tkinter._default_root``) and only THEN tries to load the
+    native tkdnd library. When that load fails (always, in the frozen macOS
+    app), the exception leaves the abandoned interp as the default root. Every
+    ``StringVar``/``BooleanVar`` created afterwards without an explicit master
+    silently binds to that ZOMBIE interp instead of the real window — so
+    checkboxes render as indeterminate dashes and entry fields (FreeCAD path,
+    output, units) look blank even though the values were set. Destroying the
+    zombie makes the real root the default so everything binds where it shows.
+    """
+    zombie = getattr(tk, "_default_root", None)
+    if zombie is None:
+        return
+    try:
+        zombie.destroy()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        tk._default_root = None  # destroy() usually clears it; make sure
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _disable_mac_window_tabs(root: "tk.Tk") -> None:
+    """Stop macOS from adding an empty window-tab bar above our single window.
+
+    On macOS the window manager can group Tk windows into native tabs, which
+    surfaces as a stray blank "( )" tab strip at the top of the app's only
+    window. Setting the NSWindow tabbing mode to *disallowed* removes it. Wrapped
+    in try/except: the Tcl command only exists on macOS Aqua Tk and is a no-op
+    (or absent) elsewhere.
+    """
+    if sys.platform != "darwin":
+        return
+    # Tk 8.7+ exposes a per-window tabbing mode; "disallowed" removes the native
+    # tab bar. Tk 8.6 (what we bundle) has no such subcommand — the effective
+    # opt-out there is the AppleWindowTabbingMode user default, set once before
+    # any window is created (see packaging/app.py). This call is a harmless no-op
+    # on 8.6 and a belt-and-braces removal on 8.7+.
+    try:
+        root.tk.eval("tk::unsupported::MacWindowStyle tabbingMode . disallowed")
+    except tk.TclError:
+        pass
 
 # Run child processes without flashing a console window on Windows.
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -119,12 +172,16 @@ class WorkerError(RuntimeError):
 
 def run_worker(job: dict, freecad_python: str, on_line=None, timeout: float = 1800) -> dict:
     """Run one worker job out-of-process, streaming stdout lines to ``on_line``."""
+    from . import provision
+
     with tempfile.TemporaryDirectory() as tmp:
         job_file = Path(tmp) / "job.json"
         res_file = Path(tmp) / "result.json"
         job_file.write_text(json.dumps(job), encoding="utf-8")
 
-        env = dict(os.environ)
+        # Prepend our package source AND the auto-provisioned prep-deps dir
+        # (pymeshlab/manifold3d) so FreeCAD's interpreter can import both.
+        env = provision.prep_env(freecad_python)
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = _package_src() + (os.pathsep + existing if existing else "")
 
@@ -171,18 +228,30 @@ class App:
         self.closed_var = tk.BooleanVar(value=True)
         self.freecad_var = tk.StringVar(value=find_freecad_python() or "")
         self.output_dir = None  # user-chosen output folder; None = use input's folder
+        # Failure-corpus option (persisted across runs in the app settings).
+        from . import provision
+        self._settings = provision.load_settings()
+        self.savefail_var = tk.BooleanVar(
+            value=bool(self._settings.get("save_failures", False)))
+        self.failures_dir = self._settings.get("failures_dir") or None
         self._longest_mm = None
         self._t0 = 0.0
         self._last_line_t = 0.0
         self._stall_noted = False
         self.last_stl = None
         self.last_step = None
+        self._last_result = None
+
+        self._prep_ready = False   # prep deps provisioned this session?
 
         self._init_style()
         self._build()
         self.root.after(80, self._drain_queue)
         if not self.freecad_var.get():
-            self._log("⚠  FreeCAD not found — set its python path below.", "err")
+            self._log("⚠  FreeCAD not found.", "err")
+            # Offer to auto-download/install it (no admin needed). Do it after the
+            # window is up so the consent dialog has a parent.
+            self.root.after(300, self._offer_freecad_install)
         else:
             self._log(f"FreeCAD: {self.freecad_var.get()}", "muted")
 
@@ -218,6 +287,22 @@ class App:
         ttk.Label(inner, text=title, style="Head.TLabel").pack(anchor="w", pady=(0, 8))
         return inner
 
+    @staticmethod
+    def _checkbutton(parent, text: str, variable: "tk.BooleanVar") -> ttk.Checkbutton:
+        """A ttk.Checkbutton that shows its real on/off state, never a dash.
+
+        A fresh ttk.Checkbutton starts in the tri-state 'alternate' look (renders
+        as '-' on the macOS/clam themes) until the user clicks it — even though
+        its BooleanVar already holds True/False. Clearing 'alternate' and pushing
+        the variable's value through makes the box read its intended default the
+        moment the window opens.
+        """
+        cb = ttk.Checkbutton(parent, text=text, variable=variable,
+                             onvalue=True, offvalue=False)
+        cb.state(["!alternate"])
+        variable.set(variable.get())  # force the check/uncheck to match the var
+        return cb
+
     # ---- layout -----------------------------------------------------------
     def _build(self):
         # Header band
@@ -242,6 +327,13 @@ class App:
         canvas = tk.Canvas(scroll_area, bg=BG, highlightthickness=0, bd=0, width=560)
         vbar = ttk.Scrollbar(scroll_area, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vbar.set)
+        if sys.platform == "darwin":
+            # Pixel-ish scrolling. With no yscrollincrement, one scroll "unit" is
+            # a tenth of the canvas height — and an aqua trackpad swipe delivers a
+            # stream of delta events, so one swipe slammed the panel from top to
+            # bottom. 3 px per unit × the per-event delta gives the standard
+            # macOS feel (several swipes to traverse the panel).
+            canvas.configure(yscrollincrement=3)
         vbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
@@ -252,11 +344,23 @@ class App:
         body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
         def _on_wheel(e):
-            # Leave the log's own text area free to scroll itself.
+            # Leave the log's own text area free to scroll itself, and don't
+            # steal wheel events from the preview panel on the right.
             w = self.root.winfo_containing(e.x_root, e.y_root)
-            if isinstance(w, tk.Text):
+            if w is None or isinstance(w, tk.Text):
                 return
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            area = str(scroll_area)
+            if not (str(w) == area or str(w).startswith(area + ".")):
+                return
+            if sys.platform == "darwin":
+                # Aqua Tk reports small per-line deltas (±1..±10); the Windows
+                # convention divides by 120, which floors to 0 here and made
+                # trackpad scrolling a no-op on macOS.
+                step = -e.delta
+            else:
+                step = int(-e.delta / 120)
+            if step:
+                canvas.yview_scroll(int(step), "units")
 
         canvas.bind_all("<MouseWheel>", _on_wheel)
 
@@ -297,16 +401,27 @@ class App:
         cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_units())
         self.units_preview = ttk.Label(urow, text="STEP output is always mm", style="Muted.TLabel")
         self.units_preview.pack(side="left", padx=8)
-        ttk.Checkbutton(c2, text="Detect cylindrical holes / bosses (best-fit radius)",
-                        variable=self.detect_var).pack(anchor="w", pady=(8, 0))
-        ttk.Checkbutton(c2, text="Repair mesh (fix self-intersections, duplicates, normals) — "
-                                 "recovers holes on defective meshes",
-                        variable=self.repair_var).pack(anchor="w")
-        ttk.Checkbutton(c2, text="Fully closed (guarantee watertight; slower, faceted holes on "
-                                 "organic parts)",
-                        variable=self.closed_var).pack(anchor="w")
-        ttk.Checkbutton(c2, text="Faceted only (skip reconstruction)",
-                        variable=self.faceted_var).pack(anchor="w")
+        self._checkbutton(c2, "Detect cylindrical holes / bosses (best-fit radius)",
+                          self.detect_var).pack(anchor="w", pady=(8, 0))
+        self._checkbutton(c2, "Repair mesh (fix self-intersections, duplicates, normals) — "
+                          "recovers holes on defective meshes",
+                          self.repair_var).pack(anchor="w")
+        self._checkbutton(c2, "Fully closed (guarantee watertight; slower, faceted holes on "
+                          "organic parts)",
+                          self.closed_var).pack(anchor="w")
+        self._checkbutton(c2, "Faceted only (skip reconstruction)",
+                          self.faceted_var).pack(anchor="w")
+        sf = self._checkbutton(c2, "Save failing models for regression testing",
+                               self.savefail_var)
+        sf.config(command=self._on_savefail_toggle)
+        sf.pack(anchor="w", pady=(8, 0))
+        sfrow = ttk.Frame(c2, style="Card.TFrame")
+        sfrow.pack(fill="x")
+        self.faildest_label = ttk.Label(sfrow, text="→ " + str(self._failures_dest()),
+                                        style="Muted.TLabel")
+        self.faildest_label.pack(side="left", padx=(24, 0))
+        ttk.Button(sfrow, text="…", width=3,
+                   command=self._choose_failures_dir).pack(side="left", padx=(6, 0))
 
         # --- Output ---
         c3 = self._card(body, "3  ·  Output")
@@ -345,6 +460,9 @@ class App:
         self.view_btn = ttk.Button(arow, text="Pop out 3D view ↗", state="disabled",
                                    command=self._view_result)
         self.view_btn.pack(side="left")
+        self.flag_btn = ttk.Button(arow, text="Flag for improvement", state="disabled",
+                                   command=self._flag_result)
+        self.flag_btn.pack(side="left", padx=6)
         ttk.Button(arow, text="Save log…", command=self._save_log).pack(side="left", padx=6)
 
         # --- Log ---
@@ -386,6 +504,34 @@ class App:
         if p:
             self.freecad_var.set(p)
             self._log(f"FreeCAD: {p}", "muted")
+
+    # ---- failure corpus ----------------------------------------------------
+    def _failures_dest(self):
+        from . import failstore
+
+        return failstore.resolve_dest(self.failures_dir)
+
+    def _on_savefail_toggle(self):
+        self._persist_settings()
+        if self.savefail_var.get():
+            self._log(f"Failing inputs will be copied to {self._failures_dest()} "
+                      f"(sorted by failure category).", "muted")
+
+    def _choose_failures_dir(self):
+        d = filedialog.askdirectory(title="Failure corpus folder",
+                                    initialdir=str(self._failures_dest()))
+        if d:
+            self.failures_dir = d
+            self.faildest_label.config(text="→ " + d)
+            self._persist_settings()
+            self._log(f"Failure corpus folder: {d}", "muted")
+
+    def _persist_settings(self):
+        from . import provision
+
+        self._settings["save_failures"] = bool(self.savefail_var.get())
+        self._settings["failures_dir"] = self.failures_dir
+        provision.save_settings(self._settings)
 
     def _on_drop(self, event):
         self._set_input(event.data.strip().strip("{}"))
@@ -435,6 +581,10 @@ class App:
         # output folder if one was set), so converting a second file doesn't
         # keep writing to the first file's name.
         self._update_output_path()
+        # Show the mesh in the preview immediately — it needs no FreeCAD, so it
+        # must not wait for the inspect worker (which can take seconds). If the
+        # inspection finds defects, _on_inspect re-shows it with the markers.
+        self.viewer.show_stl(path)
         self._inspect(path)
 
     def _refresh_units(self):
@@ -449,6 +599,73 @@ class App:
             self._log("⚠  Set the path to FreeCAD's python executable first.", "err")
             return None
         return fc
+
+    # ---- self-provisioning ------------------------------------------------
+    def _offer_freecad_install(self):
+        """If FreeCAD is missing, ask consent and auto-download it (no admin)."""
+        from tkinter import messagebox
+
+        if self.freecad_var.get().strip() or self.busy:
+            return
+        ok = messagebox.askyesno(
+            "FreeCAD not found",
+            "mesh2step needs FreeCAD to convert meshes, but no install was found.\n\n"
+            "Download the official FreeCAD (macOS) now and install it into your "
+            "~/Applications folder? No administrator password is required.\n\n"
+            "(You can also click No and point at an existing FreeCAD python "
+            "manually in the Output section.)",
+            parent=self.root,
+        )
+        if not ok:
+            self._log("FreeCAD auto-install declined — set its python path below, "
+                      "or install from https://www.freecad.org/downloads.php", "muted")
+            return
+        self._start("Downloading & installing FreeCAD…")
+
+        def work():
+            from . import freecad_env, provision
+
+            app = provision.install_freecad(log=lambda m: self.q.put(("log", m)))
+            if app:
+                py = freecad_env.find_freecad_python()
+                self.q.put(("freecad_installed", py or ""))
+            else:
+                self.q.put(("freecad_installed", ""))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_freecad_installed(self, py: str):
+        self._stop()
+        if py and Path(py).is_file():
+            self.freecad_var.set(py)
+            self._log(f"✔  FreeCAD ready: {py}", "ok")
+            self.status.config(text="FreeCAD installed — choose an STL to convert.")
+        else:
+            self._log("⚠  Could not auto-install FreeCAD. Install it manually from "
+                      "https://www.freecad.org/downloads.php, then set its python "
+                      "path below.", "err")
+            self.status.config(text="FreeCAD not available.", fg=ERR_RED)
+
+    def _ensure_prep_deps(self, fc: str) -> bool:
+        """Provision pymeshlab/manifold3d into the user pydeps dir if needed.
+
+        Runs synchronously on the worker thread (callers are already off the UI
+        thread). Streams pip output into the log. Best-effort: returns True when
+        the deps import, False otherwise — conversion still proceeds either way
+        (the pipeline degrades gracefully without them).
+        """
+        from . import provision
+
+        if self._prep_ready:
+            return True
+        try:
+            target = provision.ensure_prep_deps(
+                fc, log=lambda m: self.q.put(("log", m)))
+        except Exception as exc:  # noqa: BLE001
+            self.q.put(("log", f"⚠ prep-dep provisioning error: {exc}"))
+            target = None
+        self._prep_ready = target is not None
+        return self._prep_ready
 
     def _inspect(self, path: str):
         fc = self._freecad()
@@ -486,9 +703,22 @@ class App:
     def _run(self, job, fc, kind):
         def worker():
             try:
+                # A conversion needs the prep deps (pymeshlab/manifold3d) for the
+                # watertight path; provision them once, on first use, so the user
+                # never has to pip-install anything. Inspect doesn't need them.
+                if kind == "convert":
+                    self._ensure_prep_deps(fc)
                 result = run_worker(job, fc, on_line=lambda ln: self.q.put(("log", ln)))
             except Exception as exc:  # noqa: BLE001
                 result = {"ok": False, "error": str(exc)}
+            if kind == "convert" and self.savefail_var.get():
+                # Keep inputs that fail to convert watertight (and record later
+                # passes on files already in the corpus). Off the UI thread —
+                # the copy/hash can take a moment on big meshes.
+                from . import failstore
+
+                failstore.record_result(job["input"], result, dest=self.failures_dir,
+                                        log=lambda m: self.q.put(("log", m)))
             self.q.put((kind, result))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -501,6 +731,8 @@ class App:
                     self._on_log_line(payload)
                 elif kind == "inspect":
                     self._on_inspect(payload)
+                elif kind == "freecad_installed":
+                    self._on_freecad_installed(payload)
                 else:
                     self._on_convert(payload)
         except queue.Empty:
@@ -571,9 +803,11 @@ class App:
             self._info_labels["Mesh health"].config(text="✔ clean")
         self.status.config(text="Mesh inspected — set units and convert.")
 
-        # Show the input mesh in the preview, marking any defect regions.
-        self.viewer.show_stl(self.input_var.get().strip(),
-                             problem_points=result.get("problem_points"))
+        # The preview already shows the mesh (kicked off at selection); only
+        # re-render it when there are defect regions to mark.
+        if result.get("problem_points"):
+            self.viewer.show_stl(self.input_var.get().strip(),
+                                 problem_points=result.get("problem_points"))
 
     def _on_convert(self, result: dict):
         took = time.monotonic() - self._t0
@@ -631,28 +865,61 @@ class App:
         written = [p for p in outputs if Path(p).exists()]
         self.last_step = written[0] if written else result["output"]
         self.view_btn.config(state="normal" if written else "disabled")
+        # "Flag for improvement" applies to a finished watertight result whose
+        # remaining faceted surfaces the user wants a future version to rebuild.
+        self._last_result = result
+        self.flag_btn.config(
+            state="normal" if (written and s.get("is_solid")) else "disabled")
 
         # Show the result (STEP + deviation heatmap) in the embedded preview.
         if written and self.last_stl:
             self.viewer.show_result(self.last_stl, self.last_step)
 
     # ---- result actions ---------------------------------------------------
-    def _view_result(self):
-        if not (self.last_stl and self.last_step and Path(self.last_step).exists()):
-            self._log("⚠  No result to view yet.", "err")
+    def _flag_result(self):
+        """Copy the input STL into the failure corpus as user-flagged
+        (watertight, but with faceted surfaces worth improving)."""
+        stl = self.last_stl
+        if not (stl and Path(stl).is_file()):
+            self._log("⚠  No input to flag.", "err")
             return
-        self._log("Opening 3D deviation viewer…", "muted")
-        self._launch_viewer(self.last_stl, self.last_step)
+        self.flag_btn.config(state="disabled")  # one flag per result
+        result = getattr(self, "_last_result", None)
 
-    def _launch_viewer(self, stl: str, step: str):
-        """Launch the pyvista deviation viewer as its own process."""
+        def work():
+            from . import failstore
+
+            failstore.record_flag(stl, result, dest=self.failures_dir,
+                                  log=lambda m: self.q.put(("log", m)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _view_result(self):
+        if self.last_stl and self.last_step and Path(self.last_step).exists():
+            self._log("Opening 3D viewer (1: STL · 2: STEP · 3: heatmap)…", "muted")
+            # Open on whatever view the embedded panel is showing.
+            self._launch_viewer(self.last_stl, self.last_step,
+                                self.viewer._active or "heatmap")
+            return
+        # Pre-conversion: pop out just the input mesh (no FreeCAD needed).
+        stl = self.input_var.get().strip()
+        if stl and Path(stl).is_file():
+            self._log("Opening 3D viewer (input STL — convert to add STEP/heatmap)…",
+                      "muted")
+            self._launch_viewer(stl, None, "stl")
+        else:
+            self._log("⚠  Choose an STL first.", "err")
+
+    def _launch_viewer(self, stl: str, step: str | None, show: str = "heatmap"):
+        """Launch the pyvista viewer as its own process."""
+        files = [stl] + ([step] if step else [])
         if getattr(sys, "frozen", False):
-            cmd = [sys.executable, "--view", stl, step]
+            cmd = [sys.executable, "--view", *files, "--show", show]
             env = None
         else:
             env = dict(os.environ)
             env["PYTHONPATH"] = _package_src() + os.pathsep + env.get("PYTHONPATH", "")
-            cmd = [sys.executable, "-m", "mesh2step.viewer", stl, step]
+            cmd = [sys.executable, "-m", "mesh2step.viewer", *files, "--show", show]
         try:
             subprocess.Popen(cmd, env=env, creationflags=_NO_WINDOW)
         except Exception as exc:  # noqa: BLE001

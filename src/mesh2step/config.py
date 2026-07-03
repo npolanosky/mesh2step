@@ -79,6 +79,33 @@ class ConversionConfig:
     # (or, better, decimate the mesh first). None disables the guard.
     boolean_max_base_faces: int | None = 60000
 
+    # Hard cost ceiling for the fully-closed boolean path, in faces. The
+    # fully-closed tier relies on decimation to shrink the boolean base, so it
+    # normally lifts ``boolean_max_base_faces`` to attempt the cuts even on dense
+    # meshes. But if decimation is unavailable, or the post-decimation base is
+    # still huge, an unbounded boolean run can grind for many minutes (DESIGN.md:
+    # ~26 s/cut at 174k faces). This ceiling caps the base the fully-closed tier
+    # will ever hand to the boolean cuts: above it, we skip booleans and fall
+    # through to the watertight faceted solid (tier 3) instead of grinding.
+    # ~130k keeps it well under a minute per cut while admitting most decimated
+    # bases. None disables the ceiling (unbounded — the old behaviour).
+    fully_closed_boolean_ceiling_faces: int | None = 130000
+
+    # Post-export re-validation. After writing the STEP, re-read it and confirm
+    # the solid still loads, is valid, is closed, and the solid count matches the
+    # in-memory result. Some defects (self-intersecting wires from sliver
+    # triangles) only surface through the STEP write/read round-trip: in-memory
+    # the shape passes isValid(), but the exported file re-reads invalid. When a
+    # decimation rung fails this check the fully-closed path backs off to the
+    # next gentler rung, so a silent invalid export is impossible. One extra STEP
+    # read per conversion — cheap. Set False to skip (e.g. for enormous files).
+    revalidate_export: bool = True
+
+    # Skip export re-validation automatically when the exported STEP exceeds this
+    # size (bytes); re-reading a very large STEP can be slow. None -> never skip
+    # on size grounds (only ``revalidate_export=False`` disables it).
+    revalidate_export_max_bytes: int | None = 80_000_000
+
     # Explicit path to FreeCAD's bin/ directory (overrides auto-detection).
     freecad_bin: str | None = None
 
@@ -145,6 +172,78 @@ class ConversionConfig:
     harmonize_radii: bool = True
     harmonize_rel_tol: float = 0.03   # radii within 3% are treated as the same
     harmonize_round: float = 0.05     # snap the shared radius to this grid (mm)
+
+    # --- Curved-feature reconstruction (M1: resolution-scaled tolerances,
+    # tangency prior, straight-edge fillets/chamfers). See docs/CURVED_FEATURES.md.
+
+    # Fit tolerances scale with local mesh resolution so coarse STLs (big facets
+    # on curved surfaces) still get analytic fits. Chord error scales with
+    # edge_length^2/(8R): a 2 mm-edge facet on an R=1 fillet has ~0.5 mm sagitta,
+    # 10x over the absolute cylinder_tol, so coarse bands otherwise stay faceted.
+    # The accepted RMS-about-fit is max(curve_fit_tol_abs, curve_fit_tol_rel *
+    # local_edge_length). curve_fit_tol_abs is a floor so fine meshes don't
+    # over-tighten. The centroid/coverage guards in _fit_circle_for_facets scale
+    # the same way, keeping false positives out while admitting coarse fits.
+    curve_fit_tol_rel: float = 0.15   # accept RMS up to 15% of local edge length
+    curve_fit_tol_abs: float = 0.02   # floor (fine meshes shouldn't over-tighten)
+
+    # Detect straight-edge fillets (partial-arc cylinder sections between two
+    # planes) and route residual chamfer strips back to planar faces. Behind this
+    # flag so the whole feature can be disabled if it ever regresses a part.
+    detect_fillets: bool = True
+
+    # Tangency prior. If a fitted fillet is *nearly* tangent to its adjacent
+    # flats, tangency is design intent: snap to exact tangency and derive the
+    # radius from the plane-plane constraint (coarse meshes chord-cut the surface
+    # and under-read radii). If *far* from tangent, it is intentional geometry:
+    # keep the best-effort fit radius. The near/far threshold is resolution-scaled
+    # (even a true tangent blend reads a defect of order median_dihedral/2 on a
+    # coarse mesh): tangency_threshold_deg = max(tangency_floor_deg, tangency_k *
+    # median_dihedral_deg).
+    tangency_floor_deg: float = 3.0
+    tangency_k: float = 1.0
+
+    # Reject fillets whose derived radius is below this many local edge lengths
+    # (sub-facet fillets can't be built cleanly). The absolute floor is
+    # min_fillet_radius; the effective floor is the larger of the two.
+    min_fillet_radius: float = 0.2
+    min_fillet_radius_edges: float = 0.5
+
+    # A straight-edge fillet is a partial arc: its facet centroids cover well
+    # under the full circle. This is the minimum coverage a fillet band must span
+    # (fillets are exempt from min_cylinder_coverage, which they never meet).
+    min_fillet_coverage: float = 0.04
+
+    # Maximum coverage for a band to still be treated as a partial-arc fillet
+    # (above this it is a real, near-full cylinder that detect_cylinders owns).
+    max_fillet_coverage: float = 0.6
+
+    # --- RTAF: Residual Tessellation Area Fraction (post-conversion quality
+    # metric). See docs/CURVED_FEATURES.md §6a. Fraction of the output solid's
+    # surface AREA that sits in "smooth chains" — runs of >=3 connected planar
+    # faces whose neighbour normals step by rtaf_angle_lo..rtaf_angle_hi degrees
+    # (a tessellated-curve fan; exactly-coplanar splits and real feature edges
+    # are excluded). Area-weighted so a curve shipped as a fan of thin flats
+    # reads high even when skipped_facets is zero (the strips technically
+    # "reconstructed"). Higher = more faceted-looking. Computed on the final
+    # shape, added to stats["rtaf"], surfaced in the quality report + failstore.
+
+    # Compute RTAF at all. Off skips it entirely (no cost).
+    compute_rtaf: bool = True
+
+    # A neighbour normal step below rtaf_angle_lo (deg) is effectively coplanar
+    # (a genuine split), above rtaf_angle_hi is a real feature edge. In between
+    # is a near-tangent tessellation step.
+    rtaf_angle_lo: float = 0.5
+    rtaf_angle_hi: float = 30.0
+    # Minimum chain length (number of connected planar faces) to count.
+    rtaf_min_chain: int = 3
+
+    # Skip the RTAF computation when the output solid has more than this many
+    # faces (the O(faces * edges) adjacency scan gets slow on enormous shells).
+    # The corpus's largest chain analysis (tweezer, ~10.5k faces) stays in
+    # single-digit seconds well under this cap. None disables the guard.
+    rtaf_max_faces: int | None = 40000
 
     @property
     def angle_tol_cos(self) -> float:

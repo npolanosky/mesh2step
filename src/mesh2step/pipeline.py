@@ -125,6 +125,9 @@ def convert(
     # the watertight version can only be produced with artifacts.
     clean_shape = shape if method == "reconstructed" else None
     dual = False
+    # Set when the boolean back-off ladder already wrote (and re-validated) the
+    # adopted solid to ``output_path`` — the final single-file export is skipped.
+    boolean_exported = False
 
     # Fully-closed toggle: upgrade the (possibly open) reconstruction to a
     # watertight solid via boolean clean-up. Priority: (1) watertight AND
@@ -165,10 +168,16 @@ def convert(
         # retry at twice the target and finally with the undecimated mesh —
         # slower cuts beat losing the watertight result altogether.
         rungs = [t for t in (target, 2 * target) if len(bfaces) > t * 1.2] + [None]
+        # Cost ceiling: the fully-closed tier lifts boolean_max_base_faces to let
+        # the cuts run on dense meshes, but only up to this many faces. Above it
+        # (decimation unavailable, or a base still huge after decimation) an
+        # unbounded boolean run grinds for many minutes — so we cap the base and
+        # fall through to the faceted watertight solid (tier 3) instead.
+        ceiling = config.fully_closed_boolean_ceiling_faces
         try:
             import dataclasses
 
-            bcfg = dataclasses.replace(config, boolean_max_base_faces=None)
+            bcfg = dataclasses.replace(config, boolean_max_base_faces=ceiling)
             bshape, built2 = None, None
             for i, tgt in enumerate(rungs):
                 if tgt is not None:
@@ -179,16 +188,57 @@ def convert(
                     dv, df = bverts, bfaces
                     if i > 0:
                         progress(f"Using undecimated base ({len(df):,} faces)")
+                if ceiling is not None and len(df) > ceiling:
+                    progress(f"  base {len(df):,} faces exceeds boolean cost ceiling "
+                             f"({ceiling:,}); skipping boolean clean-up "
+                             f"(decimation ineffective/unavailable), "
+                             f"falling through to faceted watertight solid")
+                    stats["boolean_ceiling_hit"] = {
+                        "base_faces": int(len(df)), "ceiling": int(ceiling)}
+                    if tgt is None:
+                        break
+                    continue
                 try:
-                    bshape, built2 = builder.build_boolean_clean_solid(
+                    cand_shape, cand_built = builder.build_boolean_clean_solid(
                         dv, df, bcfg, on_progress=progress
                     )
-                    break
                 except Exception:
                     if tgt is None:
                         raise
                     progress(f"  base not watertight at ~{tgt:,} faces; "
                              f"backing off decimation")
+                    continue
+                # Export round-trip re-validation: a rung can pass isValid() in
+                # memory yet re-read invalid (self-intersecting wires from sliver
+                # triangles surface only through the STEP write/read). Treat such
+                # a rung exactly like an in-memory failure and back off. We write
+                # to the real output path here; on success we keep it (no second
+                # export at the end), on failure we overwrite at the next rung.
+                if _is_solid(cand_shape) and config.revalidate_export:
+                    rung_label = f"~{tgt:,}" if tgt is not None else "undecimated"
+                    reval = _export_and_revalidate(
+                        builder, cand_shape, output_path,
+                        expected_solids=1, config=config, progress=progress)
+                    if not reval.get("valid", False):
+                        stats.setdefault("export_revalidation_failed_rungs", []).append(
+                            {"rung": rung_label, "base_faces": int(len(df)),
+                             "reason": reval.get("reason", "unknown")})
+                        progress(f"  export re-read INVALID at rung {rung_label} "
+                                 f"({reval.get('reason')}); backing off decimation")
+                        if tgt is None:
+                            # Undecimated also fails the round-trip: nothing gentler
+                            # left. Keep it as the boolean candidate anyway (the
+                            # quality report will flag it) rather than losing the
+                            # watertight result entirely.
+                            bshape, built2 = cand_shape, cand_built
+                            stats["export_revalidated"] = False
+                            break
+                        continue
+                    stats["export_revalidated"] = True
+                    stats["export_revalidation_winning_rung"] = rung_label
+                    boolean_exported = True
+                bshape, built2 = cand_shape, cand_built
+                break
             if _is_solid(bshape):
                 shape, method = bshape, "boolean-clean"
                 stats.update(built2)
@@ -219,10 +269,14 @@ def convert(
             progress(f"Boolean clean-up failed ({exc})")
             stats.setdefault("warnings_extra", []).append(f"Boolean clean-up failed: {exc}")
 
-    # Tier 3 (plain faceted solid) is only a last resort when there is no usable
-    # analytic reconstruction at all — never prefer faceted holes over clean
-    # analytic ones just to be closed.
-    if config.full_closed and not _is_solid(shape) and stats.get("faces_out", 0) == 0:
+    # Tier 3 (plain faceted solid) is a last resort. Normally we only reach it
+    # when there is no usable analytic reconstruction at all (faces_out == 0) —
+    # never prefer faceted holes over clean analytic ones just to be closed. But
+    # when the boolean tier was skipped by the cost ceiling, the (open) analytic
+    # reconstruction cannot be closed the cheap way, so a watertight faceted
+    # solid is the right fallback even though reconstruction produced faces.
+    if (config.full_closed and not _is_solid(shape)
+            and (stats.get("faces_out", 0) == 0 or "boolean_ceiling_hit" in stats)):
         progress("Fully-closed: building watertight faceted solid (last resort)")
         fverts, ffaces = load_stl(input_path, weld_tol=config.weld_tol)
         if scale != 1.0:
@@ -235,15 +289,30 @@ def convert(
             stats.setdefault("warnings_extra", []).append(
                 "Fully-closed fallback could not produce a watertight solid.")
 
-    _assess_quality(shape, input_dims, method, stats)
+    _assess_quality(shape, input_dims, method, stats, config, builder)
 
     if dual and clean_shape is not None:
         # Two deliverables, clearly named: watertight (may contain artifacts) and
         # clean (artifact-free, but open shells — heal on import).
         wt_path = _suffixed(output_path, "_watertight")
         clean_path = _suffixed(output_path, "_clean")
+        # The back-off ladder may have written a probe to output_path; the dual
+        # deliverables use suffixed names, so drop the stale unsuffixed file.
+        if boolean_exported and output_path.exists() and output_path not in (wt_path, clean_path):
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
         progress(f"Exporting {wt_path.name} (watertight, has artifacts)")
         builder.export_step(shape, wt_path)
+        if config.revalidate_export:
+            reval = _export_and_revalidate(builder, shape, wt_path, expected_solids=None,
+                                           config=config, progress=progress, already_written=True)
+            stats["export_revalidation"] = reval
+            if not reval.get("valid", False):
+                stats.setdefault("warnings_extra", []).append(
+                    f"Exported {wt_path.name} re-reads invalid ({reval.get('reason')}).")
+                _finalize_quality_after_export(stats, reval)
         progress(f"Exporting {clean_path.name} (artifact-free, open)")
         builder.export_step(clean_shape, clean_path)
         stats["dual_output"] = {"watertight": str(wt_path), "clean": str(clean_path)}
@@ -251,8 +320,23 @@ def convert(
         return ConversionResult(output_path=wt_path, method=method, stats=stats,
                                 outputs=[wt_path, clean_path])
 
+    if boolean_exported and output_path.exists():
+        # The winning boolean rung was already written to output_path and
+        # re-validated during the back-off ladder — no need to re-export.
+        progress("Done")
+        return ConversionResult(output_path=output_path, method=method, stats=stats,
+                                outputs=[output_path])
+
     progress("Exporting STEP")
     builder.export_step(shape, output_path)
+    if config.revalidate_export:
+        reval = _export_and_revalidate(builder, shape, output_path, expected_solids=None,
+                                       config=config, progress=progress, already_written=True)
+        stats["export_revalidation"] = reval
+        if not reval.get("valid", False):
+            stats.setdefault("warnings_extra", []).append(
+                f"Exported STEP re-reads invalid ({reval.get('reason')}).")
+            _finalize_quality_after_export(stats, reval)
     progress("Done")
     return ConversionResult(output_path=output_path, method=method, stats=stats,
                             outputs=[output_path])
@@ -264,7 +348,49 @@ def _is_solid(shape) -> bool:
     return bool(solids) and solids[0].isValid()
 
 
-def _assess_quality(shape, input_dims, method: str, stats: dict) -> None:
+def _finalize_quality_after_export(stats: dict, reval: dict) -> None:
+    """Downgrade the quality verdict when the final export re-reads invalid.
+
+    ``_assess_quality`` runs before the final single-file export is written, so
+    a re-read failure of that file isn't reflected in its verdict. This appends
+    the warning (if not already present) and forces ``quality`` to "problems".
+    """
+    msg = f"Exported STEP re-reads invalid ({reval.get('reason')})."
+    warnings = stats.setdefault("warnings", [])
+    if msg not in warnings:
+        warnings.append(msg)
+    stats["quality"] = "problems"
+
+
+def _export_and_revalidate(builder, shape, path, *, expected_solids, config, progress,
+                           already_written: bool = False) -> dict:
+    """Write ``shape`` to ``path`` (unless already written) and re-read to verify.
+
+    Returns the re-validation dict from ``builder.revalidate_step`` (``valid``
+    plus, on failure, ``reason``). Honours ``revalidate_export_max_bytes``: if
+    the written file exceeds it, the re-read is skipped and ``valid`` is reported
+    optimistically (with ``skipped="file too large"``) rather than paying a slow
+    read on an enormous STEP.
+    """
+    from pathlib import Path as _Path
+
+    path = _Path(path)
+    if not already_written:
+        builder.export_step(shape, path)
+    cap = config.revalidate_export_max_bytes
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    if cap is not None and size > cap:
+        progress(f"  export re-validation skipped ({size:,} bytes > {cap:,})")
+        return {"valid": True, "skipped": "file too large", "bytes": int(size),
+                "path": str(path)}
+    return builder.revalidate_step(path, expected_solids=expected_solids)
+
+
+def _assess_quality(shape, input_dims, method: str, stats: dict,
+                    config: ConversionConfig | None = None, builder=None) -> None:
     """Populate ``stats`` with a quality verdict + human-readable warnings.
 
     Gives the user an at-a-glance sense of result quality: watertightness,
@@ -272,6 +398,24 @@ def _assess_quality(shape, input_dims, method: str, stats: dict) -> None:
     mismatch between the input mesh and the exported solid.
     """
     warnings: list[str] = []
+
+    # Residual Tessellation Area Fraction: how much of the output surface area
+    # still looks faceted (near-tangent planar-fan chains). Computed on the final
+    # shape where Part is available. Surfaced as a percentage; a materially
+    # faceted result (>= 5% of surface area) earns a warning line so the user
+    # knows the geometry reads faceted even when it is a valid watertight solid.
+    if config is not None and builder is not None:
+        try:
+            rtaf_info = builder.compute_rtaf(shape, config)
+        except Exception as exc:  # noqa: BLE001 - metric must not break quality
+            rtaf_info = {"rtaf": None, "skipped": f"error ({exc})"}
+        stats["rtaf"] = rtaf_info.get("rtaf")
+        stats["rtaf_detail"] = rtaf_info
+        rtaf = rtaf_info.get("rtaf")
+        if rtaf is not None and rtaf >= 0.05:
+            warnings.append(
+                f"Residual tessellation: {rtaf * 100:.0f}% of the output surface "
+                f"area is faceted (near-tangent planar strips on curved features).")
 
     # Watertight solid?
     solids = getattr(shape, "Solids", [])
@@ -291,6 +435,29 @@ def _assess_quality(shape, input_dims, method: str, stats: dict) -> None:
     if skipped:
         warnings.append(f"{skipped:,} facets could not be reconstructed and were left out/faceted.")
 
+    # Export round-trip re-validation: surface rungs that produced an in-memory
+    # valid solid but re-read invalid from the exported STEP (sliver-triangle
+    # self-intersecting wires), and any final export that still re-reads invalid.
+    failed_rungs = stats.get("export_revalidation_failed_rungs")
+    if failed_rungs:
+        rung_names = ", ".join(r.get("rung", "?") for r in failed_rungs)
+        won = stats.get("export_revalidation_winning_rung")
+        if won:
+            warnings.append(
+                f"Export re-read invalid at decimation rung(s) {rung_names}; "
+                f"backed off and exported a valid solid at rung {won}.")
+        else:
+            warnings.append(
+                f"Export re-read invalid at decimation rung(s) {rung_names}.")
+    if stats.get("export_revalidated") is False:
+        warnings.append(
+            "Even the undecimated boolean base re-reads invalid from the "
+            "exported STEP; shipped it as the best watertight result available.")
+    final_reval = stats.get("export_revalidation")
+    if isinstance(final_reval, dict) and final_reval.get("valid") is False:
+        warnings.append(
+            f"Exported STEP re-reads invalid ({final_reval.get('reason')}).")
+
     detected = stats.get("cylinders_detected")
     built = stats.get("cylinder_faces")
     if detected is not None and built is not None and built < detected:
@@ -309,8 +476,15 @@ def _assess_quality(shape, input_dims, method: str, stats: dict) -> None:
     except Exception:  # noqa: BLE001
         pass
 
+    # A final export that re-reads invalid, or an undecimated base that never
+    # round-trips cleanly, is a hard problem — the shipped file is not a valid
+    # solid on disk even though the in-memory shape passed isValid().
+    final_reval = stats.get("export_revalidation")
+    export_invalid = (isinstance(final_reval, dict) and final_reval.get("valid") is False) \
+        or stats.get("export_revalidated") is False
+
     stats["warnings"] = warnings
-    if method == "faceted" or not is_solid:
+    if method == "faceted" or not is_solid or export_invalid:
         stats["quality"] = "problems"
     elif warnings:
         stats["quality"] = "warnings"

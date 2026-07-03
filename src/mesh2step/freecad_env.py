@@ -20,6 +20,10 @@ _CANDIDATE_GLOBS = {
     "darwin": [
         "/Applications/FreeCAD.app/Contents/Resources/lib",
         "/Applications/FreeCAD*.app/Contents/Resources/lib",
+        # Auto-installed FreeCAD lands in the per-user ~/Applications (no admin),
+        # so scan there too — otherwise a just-installed FreeCAD isn't found.
+        str(Path.home() / "Applications/FreeCAD.app/Contents/Resources/lib"),
+        str(Path.home() / "Applications/FreeCAD*.app/Contents/Resources/lib"),
     ],
     "linux": [
         "/usr/lib/freecad/lib",
@@ -91,6 +95,9 @@ _PYTHON_GLOBS = {
     "darwin": [
         "/Applications/FreeCAD.app/Contents/Resources/bin/python*",
         "/Applications/FreeCAD*.app/Contents/Resources/bin/python*",
+        # Auto-installed FreeCAD lands in the per-user ~/Applications (no admin).
+        str(Path.home() / "Applications/FreeCAD.app/Contents/Resources/bin/python*"),
+        str(Path.home() / "Applications/FreeCAD*.app/Contents/Resources/bin/python*"),
     ],
     "linux": [
         "/usr/bin/freecadcmd",
@@ -125,3 +132,35 @@ def find_freecad_python(explicit: str | None = None) -> str | None:
         if c.is_file():
             return str(c)
     return None
+
+
+def freecad_lib_dir(freecad_python: str | None) -> str | None:
+    """The directory holding FreeCAD's ``FreeCAD``/``Mesh`` C-extensions, for a
+    given bundled Python executable — or ``None`` if it can't be inferred.
+
+    A subprocess launched as ``<freecad_python> -m mesh2step.worker`` does NOT
+    get ``import FreeCAD`` for free: FreeCAD only wires that up when *it* starts
+    the interpreter (freecadcmd / the GUI). When we drive the bundled Python
+    ourselves we must put FreeCAD's library directory on ``PYTHONPATH`` — this
+    resolves it from the interpreter path across platforms:
+
+      macOS  .../FreeCAD.app/Contents/Resources/bin/python  -> ../lib
+      Linux  .../squashfs-root/usr/bin/python               -> ../lib
+      Win    ...\\FreeCAD*\\bin\\python.exe                 -> bin (same dir)
+    """
+    if not freecad_python:
+        return None
+    exe = Path(freecad_python)
+    # Windows keeps FreeCAD.pyd next to python.exe in bin/; POSIX bundles put the
+    # extension modules in a sibling lib/ of bin/.
+    candidates = [exe.parent, exe.parent.parent / "lib"]
+    for d in candidates:
+        try:
+            if (d / "FreeCAD.so").is_file() or (d / "FreeCAD.pyd").is_file():
+                return str(d)
+        except OSError:
+            continue
+    # Fall back to the sibling lib/ if it exists even without a probed extension
+    # (unusual layouts); better than nothing so the worker can still try.
+    lib = exe.parent.parent / "lib"
+    return str(lib) if lib.is_dir() else None

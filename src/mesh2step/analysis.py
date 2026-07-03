@@ -59,6 +59,16 @@ def oriented_bbox(vertices: np.ndarray) -> BoundingBox:
     close to optimal for most others, but is not guaranteed to be the true
     minimum-volume box (that needs rotating-calipers over the convex hull, a
     roadmap item). Good enough to report dimensions and suggest scaling.
+
+    PCA's eigenvectors are only defined up to an arbitrary rotation whenever
+    two or more covariance eigenvalues are (numerically) equal — e.g. for a
+    cube, or any part symmetric enough to have degenerate principal axes. In
+    that case PCA can pick a frame that is rotated 45 degrees relative to the
+    part's true faces, giving a needlessly larger box. As a safety net we also
+    compute the plain axis-aligned box and fall back to it (reported as an
+    oriented box with identity axes) whenever it is no bigger than the
+    PCA box. This guarantees oriented_bbox() is never worse than the AABB;
+    a true rotating-calipers minimum OBB is still a roadmap item.
     """
     centroid = vertices.mean(axis=0)
     centered = vertices - centroid
@@ -73,9 +83,28 @@ def oriented_bbox(vertices: np.ndarray) -> BoundingBox:
     box_center = centroid + eigvecs @ ((lo + hi) / 2.0)
 
     order = np.argsort(dims)[::-1]
+    pca_dims = dims[order]
+    pca_volume = float(np.prod(dims))
+
+    # Safety net: never return a box worse than the plain AABB (see docstring).
+    aabb_lo = vertices.min(axis=0)
+    aabb_hi = vertices.max(axis=0)
+    aabb_dims = aabb_hi - aabb_lo
+    aabb_volume = float(np.prod(aabb_dims))
+
+    rel_tol = 1e-9
+    if aabb_volume <= pca_volume * (1.0 + rel_tol):
+        aabb_order = np.argsort(aabb_dims)[::-1]
+        return BoundingBox(
+            dimensions=aabb_dims[aabb_order],
+            volume=aabb_volume,
+            axes=np.eye(3),
+            center=(aabb_lo + aabb_hi) / 2.0,
+        )
+
     return BoundingBox(
-        dimensions=dims[order],
-        volume=float(np.prod(dims)),
+        dimensions=pca_dims,
+        volume=pca_volume,
         axes=eigvecs[:, order],
         center=box_center,
     )

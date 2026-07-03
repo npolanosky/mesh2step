@@ -55,12 +55,55 @@ def _build_parser() -> argparse.ArgumentParser:
         "--freecad-bin", type=str, default=None, metavar="PATH",
         help="path to FreeCAD's bin/ (Windows) or lib/ (macOS/Linux)",
     )
+    p.add_argument(
+        "--save-failures", nargs="?", const="", default=None, metavar="DIR",
+        help="copy inputs that fail to convert to a single watertight solid into "
+             "a regression corpus, sorted by failure category (default DIR: "
+             "tests/data/community/failures in a source checkout, else the "
+             "per-user support dir); a later pass on a saved file is recorded "
+             "in the corpus manifest",
+    )
     return p
 
 
 def _split_argv(argv: list[str]) -> list[str]:
     """Drop a leading ``--`` separator used when launched via freecadcmd."""
     return argv[1:] if argv and argv[0] == "--" else argv
+
+
+def _ensure_prep_on_path() -> None:
+    """Inject the auto-provisioned prep-deps dir onto ``sys.path`` (headless).
+
+    If the CLI is running under FreeCAD's Python and pymeshlab/manifold3d aren't
+    importable, provision them once (into the per-user pydeps dir) and add that
+    dir to ``sys.path``. Silent + best-effort: any failure just leaves the deps
+    unavailable and the pipeline degrades gracefully.
+    """
+    try:
+        from . import provision
+    except Exception:  # noqa: BLE001
+        return
+    # We're presumably running under FreeCAD's own interpreter here.
+    fc_python = sys.executable
+    target = provision.pydeps_dir(fc_python)
+    if str(target) not in sys.path:
+        sys.path.insert(0, str(target))
+    # Only probe manifold3d here (the required dep). We must NOT `import
+    # pymeshlab` in-process: on some macOS builds that hard-crashes the
+    # interpreter (SIGTRAP), which no try/except can catch. meshprep probes
+    # pymeshlab crash-safely in a subprocess when it's actually needed.
+    try:
+        import manifold3d  # type: ignore  # noqa: F401
+
+        return  # already importable — nothing to provision
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        got = provision.ensure_prep_deps(fc_python, log=lambda m: print(m, file=sys.stderr))
+        if got and str(got) not in sys.path:
+            sys.path.insert(0, str(got))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -79,8 +122,24 @@ def main(argv: list[str] | None = None) -> int:
         freecad_bin=args.freecad_bin,
     )
 
+    # Headless self-provisioning: when running under FreeCAD's own Python (the
+    # usual way the CLI is invoked), make the auto-installed prep deps
+    # (pymeshlab/manifold3d) importable and provision them on first use, so the
+    # bundled `mesh2step` works with no manual pip install. Best-effort.
+    _ensure_prep_on_path()
+
     # Imported here so `mesh2step --help` works without FreeCAD present.
     from .pipeline import convert
+
+    def _record_outcome(outcome: dict) -> None:
+        """Book-keep the failure corpus when --save-failures is on. Best-effort."""
+        if args.save_failures is None:
+            return
+        from . import failstore
+
+        failstore.record_result(args.input, outcome,
+                                dest=args.save_failures or None,
+                                log=lambda m: print(m, file=sys.stderr))
 
     try:
         result = convert(args.input, args.output, config)
@@ -88,11 +147,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: input not found: {args.input}", file=sys.stderr)
         return 2
     except ImportError as exc:
+        # Environment problem (FreeCAD missing), not a property of the mesh —
+        # don't pollute the failure corpus with it.
         print(f"error: {exc}", file=sys.stderr)
         return 3
     except Exception as exc:  # noqa: BLE001
+        _record_outcome({"ok": False, "error": str(exc)})
         print(f"error: conversion failed: {exc}", file=sys.stderr)
         return 1
+    _record_outcome({"ok": True, "stats": result.stats})
 
     s = result.stats
     print(f"wrote {result.output_path}  [{result.method}]")
@@ -101,6 +164,10 @@ def main(argv: list[str] | None = None) -> int:
             f"  faces: {s['faces_in']} triangles -> {s['faces_out']} STEP faces"
             f"  (solid={s.get('is_solid')})"
         )
+    if s.get("skipped_facets"):
+        print(f"  skipped facets: {s['skipped_facets']:,}")
+    if s.get("rtaf") is not None:
+        print(f"  residual tessellation (RTAF): {s['rtaf'] * 100:.0f}% of surface area")
     if "reconstruction_error" in s:
         print(f"  note: fell back to faceted ({s['reconstruction_error']})")
     return 0

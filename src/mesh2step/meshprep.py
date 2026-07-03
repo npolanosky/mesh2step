@@ -7,6 +7,13 @@ when repair/decimation is requested.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
 import numpy as np
 
 from .config import ConversionConfig
@@ -176,63 +183,155 @@ def load_and_prepare(
     return verts, faces, report
 
 
+# Decimation runs pymeshlab in a SEPARATE subprocess (see meshprep_runner):
+# pymeshlab's bundled Qt 5 collides with FreeCAD's Qt 6 in one process on macOS
+# (Objective-C duplicate-class SIGTRAP). The runner is launched with only the
+# pydeps dir + our package root on PYTHONPATH — never FreeCAD's lib dir — so the
+# two Qts never share a process.
+
+_PYMESHLAB_OK: bool | None = None
+_DEC_TIMEOUT = 900  # seconds; a single decimation should take a few seconds
+
+
+def _pydeps_dir() -> str | None:
+    """The dir holding the provisioned pymeshlab, inferred without FreeCAD.
+
+    The worker's ``PYTHONPATH`` already contains it (prep_env injects it), so we
+    find it as the ``sys.path`` entry that actually holds a ``pymeshlab``
+    package. Falls back to provision.pydeps_dir() for the current interpreter.
+    """
+    for entry in sys.path:
+        try:
+            if entry and (Path(entry) / "pymeshlab").is_dir():
+                return entry
+        except OSError:
+            continue
+    try:
+        from . import provision
+
+        target = provision.pydeps_dir(sys.executable)
+        if (target / "pymeshlab").is_dir():
+            return str(target)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _runner_env() -> dict | None:
+    """A subprocess env with ONLY pydeps + our package root on PYTHONPATH.
+
+    Crucially excludes FreeCAD's lib dir: importing FreeCAD/Part before pymeshlab
+    is what aborts the process (Qt5/Qt6 class collision). Returns None if the
+    pydeps dir (hence pymeshlab) can't be located.
+    """
+    pydeps = _pydeps_dir()
+    if pydeps is None:
+        return None
+    # Directory that makes ``import mesh2step`` resolve (the parent of this pkg).
+    pkg_root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([pydeps, pkg_root])
+    return env
+
+
+def _pymeshlab_importable() -> bool:
+    """Probe whether pymeshlab imports without crashing, in the clean runner env.
+
+    Runs ``<freecad python> -c "import numpy, pymeshlab"`` with the *runner* env
+    (only pydeps + our package root on PYTHONPATH — never FreeCAD's lib dir), the
+    same environment the real decimation subprocess uses. A Qt/objc abort
+    (uncatchable SIGTRAP, exit 133) or a numpy-ABI crash surfaces as a nonzero
+    return code here, and we skip decimation gracefully. Cached per run.
+    """
+    global _PYMESHLAB_OK
+    if _PYMESHLAB_OK is not None:
+        return _PYMESHLAB_OK
+    env = _runner_env()
+    if env is None:
+        _PYMESHLAB_OK = False
+        return _PYMESHLAB_OK
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import numpy, pymeshlab; print('ok')"],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        _PYMESHLAB_OK = proc.returncode == 0 and "ok" in proc.stdout
+    except Exception:  # noqa: BLE001
+        _PYMESHLAB_OK = False
+    return _PYMESHLAB_OK
+
+
 def decimate_planar(
     verts: np.ndarray, faces: np.ndarray, target_faces: int
 ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Planar-preserving quadric decimation via pymeshlab.
+    """Planar-preserving quadric decimation via the out-of-process pymeshlab runner.
 
     Collapses over-tessellated flat regions toward ``target_faces`` while keeping
     holes/curves dense (``planarquadric`` favours coplanar collapses) and edges
     sharp (``preserveboundary``). This both shrinks the output and makes the
     boolean clean-up tractable — and it can even *improve* hole detection by
-    cleaning up noisy tessellation. Returns ``(verts, faces, report)``; on any
-    failure (e.g. pymeshlab missing) it returns the input unchanged.
+    cleaning up noisy tessellation.
+
+    pymeshlab is run in a separate subprocess (meshprep_runner) so its bundled
+    Qt 5 never collides with FreeCAD's Qt 6 in this (FreeCAD-loaded) process.
+    Returns ``(verts, faces, report)``; on any failure (pymeshlab missing,
+    subprocess crash) it returns the input unchanged.
     """
     report = {"before_facets": int(len(faces)), "target": int(target_faces)}
     if len(faces) <= target_faces:
         report["after_facets"] = int(len(faces))
         report["skipped"] = "already below target"
         return verts, faces, report
-    try:
-        import pymeshlab as ml
+    if not _pymeshlab_importable():
+        report["after_facets"] = int(len(faces))
+        report["skipped"] = "pymeshlab unavailable (import failed/crashed)"
+        return verts, faces, report
 
-        ms = ml.MeshSet()
-        ms.add_mesh(ml.Mesh(vertex_matrix=np.asarray(verts, dtype=np.float64),
-                            face_matrix=np.asarray(faces, dtype=np.int32)))
-        # Cleanup that pymeshlab's file loader would do implicitly but add_mesh
-        # skips — without it the decimated mesh can be left non-watertight,
-        # which breaks the boolean base solid.
-        for filt in ("meshing_remove_duplicate_vertices",
-                     "meshing_remove_duplicate_faces",
-                     "meshing_remove_unreferenced_vertices",
-                     "meshing_remove_null_faces"):
-            try:
-                ms.apply_filter(filt)
-            except Exception:  # noqa: BLE001 - filter names vary by version
-                pass
-        ms.meshing_decimation_quadric_edge_collapse(
-            targetfacenum=int(target_faces),
-            qualitythr=0.4,
-            preserveboundary=True,
-            boundaryweight=2.0,
-            preservenormal=True,
-            preservetopology=True,
-            planarquadric=True,
-            autoclean=True,
-        )
-        for filt in ("meshing_repair_non_manifold_edges",
-                     "meshing_repair_non_manifold_vertices",
-                     "meshing_re_orient_faces_coherently"):
-            try:
-                ms.apply_filter(filt)
-            except Exception:  # noqa: BLE001
-                pass
-        m = ms.current_mesh()
-        out_v = np.asarray(m.vertex_matrix(), dtype=np.float64)
-        out_f = np.asarray(m.face_matrix(), dtype=np.int64)
-        report["after_facets"] = int(len(out_f))
-        return out_v, out_f, report
-    except Exception as exc:  # noqa: BLE001 - decimation is best-effort
-        report["error"] = str(exc)
+    env = _runner_env()
+    if env is None:  # defensive: _pymeshlab_importable already gated this
+        report["after_facets"] = int(len(faces))
+        report["skipped"] = "pymeshlab unavailable (import failed/crashed)"
+        return verts, faces, report
+
+    with tempfile.TemporaryDirectory(prefix="m2s_decimate_") as tmp:
+        in_path = os.path.join(tmp, "in.npz")
+        out_path = os.path.join(tmp, "out.npz")
+        params_path = os.path.join(tmp, "params.json")
+        np.savez(in_path,
+                 vertices=np.asarray(verts, dtype=np.float64),
+                 faces=np.asarray(faces, dtype=np.int64))
+        with open(params_path, "w", encoding="utf-8") as fh:
+            json.dump({"target_faces": int(target_faces)}, fh)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "mesh2step.meshprep_runner",
+                 in_path, out_path, params_path],
+                capture_output=True, text=True, timeout=_DEC_TIMEOUT, env=env,
+            )
+        except Exception as exc:  # noqa: BLE001 - decimation is best-effort
+            report["error"] = f"runner launch failed: {exc}"
+            report["after_facets"] = int(len(faces))
+            return verts, faces, report
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            report["error"] = (proc.stderr or f"runner exited {proc.returncode}").strip()[:500]
+            report["after_facets"] = int(len(faces))
+            return verts, faces, report
+        try:
+            with np.load(out_path) as data:
+                out_v = np.asarray(data["vertices"], dtype=np.float64)
+                out_f = np.asarray(data["faces"], dtype=np.int64)
+            stats_path = out_path + ".json"
+            if os.path.exists(stats_path):
+                with open(stats_path, encoding="utf-8") as fh:
+                    report.update(json.load(fh))
+        except Exception as exc:  # noqa: BLE001
+            report["error"] = f"runner output unreadable: {exc}"
+            report["after_facets"] = int(len(faces))
+            return verts, faces, report
+
+    if "error" in report:  # runner reported an internal decimation failure
         report["after_facets"] = int(len(faces))
         return verts, faces, report
+    report["after_facets"] = int(len(out_f))
+    return out_v, out_f, report

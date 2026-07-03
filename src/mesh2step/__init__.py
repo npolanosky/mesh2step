@@ -13,8 +13,8 @@ from __future__ import annotations
 
 __all__ = ["ConversionConfig", "load_stl", "segment_planar", "convert"]
 
-__version__ = "0.3.0a1"          # PEP 440
-DISPLAY_VERSION = "v0.3.0-alpha.1"  # shown in the GUI
+__version__ = "0.4.0a1"          # PEP 440
+DISPLAY_VERSION = "v0.4.0-alpha.1"  # shown in the GUI
 
 # Map public name -> (submodule, attribute). Imports happen on first access so
 # that e.g. ConversionConfig (pure stdlib) is usable without importing numpy.

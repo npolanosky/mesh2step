@@ -96,5 +96,10 @@ Debug a crash: "$BIN"          # runs with console output attached
 Crash log:     ~/Library/Logs/mesh2step/mesh2step.log
 Zip to share:  (cd dist && zip -r mesh2step-mac.zip mesh2step.app)
 
-The target Mac still needs FreeCAD 0.20+ installed (auto-detected at runtime).
+The app self-provisions on the target Mac — no manual dependency installs:
+  * FreeCAD: auto-detected; if missing, the GUI offers to download + install the
+    official macOS build into ~/Applications (no admin needed).
+  * Prep deps (manifold3d, pymeshlab): auto-installed on first conversion into
+    ~/Library/Application Support/mesh2step/pydeps/ using FreeCAD's own pip
+    (FreeCAD.app is never modified), and injected onto the worker's PYTHONPATH.
 EOF

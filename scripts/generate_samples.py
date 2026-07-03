@@ -134,10 +134,53 @@ def angled_hole_plate():
     )
 
 
+def fillet_chamfer_plate():
+    # 40 x 30 x 12 plate. One long top edge (y=0, z=12) is filleted to R=3;
+    # the opposite long top edge (y=30, z=12) is chamfered at 45deg, width 3.
+    # Ground truth for M1 straight-edge fillet + chamfer reconstruction.
+    L, W, H, R, C = 40.0, 30.0, 12.0, 3.0, 3.0
+    plate = Part.makeBox(L, W, H)
+    # Fillet the y=0/z=H edge: subtract a box then add the rounding cylinder.
+    # Easiest exact way: use Part's fillet on the specific edge.
+    edges = []
+    for e in plate.Edges:
+        v = e.Vertexes
+        p0 = App.Vector(v[0].X, v[0].Y, v[0].Z)
+        p1 = App.Vector(v[-1].X, v[-1].Y, v[-1].Z)
+        mid = (p0 + p1) * 0.5
+        length = (p1 - p0).Length
+        # long edges run in x; pick the two top long edges by y.
+        if length > L - 1e-6 and abs(mid.z - H) < 1e-6:
+            edges.append((e, mid.y))
+    fillet_edge = min(edges, key=lambda t: t[1])[0]   # y=0 edge gets the fillet
+    part = plate.makeFillet(R, [fillet_edge])
+    # Re-find the chamfer edge on the filleted solid (edge indices changed).
+    ce = None
+    for e in part.Edges:
+        v = e.Vertexes
+        p0 = App.Vector(v[0].X, v[0].Y, v[0].Z)
+        p1 = App.Vector(v[-1].X, v[-1].Y, v[-1].Z)
+        mid = (p0 + p1) * 0.5
+        length = (p1 - p0).Length
+        if length > L - 1e-6 and abs(mid.y - W) < 1e-6 and abs(mid.z - H) < 1e-6:
+            ce = e
+            break
+    if ce is not None:
+        part = part.makeChamfer(C, [ce])
+    return save(
+        part,
+        "fillet_chamfer_plate",
+        {"kind": "fillet_chamfer_plate", "dims_mm": [L, W, H],
+         "cylinders": [],
+         "fillets": [{"radius": R, "axis": [1, 0, 0], "convex": True}],
+         "chamfers": [{"width": C, "angle_deg": 45.0}]},
+    )
+
+
 def main():
     print(f"Writing samples to {OUT} (deflection={DEFLECTION} mm)")
     truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe(),
-              countersink_plate(), angled_hole_plate()]
+              countersink_plate(), angled_hole_plate(), fillet_chamfer_plate()]
     (OUT / "samples.json").write_text(json.dumps(truths, indent=2))
     print(f"Wrote {len(truths)} samples + samples.json")
 

@@ -16,7 +16,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from .config import ConversionConfig
-from .segmentation import build_edge_adjacency, face_normals_and_areas
+from .segmentation import (
+    MeshResolution,
+    Region,
+    build_edge_adjacency,
+    face_normals_and_areas,
+    mesh_resolution,
+)
 
 
 @dataclass
@@ -32,6 +38,11 @@ class Cylinder:
     face_indices: list[int]  # facets assigned to this cylinder
     outward: bool = True     # True for a boss (material inside), False for a hole
     coverage: float = 1.0    # fraction of the full circle the facets span (0..1)
+    is_fillet: bool = False  # True for a partial-arc straight-edge fillet section
+    tangent: bool = False    # True when snapped tangent to its adjacent flats
+    radius_source: str = "fit"  # "fit" | "tangency"
+    u_start: float = 0.0     # start angle (rad) of the arc, from axis_point basis
+    u_span: float = 2.0 * np.pi  # arc span (rad); 2*pi for a full cylinder
 
     @property
     def height(self) -> float:
@@ -55,6 +66,9 @@ class Cylinder:
             "facets": len(self.face_indices),
             "role": self.role,
             "coverage": float(self.coverage),
+            "is_fillet": bool(self.is_fillet),
+            "tangent": bool(self.tangent),
+            "radius_source": self.radius_source,
         }
 
 
@@ -262,6 +276,20 @@ def _angular_coverage(
     return len(set(idx.tolist())) / bins
 
 
+def _local_tol(config: ConversionConfig, local_edge: float) -> float:
+    """Resolution-scaled RMS acceptance: max(abs floor, rel * local edge).
+
+    Chord error on a tessellated curved surface scales with the edge length, so
+    a fixed mm tolerance rejects correct fits on coarse meshes. This is the
+    accepted RMS-about-fit (roughly half the one-sided chordal sagitta), floored
+    by ``curve_fit_tol_abs`` so fine meshes don't over-tighten. Never tighter
+    than the legacy ``cylinder_tol`` so exact-radius recovery is unchanged where
+    it already worked.
+    """
+    scaled = max(config.curve_fit_tol_abs, config.curve_fit_tol_rel * float(local_edge))
+    return max(scaled, config.cylinder_tol)
+
+
 def _fit_circle_for_facets(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -270,8 +298,15 @@ def _fit_circle_for_facets(
     normals: np.ndarray,
     max_radius: float,
     config: ConversionConfig,
+    resolution: MeshResolution | None = None,
 ) -> Cylinder | None:
-    """Fit + validate a cylinder for wall facets known to share ``axis``."""
+    """Fit + validate a cylinder for wall facets known to share ``axis``.
+
+    Tolerances scale with the band's local edge length (``resolution``) so a
+    coarse-mesh cylinder whose chordal sagitta exceeds the absolute ``cylinder_tol``
+    is still accepted, while the coverage/centroid/RMS guards keep false
+    positives out. With ``resolution=None`` the legacy absolute tolerances apply.
+    """
     if len(facet_ids) < config.min_cylinder_facets:
         return None
     vert_ids = np.unique(faces[facet_ids].reshape(-1))
@@ -281,7 +316,26 @@ def _fit_circle_for_facets(
     rel = pts - centroid
     pts2d = np.column_stack((rel @ u, rel @ v))
     center2d, radius, rms = _fit_circle_2d(pts2d)
-    if radius <= 0 or rms > config.cylinder_tol:
+
+    if resolution is not None:
+        local_edge = resolution.edge_for(facet_ids)
+        tol = _local_tol(config, local_edge)
+        # The centroid of a chordal facet sits inside the true circle by the
+        # sagitta ~edge^2/(8R); scale the centroid-radius guard by that (NOT
+        # linearly in edge, which would be far too loose on big flat faces and
+        # let a square's corners pass as a giant circle) plus a small relative
+        # term for fit/rounding noise. Cap the sagitta contribution at a strict
+        # fraction of the radius: a genuine coarse fit has sagitta/R well under
+        # this (edge<~0.7R), while a square's four corners fitting a huge circle
+        # miss by ~29% and must still be rejected.
+        sagitta = (local_edge * local_edge) / (8.0 * radius) if radius > 1e-9 else 0.0
+        guard = 0.05 * radius + min(max(0.05, 1.5 * sagitta), 0.08 * radius)
+    else:
+        local_edge = 0.0
+        tol = config.cylinder_tol
+        guard = 0.05 * radius + 0.05
+
+    if radius <= 0 or rms > tol:
         return None
     # Reject sub-millimetre "cylinders": tiny curved facet clusters on an organic
     # surface algebraically fit a near-zero-radius circle, producing dozens of
@@ -296,13 +350,16 @@ def _fit_circle_for_facets(
 
     # Discriminator: facet *centroids* must sit at the fitted radius. This is
     # what separates a real cylinder from e.g. a square's corners (which can be
-    # equidistant from a centre yet have centroids well inside that radius).
+    # equidistant from a centre yet have centroids well inside that radius). The
+    # centroid of a chordal facet sits at radius*cos(half-arc) < radius, so on a
+    # coarse mesh the mean centroid radius reads low by ~edge^2/(8R); the guard is
+    # edge-scaled to admit that without letting a corner cluster through.
     fcent = vertices[faces[facet_ids]].mean(axis=1)
     radial_vec = (fcent - axis_point) - ((fcent - axis_point) @ axis)[:, None] * axis
     radial_dist = np.linalg.norm(radial_vec, axis=1)
-    if abs(float(radial_dist.mean()) - radius) > 0.05 * radius + 0.05:
+    if abs(float(radial_dist.mean()) - radius) > guard:
         return None
-    if float(radial_dist.std()) > 0.05 * radius + 0.05:
+    if float(radial_dist.std()) > guard:
         return None
 
     # The facets must wrap a meaningful arc; a sliver spanning a few degrees can
@@ -347,6 +404,7 @@ def detect_cylinders(
     if not config.detect_cylinders or len(faces) < config.min_cylinder_facets:
         return []
 
+    resolution = mesh_resolution(vertices, faces, config)
     normals, areas = face_normals_and_areas(vertices, faces)
     adjacency = build_edge_adjacency(faces)
     neighbors: list[list[int]] = [[] for _ in range(len(faces))]
@@ -385,7 +443,8 @@ def detect_cylinders(
             continue
         for cluster in _connected_components(wall, neighbors):
             cyl = _fit_circle_for_facets(
-                vertices, faces, cluster, axis, normals, max_radius, config
+                vertices, faces, cluster, axis, normals, max_radius, config,
+                resolution=resolution,
             )
             if cyl is not None:
                 found.append(cyl)
@@ -537,3 +596,317 @@ def _harmonize_radii(cylinders: list[Cylinder], config: ConversionConfig) -> Non
         snapped = round(mean_r / grid) * grid if grid > 0 else mean_r
         for i in group:
             cylinders[i].radius = snapped
+
+
+# --------------------------------------------------------------------------- #
+# Straight-edge fillets (plane-plane blends) — design §1.2, §1.3, §2, §3.
+# --------------------------------------------------------------------------- #
+
+
+def _plane_intersection_line(
+    p1: np.ndarray, n1: np.ndarray, p2: np.ndarray, n2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Line where two planes meet: returns (point_on_line, unit_direction).
+
+    ``p*``/``n*`` are a point and unit normal of each plane. Returns None when
+    the planes are (near) parallel.
+    """
+    d = np.cross(n1, n2)
+    dn = float(np.linalg.norm(d))
+    if dn < 1e-6:
+        return None
+    d = d / dn
+    # Solve for a point on both planes: [n1; n2; d] x = [n1.p1; n2.p2; 0].
+    A = np.vstack([n1, n2, d])
+    rhs = np.array([float(n1 @ p1), float(n2 @ p2), 0.0])
+    try:
+        pt = np.linalg.solve(A, rhs)
+    except np.linalg.LinAlgError:
+        return None
+    return pt, d
+
+
+def _tangent_axis_for_radius(
+    line_pt: np.ndarray, bisector: np.ndarray, half_theta: float, radius: float,
+) -> np.ndarray:
+    """Axis point of a cylinder of ``radius`` tangent to both planes.
+
+    The axis lies on the bisector plane at distance ``R / sin(theta/2)`` from the
+    edge line (design §1.3).
+    """
+    s = float(np.sin(half_theta))
+    if s < 1e-6:
+        return line_pt.copy()
+    return line_pt + bisector * (radius / s)
+
+
+def measure_tangency_defect(
+    axis: np.ndarray,
+    axis_point: np.ndarray,
+    radius: float,
+    plane_normals: list[np.ndarray],
+    plane_points: list[np.ndarray],
+) -> float:
+    """Tangency defect (deg) of a cylinder against adjacent planes (design §1.2).
+
+    For a cylinder truly tangent to a plane, the point on the plane closest to
+    the axis lies at exactly ``radius`` from the axis, and the surface normal
+    there is parallel to the plane normal. We measure how far the plane sits from
+    that ideal: the angle whose sine is ``(dist_axis_to_plane - radius) /
+    radius`` — 0 deg at a true tangent blend. Returns the max defect over the
+    adjacent planes (the worst tangency).
+    """
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    worst = 0.0
+    for pn, pp in zip(plane_normals, plane_points):
+        pn = pn / (np.linalg.norm(pn) or 1.0)
+        # Signed distance from the axis point to the plane, along the plane normal.
+        dist = abs(float((axis_point - pp) @ pn))
+        if radius <= 1e-9:
+            continue
+        # A tangent cylinder has dist == radius. Convert the shortfall/excess to
+        # an angular defect relative to the radius.
+        frac = min(1.0, abs(dist - radius) / radius)
+        defect = float(np.degrees(np.arcsin(frac)))
+        worst = max(worst, defect)
+    return worst
+
+
+def tangency_threshold_deg(config: ConversionConfig, resolution: MeshResolution) -> float:
+    """Resolution-scaled near/far tangency threshold (design §1.2)."""
+    return max(config.tangency_floor_deg,
+               config.tangency_k * resolution.median_dihedral_deg)
+
+
+def _fit_fillet_between_planes(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    band_faces: list[int],
+    r1: Region,
+    r2: Region,
+    normals: np.ndarray,
+    config: ConversionConfig,
+    resolution: MeshResolution,
+) -> Cylinder | None:
+    """Fit a partial-arc cylinder to a fillet band between two planar regions.
+
+    The candidate axis is the two planes' intersection-edge direction (which
+    ``_candidate_axes`` never generates). A free circle fit in the plane
+    perpendicular to that edge gives a rough radius; if the band is near-tangent
+    to both flats the radius is re-derived from the tangency constraint (exact
+    planes, chord-bias-free), otherwise the free fit radius is kept.
+    """
+    if len(band_faces) < config.min_cylinder_facets:
+        return None
+    n1 = r1.plane_normal / (np.linalg.norm(r1.plane_normal) or 1.0)
+    n2 = r2.plane_normal / (np.linalg.norm(r2.plane_normal) or 1.0)
+    line = _plane_intersection_line(r1.plane_point, n1, r2.plane_point, n2)
+    if line is None:
+        return None
+    line_pt, axis = line
+
+    vert_ids = np.unique(faces[band_faces].reshape(-1))
+    pts = vertices[vert_ids]
+
+    # Free circle fit in the plane perpendicular to the edge direction.
+    u, v = _plane_basis(axis)
+    centroid = pts.mean(axis=0)
+    rel = pts - centroid
+    pts2d = np.column_stack((rel @ u, rel @ v))
+    center2d, r_fit, rms_free = _fit_circle_2d(pts2d)
+    if r_fit <= 0:
+        return None
+
+    max_radius = config.max_cylinder_radius or float(
+        (vertices.max(axis=0) - vertices.min(axis=0)).max())
+    if r_fit > max_radius:
+        return None
+
+    # Interior dihedral angle theta between the two flats. The fillet fills the
+    # interior corner, so its axis is offset along the interior bisector.
+    cos_between = float(np.clip(n1 @ n2, -1.0, 1.0))
+    # theta is the interior dihedral (angle of the material wedge). For outward
+    # normals, the exterior angle between normals is (pi - theta), so
+    # theta = pi - angle(n1, n2).
+    theta = np.pi - float(np.arccos(cos_between))
+    half_theta = theta / 2.0
+    if half_theta < np.radians(5) or half_theta > np.radians(85):
+        return None
+
+    # Bisector candidates (into the material): try both signs and both radius
+    # sources, keep whichever gives the lowest vertex residual to the tangent
+    # cylinder. The 1-D radius search is bracketed around the free-fit radius.
+    line_pt0 = line_pt + axis * float((centroid - line_pt) @ axis)  # nearest to band
+
+    def residual_for(radius: float, sign: float) -> tuple[float, np.ndarray]:
+        bis = sign * (-(n1 + n2))
+        bn = float(np.linalg.norm(bis))
+        if bn < 1e-9:
+            return float("inf"), line_pt0
+        bis /= bn
+        ap = _tangent_axis_for_radius(line_pt0, bis, half_theta, radius)
+        d = pts - ap
+        radial = d - np.outer(d @ axis, axis)
+        rr = np.linalg.norm(radial, axis=1)
+        resid = rr - radius
+        return float(np.sqrt(np.mean(resid ** 2))), ap
+
+    best = None  # (rms, radius, axis_point, sign)
+    for sign in (1.0, -1.0):
+        # 1-D search over radius near the free fit (design: minimize vertex
+        # residual to the tangency-constrained cylinder).
+        lo, hi = 0.4 * r_fit, 1.8 * r_fit
+        grid = np.linspace(lo, hi, 33)
+        rmss = [residual_for(float(rg), sign)[0] for rg in grid]
+        k = int(np.argmin(rmss))
+        # Refine around the best grid point.
+        r_lo = grid[max(0, k - 1)]
+        r_hi = grid[min(len(grid) - 1, k + 1)]
+        fine = np.linspace(r_lo, r_hi, 21)
+        for rg in fine:
+            rms, ap = residual_for(float(rg), sign)
+            if best is None or rms < best[0]:
+                best = (rms, float(rg), ap, sign)
+    if best is None:
+        return None
+    rms_tan, r_tan, ap_tan, sign = best
+
+    local_edge = resolution.edge_for(band_faces)
+    tol = _local_tol(config, local_edge)
+
+    # Free-fit axis point (in 3D) for defect measurement and the non-tangent case.
+    free_axis_point = centroid + center2d[0] * u + center2d[1] * v
+
+    # Near/far tangency decision (design §1.2): measure the free fit's tangency
+    # defect against the two adjacent flats; if within the resolution-scaled
+    # threshold, tangency is design intent — snap and derive R from the exact
+    # planes (chord-bias free). Otherwise keep the best-effort free fit radius.
+    defect = measure_tangency_defect(
+        axis, free_axis_point, r_fit,
+        [n1, n2], [r1.plane_point, r2.plane_point])
+    thresh_deg = tangency_threshold_deg(config, resolution)
+
+    # Coverage: a straight fillet is a partial arc. Compute it about the chosen
+    # axis so we can gate on the fillet-specific coverage window.
+    fcent = vertices[faces[band_faces]].mean(axis=1)
+
+    tangent = defect <= thresh_deg and rms_tan <= tol
+    if tangent:
+        radius, rms, radius_source = r_tan, rms_tan, "tangency"
+        axis_point = ap_tan
+    else:
+        # Far from tangent: best-effort free fit, no snap.
+        if rms_free > tol:
+            return None
+        radius = r_fit
+        rms = rms_free
+        radius_source = "fit"
+        axis_point = free_axis_point
+    coverage = _angular_coverage(fcent, axis, axis_point)
+
+    # Resolution-scaled minimum radius: sub-facet fillets can't be built cleanly.
+    min_r = max(config.min_fillet_radius, config.min_fillet_radius_edges * local_edge)
+    if radius < min_r or radius > max_radius:
+        return None
+
+    # Coverage window: a fillet is a genuine partial arc. Too little => sliver
+    # noise; too much => it's a real cylinder detect_cylinders should own.
+    if coverage < config.min_fillet_coverage or coverage > config.max_fillet_coverage:
+        return None
+
+    # Boss vs hole (convex outer edge vs concave inner corner): outward normals
+    # pointing away from the axis => convex/boss (fuse); toward => concave (cut).
+    d = pts - axis_point
+    radial = d - np.outer(d @ axis, axis)
+    radial /= np.linalg.norm(radial, axis=1, keepdims=True) + 1e-12
+    # Use facet normals for orientation.
+    fn = normals[band_faces]
+    fc = fcent - axis_point
+    fr = fc - np.outer(fc @ axis, axis)
+    fr /= np.linalg.norm(fr, axis=1, keepdims=True) + 1e-12
+    outward = bool(np.mean(np.sum(fn * fr, axis=1)) > 0)
+
+    # Arc extent (u_start, u_span) about the axis for a trimmed cylinder face.
+    rel_c = fcent - axis_point
+    ang = np.arctan2(rel_c @ v, rel_c @ u)
+    u_start, u_span = _arc_span(ang)
+
+    axial = (pts - axis_point) @ axis
+    return Cylinder(
+        axis_point=axis_point,
+        axis_dir=axis,
+        radius=float(radius),
+        axial_min=float(axial.min()),
+        axial_max=float(axial.max()),
+        rms=float(rms),
+        face_indices=list(band_faces),
+        outward=outward,
+        coverage=coverage,
+        is_fillet=True,
+        tangent=tangent,
+        radius_source=radius_source,
+        u_start=float(u_start),
+        u_span=float(u_span),
+    )
+
+
+def _arc_span(ang: np.ndarray) -> tuple[float, float]:
+    """Smallest arc (start, span) in radians covering all angles in ``ang``.
+
+    Finds the largest angular gap between consecutive sorted angles; the arc is
+    the complement of that gap.
+    """
+    a = np.sort(np.mod(ang, 2 * np.pi))
+    if a.size < 2:
+        return 0.0, 2 * np.pi
+    gaps = np.diff(a)
+    wrap = (a[0] + 2 * np.pi) - a[-1]
+    all_gaps = np.append(gaps, wrap)
+    k = int(np.argmax(all_gaps))
+    span = 2 * np.pi - float(all_gaps[k])
+    # The arc starts just after the largest gap.
+    start = float(a[(k + 1) % a.size])
+    return start, span
+
+
+def detect_fillets_straight(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    smooth_bands,
+    regions: list[Region],
+    claimed: set[int],
+    config: ConversionConfig | None = None,
+    resolution: MeshResolution | None = None,
+) -> list[Cylinder]:
+    """Detect straight-edge fillets as partial-arc cylinders (design §2, §3).
+
+    Driven from the ``band``-classed smooth regions (each bordering exactly two
+    planar regions): the candidate axis is the two planes' intersection-edge
+    direction, and the radius is tangency-derived when the band is near-tangent
+    to both flats. Returns fillet ``Cylinder`` objects tagged ``is_fillet``.
+    """
+    config = config or ConversionConfig()
+    if not config.detect_fillets:
+        return []
+    if resolution is None:
+        resolution = mesh_resolution(vertices, faces, config)
+    normals, _ = face_normals_and_areas(vertices, faces)
+
+    fillets: list[Cylinder] = []
+    for band in smooth_bands:
+        if band.class_hint != "band" or len(band.border_regions) != 2:
+            continue
+        if any(fi in claimed for fi in band.face_indices):
+            band_faces = [fi for fi in band.face_indices if fi not in claimed]
+        else:
+            band_faces = list(band.face_indices)
+        if len(band_faces) < config.min_cylinder_facets:
+            continue
+        r1 = regions[band.border_regions[0]]
+        r2 = regions[band.border_regions[1]]
+        cyl = _fit_fillet_between_planes(
+            vertices, faces, band_faces, r1, r2, normals, config, resolution)
+        if cyl is not None:
+            fillets.append(cyl)
+            claimed.update(cyl.face_indices)
+    return fillets
