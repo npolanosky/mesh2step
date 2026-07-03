@@ -226,29 +226,21 @@ def _purge_shadowing_numpy(target: Path, log=None) -> bool:
     return removed
 
 
-def ensure_prep_deps(freecad_python: str, log=None, force: bool = False) -> Path | None:
-    """Ensure pymeshlab + manifold3d are importable by FreeCAD's Python.
+def _pip_install_into(freecad_python: str, target: Path, packages: list[str],
+                      log=None) -> bool:
+    """Run one ``pip install --target`` for ``packages`` under FreeCAD's Python.
 
-    Installs them (once) into the per-user pydeps dir via FreeCAD's pip and
-    returns that directory, or ``None`` if provisioning failed. Idempotent: a
-    no-op when the deps already import.
+    Returns True on a zero exit. Kept as its own call per package group so a
+    failure installing the OPTIONAL group can never take down the REQUIRED one
+    (a single combined ``pip install a b`` fails atomically — if pip cannot find
+    a pymeshlab wheel it aborts before installing manifold3d).
     """
-    target = pydeps_dir(freecad_python)
-    if not force and prep_deps_present(freecad_python):
-        # Self-heal an existing install that may carry a shadowing numpy from an
-        # older provisioning run (the bug that crashed pymeshlab standalone).
-        _purge_shadowing_numpy(target, log)
-        return target
-
-    target.mkdir(parents=True, exist_ok=True)
-    _log(log, f"Provisioning prep deps (pymeshlab, manifold3d) → {target}")
-    _log(log, "  (one-time download; uses FreeCAD's pip, does not touch FreeCAD.app)")
     # --no-deps: the only dependency is numpy, which FreeCAD bundles (1.26.4).
     # Pulling numpy into pydeps would shadow FreeCAD's and crash the prep deps.
     cmd = [
         freecad_python, "-m", "pip", "install",
         "--no-input", "--disable-pip-version-check", "--no-deps",
-        "--target", str(target), *PREP_PACKAGES,
+        "--target", str(target), *packages,
     ]
     try:
         proc = subprocess.Popen(
@@ -261,12 +253,46 @@ def ensure_prep_deps(freecad_python: str, log=None, force: bool = False) -> Path
             if line:
                 _log(log, "  pip: " + line)
         proc.wait(timeout=1800)
-        if proc.returncode != 0:
-            _log(log, f"  ⚠ pip exited {proc.returncode}; prep deps may be unavailable")
-            return None
+        return proc.returncode == 0
     except Exception as exc:  # noqa: BLE001
-        _log(log, f"  ⚠ prep-dep install failed: {exc}")
-        return None
+        _log(log, f"  ⚠ pip install failed for {packages}: {exc}")
+        return False
+
+
+def ensure_prep_deps(freecad_python: str, log=None, force: bool = False) -> Path | None:
+    """Ensure manifold3d (required) + pymeshlab (optional) are importable by
+    FreeCAD's Python.
+
+    Installs them (once) into the per-user pydeps dir via FreeCAD's pip and
+    returns that directory when manifold3d ends up importable, or ``None`` if the
+    REQUIRED dep could not be provisioned. Idempotent: a no-op when the required
+    dep already imports.
+
+    The two package groups are installed in SEPARATE pip invocations: a combined
+    ``pip install manifold3d pymeshlab`` fails atomically, so a missing/broken
+    pymeshlab wheel would silently drop manifold3d too. manifold3d is load-bearing
+    (the watertight/self-intersection resolver); pymeshlab only does optional
+    decimation and the pipeline degrades gracefully without it.
+    """
+    target = pydeps_dir(freecad_python)
+    if not force and prep_deps_present(freecad_python):
+        # Self-heal an existing install that may carry a shadowing numpy from an
+        # older provisioning run (the bug that crashed pymeshlab standalone).
+        _purge_shadowing_numpy(target, log)
+        return target
+
+    target.mkdir(parents=True, exist_ok=True)
+    _log(log, f"Provisioning prep deps (manifold3d required, pymeshlab optional) → {target}")
+    _log(log, "  (one-time download; uses FreeCAD's pip, does not touch FreeCAD.app)")
+
+    # REQUIRED group first, on its own: manifold3d must succeed independently.
+    if not _pip_install_into(freecad_python, target, REQUIRED_PACKAGES, log):
+        _log(log, "  ⚠ manifold3d install failed; the watertight resolver is unavailable")
+
+    # OPTIONAL group in a separate call: its failure must not affect manifold3d.
+    if not _pip_install_into(freecad_python, target, OPTIONAL_PACKAGES, log):
+        _log(log, "  ⚠ pymeshlab install failed (optional); decimation will be "
+                  "skipped — conversions still work.")
 
     # Belt-and-braces: strip any numpy pip still deposited (older pip ignores
     # --no-deps for already-cached wheels in some edge cases).
@@ -277,11 +303,11 @@ def ensure_prep_deps(freecad_python: str, log=None, force: bool = False) -> Path
         if pymeshlab_usable(freecad_python):
             _log(log, "  ✔ pymeshlab ready (planar decimation)")
         else:
-            _log(log, "  ⚠ pymeshlab unavailable on this macOS (its bundled Qt "
-                      "crashes on import); decimation will be skipped — "
+            _log(log, "  ⚠ pymeshlab unavailable (missing wheel, or its bundled Qt "
+                      "crashes on import on this macOS); decimation will be skipped — "
                       "conversions still work.")
         return target
-    _log(log, "  ⚠ prep deps installed but manifold3d did not import cleanly")
+    _log(log, "  ⚠ manifold3d did not import cleanly after install; prep deps unavailable")
     return None
 
 

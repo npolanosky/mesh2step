@@ -378,12 +378,14 @@ class App:
                 self.drop.dnd_bind("<<Drop>>", self._on_drop)
             except Exception:  # noqa: BLE001 - drag-drop is a convenience, not required
                 self.drop.config(text="Drag an STL here  (or use Browse)")
-        row = ttk.Frame(c1, style="Card.TFrame"); row.pack(fill="x", pady=(8, 0))
+        row = ttk.Frame(c1, style="Card.TFrame")
+        row.pack(fill="x", pady=(8, 0))
         ttk.Entry(row, textvariable=self.input_var).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Browse…", command=self._browse_input).pack(side="left", padx=(6, 0))
 
         # mesh info grid
-        self.info = ttk.Frame(c1, style="Card.TFrame"); self.info.pack(fill="x", pady=(10, 0))
+        self.info = ttk.Frame(c1, style="Card.TFrame")
+        self.info.pack(fill="x", pady=(10, 0))
         self._info_labels = {}
         for i, key in enumerate(["Triangles", "AABB X·Y·Z", "OBB (oriented)", "Mesh health"]):
             ttk.Label(self.info, text=key, style="Muted.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 10))
@@ -393,7 +395,8 @@ class App:
 
         # --- Units & options ---
         c2 = self._card(body, "2  ·  Units & options")
-        urow = ttk.Frame(c2, style="Card.TFrame"); urow.pack(fill="x")
+        urow = ttk.Frame(c2, style="Card.TFrame")
+        urow.pack(fill="x")
         ttk.Label(urow, text="Source units").pack(side="left")
         cb = ttk.Combobox(urow, textvariable=self.units_var, values=UNIT_CHOICES,
                           width=6, state="readonly")
@@ -425,14 +428,16 @@ class App:
 
         # --- Output ---
         c3 = self._card(body, "3  ·  Output")
-        orow = ttk.Frame(c3, style="Card.TFrame"); orow.pack(fill="x")
+        orow = ttk.Frame(c3, style="Card.TFrame")
+        orow.pack(fill="x")
         ttk.Entry(orow, textvariable=self.output_var, state="readonly").pack(
             side="left", fill="x", expand=True)
         ttk.Button(orow, text="Choose folder…", command=self._browse_output).pack(
             side="left", padx=(6, 0))
         ttk.Label(c3, text="File name follows the input; pick a folder to change where it lands.",
                   style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
-        frow = ttk.Frame(c3, style="Card.TFrame"); frow.pack(fill="x", pady=(8, 0))
+        frow = ttk.Frame(c3, style="Card.TFrame")
+        frow.pack(fill="x", pady=(8, 0))
         ttk.Label(frow, text="FreeCAD Python", style="Muted.TLabel").pack(side="left")
         ttk.Entry(frow, textvariable=self.freecad_var).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(frow, text="…", width=3, command=self._browse_freecad).pack(side="left")
@@ -441,7 +446,8 @@ class App:
         self.convert_btn = ttk.Button(body, text="Convert  →  STEP",
                                       style="Accent.TButton", command=self._convert)
         self.convert_btn.pack(fill="x")
-        prow = ttk.Frame(body, style="Bg.TFrame"); prow.pack(fill="x", pady=(8, 4))
+        prow = ttk.Frame(body, style="Bg.TFrame")
+        prow.pack(fill="x", pady=(8, 4))
         self.progress = ttk.Progressbar(prow, mode="determinate", maximum=100,
                                         style="Accent.Horizontal.TProgressbar")
         self.progress.pack(side="left", fill="x", expand=True)
@@ -456,7 +462,8 @@ class App:
         self.quality.pack(fill="x", pady=(2, 6))
 
         # --- Result actions ---
-        arow = ttk.Frame(body, style="Bg.TFrame"); arow.pack(fill="x", pady=(0, 6))
+        arow = ttk.Frame(body, style="Bg.TFrame")
+        arow.pack(fill="x", pady=(0, 6))
         self.view_btn = ttk.Button(arow, text="Pop out 3D view ↗", state="disabled",
                                    command=self._view_result)
         self.view_btn.pack(side="left")
@@ -850,6 +857,10 @@ class App:
         bi, bo = s.get("bbox_input_mm"), s.get("bbox_output_mm")
         if bi and bo:
             self._log(f"   bbox in {bi} → out {bo}  (Δ{s.get('bbox_delta_pct',0)}%)", "muted")
+        if s.get("solids"):
+            bodies = s.get("bodies") or []
+            ok = sum(1 for b in bodies if b.get("is_solid"))
+            self._log(f"   multi-body: {s['solids']} solids ({ok} watertight)", "muted")
         for w in s.get("warnings", []):
             self._log(f"   ⚠ {w}", "err")
         # Prominent quality verdict.

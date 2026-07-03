@@ -40,6 +40,52 @@ def _vec(p):
     return FreeCAD.Vector(float(p[0]), float(p[1]), float(p[2]))
 
 
+def _loop_degenerate(points3d, tol: float = 1e-6) -> str | None:
+    """Pre-validate a boundary loop before it reaches an OCC wire/face constructor.
+
+    Some degenerate loops make OCC's polygon/plane/face constructors raise a
+    *native* ``Standard_ConstructionError`` that abort()s the process instead of
+    surfacing as a catchable Python exception — no ``except Exception:`` around
+    the constructor can save the worker. The only safe fix is to reject the bad
+    loop in pure Python *before* calling into OCC.
+
+    Returns a short reason string if the loop is degenerate (caller skips it and
+    logs), or ``None`` if it is safe to build. Rejects:
+      * fewer than 3 points, or fewer than 3 *distinct* points (within ``tol``);
+      * consecutive duplicate points (zero-length edges);
+      * a near-zero coordinate span (all points coincide);
+      * a collinear loop (zero enclosed area / rank < 2) — this is the case that
+        aborts ``Part.Face``/``Part.Plane`` on a smooth wall misclassified into
+        thin strips, since a line has no plane to build a face on.
+    """
+    pts = np.asarray(points3d, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] < 3:
+        return "fewer than 3 points"
+    span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    if span < tol:
+        return "zero coordinate span"
+    # Consecutive duplicates (including wrap-around) -> zero-length edges.
+    edges = pts - np.roll(pts, -1, axis=0)
+    if float(np.linalg.norm(edges, axis=1).min()) < tol:
+        return "consecutive duplicate points"
+    # Distinct-point count (rounded to tol grid).
+    scale = max(span, 1.0)
+    quant = np.round(pts / (tol * scale)).astype(np.int64)
+    if len({tuple(row) for row in quant}) < 3:
+        return "fewer than 3 distinct points"
+    # Collinearity / zero enclosed area: SVD rank of the centred points. A loop
+    # whose points all lie on one line has a single dominant singular value; OCC
+    # cannot infer a plane and aborts. Compare the 2nd singular value to the 1st.
+    centred = pts - pts.mean(axis=0)
+    try:
+        sv = np.linalg.svd(centred, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return "SVD failed (degenerate loop)"
+    if sv.size < 2 or sv[0] <= tol or sv[1] < 1e-6 * sv[0]:
+        return "collinear loop (zero area)"
+    return None
+
+
 def _wire_from_points(points3d: np.ndarray, Part):
     """Build a closed polygonal wire from ordered 3D points."""
     vectors = [_vec(p) for p in points3d]
@@ -128,10 +174,24 @@ def _planar_face(loops: FaceLoops, circles, Part):
             return _circle_wire(center, -n if is_hole else n, radius, Part)
         return _wire_from_points(loop, Part)
 
+    # Degenerate-loop guard (see _loop_degenerate): a collinear/zero-area outer
+    # loop makes Part.Face/Part.Plane abort() natively — uncatchable from Python.
+    # Reject it here as an ordinary exception so the caller drops the region to
+    # gap-fill instead of the whole worker crashing. Circle-matched loops are
+    # exact analytic circles and safe regardless.
+    if _match_loop_to_circle(loops.outer, normal, circles) is None:
+        reason = _loop_degenerate(loops.outer)
+        if reason is not None:
+            raise RuntimeError(f"degenerate outer loop ({reason})")
+
     wires = [wire_for(loops.outer, is_hole=False)]
     for hole in loops.holes:
-        if len(hole) >= 3:
-            wires.append(wire_for(hole, is_hole=True))
+        if len(hole) < 3:
+            continue
+        if _match_loop_to_circle(hole, normal, circles) is None \
+                and _loop_degenerate(hole) is not None:
+            continue  # skip a degenerate hole loop rather than abort in OCC
+        wires.append(wire_for(hole, is_hole=True))
 
     try:
         # Fast path: OCC infers the plane from the wire. Works for the vast
@@ -1129,20 +1189,51 @@ def _repair_nonmanifold(vertices: np.ndarray, faces: np.ndarray):
     return verts, tris
 
 
-def _try_boolean_step(current_solid, fn):
+def _bbox_dims(shape):
+    """Sorted (desc) bounding-box side lengths of a shape, as a tuple."""
+    b = shape.BoundBox
+    return tuple(sorted((b.XLength, b.YLength, b.ZLength), reverse=True))
+
+
+def _bbox_grew(before, after, rel_tol: float, abs_tol: float = 0.05) -> bool:
+    """True if ``after``'s bounding box is materially larger than ``before``'s.
+
+    A hole cut can only remove material and a fuse-back trues up a boss over its
+    own extent — neither should enlarge the part's overall silhouette. A mis-fit
+    feature (a spurious giant tilted cylinder, an over-radius fillet) *does* grow
+    the box, so any op that expands a side beyond ``rel_tol`` (relative) and
+    ``abs_tol`` (mm, to ignore FP noise on tiny parts) is rejected.
+    """
+    for a, b in zip(after, before):
+        if a - b > abs_tol and a - b > rel_tol * b:
+            return True
+    return False
+
+
+def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None):
     """Apply one boolean cleanup step; revert if it breaks solid validity.
 
     Never lets a single bad feature corrupt or abort the whole result — later
-    steps always see a known-good solid.
+    steps always see a known-good solid. When ``max_bbox_growth`` is given, also
+    revert any op that enlarges the solid's bounding box beyond that relative
+    fraction: a cut/fuse-back that grows the silhouette is a mis-detected feature
+    (see _bbox_grew) and must not silently distort the part's dimensions.
     """
     try:
         candidate = fn(current_solid)
     except Exception:  # noqa: BLE001
         return current_solid, False
     solids = getattr(candidate, "Solids", [])
-    if len(solids) == 1 and solids[0].isValid():
-        return candidate, True
-    return current_solid, False
+    if len(solids) != 1 or not solids[0].isValid():
+        return current_solid, False
+    if max_bbox_growth is not None:
+        try:
+            if _bbox_grew(_bbox_dims(current_solid), _bbox_dims(candidate),
+                          max_bbox_growth):
+                return current_solid, False
+        except Exception:  # noqa: BLE001 - bbox read must not break the step
+            pass
+    return candidate, True
 
 
 def build_boolean_clean_solid(
@@ -1243,19 +1334,27 @@ def build_boolean_clean_solid(
     # sequentially (not batched) because coaxial/nested features — e.g. a bore
     # inside a boss — must be processed in order: a batched fuse-back of the boss
     # would fill the bore. One bad feature never corrupts the rest.
+    # Bounding-box growth guard: revert any cut/fuse-back that enlarges the
+    # part's silhouette (a mis-detected feature — e.g. a spurious giant tilted
+    # cylinder — otherwise distorts the exported dimensions by 10-30%).
+    bbox_guard = config.boolean_max_bbox_growth
+
     cyl_ok = 0
     for i, cyl in enumerate(cylinders):
         r_cut = _design_radius(vertices, faces, cyl.axis_dir, cyl.axis_point,
                                cyl.face_indices, cyl.radius)
         solid, ok = _try_boolean_step(
-            solid, lambda s, c=cyl, rc=r_cut: _boolean_clean_cylinder(s, c, Part, radius=rc))
+            solid, lambda s, c=cyl, rc=r_cut: _boolean_clean_cylinder(s, c, Part, radius=rc),
+            max_bbox_growth=bbox_guard)
         cyl_ok += ok
         if (i + 1) % 10 == 0 or i + 1 == len(cylinders):
             progress(f"  cylinders cleaned {cyl_ok}/{i + 1} of {len(cylinders)}")
 
     cone_ok = 0
     for cone in cones:
-        solid, ok = _try_boolean_step(solid, lambda s, c=cone: _boolean_clean_cone(s, c, Part))
+        solid, ok = _try_boolean_step(
+            solid, lambda s, c=cone: _boolean_clean_cone(s, c, Part),
+            max_bbox_growth=bbox_guard)
         cone_ok += ok
 
     # Fillets last: a concave fillet cuts, a convex one fuses its rounded-corner
@@ -1263,7 +1362,8 @@ def build_boolean_clean_solid(
     fillet_ok = 0
     for fl in fillets:
         solid, ok = _try_boolean_step(
-            solid, lambda s, f=fl: _boolean_clean_fillet(s, f, Part))
+            solid, lambda s, f=fl: _boolean_clean_fillet(s, f, Part),
+            max_bbox_growth=bbox_guard)
         fillet_ok += ok
     if fillets:
         progress(f"  fillets cleaned {fillet_ok}/{len(fillets)}")

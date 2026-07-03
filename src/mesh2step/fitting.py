@@ -895,18 +895,44 @@ def detect_fillets_straight(
         resolution = mesh_resolution(vertices, faces, config)
     normals, _ = face_normals_and_areas(vertices, faces)
 
-    fillets: list[Cylinder] = []
+    # Candidate bands: "band"-classed strips bordering exactly two planar regions
+    # with enough facets to fit. Collected first so we can measure how many
+    # distinct fillets each border region serves before committing any.
+    candidates: list[tuple] = []  # (band, band_faces, r1_idx, r2_idx)
     for band in smooth_bands:
         if band.class_hint != "band" or len(band.border_regions) != 2:
             continue
-        if any(fi in claimed for fi in band.face_indices):
-            band_faces = [fi for fi in band.face_indices if fi not in claimed]
-        else:
-            band_faces = list(band.face_indices)
+        band_faces = [fi for fi in band.face_indices if fi not in claimed]
         if len(band_faces) < config.min_cylinder_facets:
             continue
-        r1 = regions[band.border_regions[0]]
-        r2 = regions[band.border_regions[1]]
+        candidates.append((band, band_faces, band.border_regions[0], band.border_regions[1]))
+
+    # Organic-surface guard via border reuse (see config.fillet_max_border_reuse).
+    # A genuine straight-edge fillet rounds between two flats that are *its own*:
+    # on a prismatic part each real fillet has two dedicated bordering faces
+    # (reuse count 1). A smooth freeform/vase-mode wall segments into stacked
+    # rings, so a handful of large panels each border a dozen "fillet" slices —
+    # the same border region is reused across many candidates. That reuse is the
+    # tell that separates the vase (105 candidates over 22 borders, max reuse 13)
+    # from a true multi-fillet part (tslot: 12 fillets, zero reuse). Reject any
+    # candidate whose either border is shared by more than the allowed number.
+    reuse: dict[int, int] = {}
+    for _band, _bf, i1, i2 in candidates:
+        reuse[i1] = reuse.get(i1, 0) + 1
+        reuse[i2] = reuse.get(i2, 0) + 1
+    limit = config.fillet_max_border_reuse
+
+    fillets: list[Cylinder] = []
+    for band, band_faces, i1, i2 in candidates:
+        # Recompute unclaimed facets: earlier accepted fillets may have claimed
+        # some of this band's facets.
+        band_faces = [fi for fi in band_faces if fi not in claimed]
+        if len(band_faces) < config.min_cylinder_facets:
+            continue
+        if reuse.get(i1, 0) > limit or reuse.get(i2, 0) > limit:
+            continue
+        r1 = regions[i1]
+        r2 = regions[i2]
         cyl = _fit_fillet_between_planes(
             vertices, faces, band_faces, r1, r2, normals, config, resolution)
         if cyl is not None:

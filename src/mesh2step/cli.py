@@ -159,6 +159,11 @@ def main(argv: list[str] | None = None) -> int:
 
     s = result.stats
     print(f"wrote {result.output_path}  [{result.method}]")
+    if s.get("solids"):
+        bodies = s.get("bodies") or []
+        ok = sum(1 for b in bodies if b.get("is_solid"))
+        print(f"  multi-body: {s['solids']} solids ({ok} watertight, "
+              f"all_watertight={s.get('is_solid')})")
     if "faces_out" in s:
         print(
             f"  faces: {s['faces_in']} triangles -> {s['faces_out']} STEP faces"

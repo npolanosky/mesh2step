@@ -63,6 +63,20 @@ def convert(
     ensure_freecad(config.freecad_bin)
     from . import builder
 
+    # Multi-body dispatch: a mesh with several disjoint bodies (a print-in-place
+    # hinge, a snap-fit lid+base) can never close into ONE watertight solid, so
+    # convert each body independently and combine into a STEP compound of N
+    # solids. Detected on the raw welded mesh (matching what each tier reloads).
+    # A single-body mesh falls straight through to the ordinary path below.
+    if config.multi_body:
+        raw_v, raw_f = load_stl(input_path, weld_tol=config.weld_tol)
+        from .mesh_io import split_components
+
+        components = split_components(raw_v, raw_f)
+        if len(components) > 1:
+            return _convert_multibody(
+                components, input_path, output_path, config, builder, progress)
+
     # Weld in raw units, then scale to millimetres (STEP is always mm). Welding
     # first keeps weld_tol meaningful regardless of the source unit scale.
     prep_report = None
@@ -291,6 +305,16 @@ def convert(
 
     _assess_quality(shape, input_dims, method, stats, config, builder)
 
+    # Narrate a material bounding-box distortion so a user watching live progress
+    # (CLI/GUI) sees it — previously it only appeared in the returned stats dict,
+    # so an "artifact-free — adopted" success could hide a 15% oversize.
+    bdelta = stats.get("bbox_delta_pct")
+    if isinstance(bdelta, (int, float)) and bdelta > 2.0:
+        sev = "PROBLEM" if bdelta > 5.0 else "warning"
+        progress(f"Bounding-box {sev}: output differs from input by {bdelta:.1f}% "
+                 f"(input {stats.get('bbox_input_mm')} vs "
+                 f"output {stats.get('bbox_output_mm')} mm)")
+
     if dual and clean_shape is not None:
         # Two deliverables, clearly named: watertight (may contain artifacts) and
         # clean (artifact-free, but open shells — heal on import).
@@ -340,6 +364,105 @@ def convert(
     progress("Done")
     return ConversionResult(output_path=output_path, method=method, stats=stats,
                             outputs=[output_path])
+
+
+def _convert_multibody(components, input_path, output_path, config, builder,
+                       progress) -> ConversionResult:
+    """Convert a multi-body mesh: one STEP compound of N independent solids.
+
+    Each disjoint body is written to a temp STL and run through the *ordinary*
+    single-body ``convert`` (with multi-body dispatch disabled so it can't
+    re-split), then the resulting solids are compounded into one STEP. The
+    per-body stats are collected under ``stats["bodies"]`` and aggregated:
+    ``stats["solids"]`` is N, ``stats["watertight"]`` / ``stats["is_solid"]`` are
+    True only if EVERY body is a watertight solid, and ``stats["quality"]`` is the
+    worst body verdict. Watertightness is thus required per body.
+    """
+    import dataclasses
+    import tempfile
+
+    import Part  # type: ignore
+
+    from .mesh_io import write_binary_stl
+
+    n = len(components)
+    progress(f"Multi-body mesh: {n} disjoint bodies; converting each independently")
+    body_cfg = dataclasses.replace(config, multi_body=False)
+
+    solids: list = []
+    body_stats: list[dict] = []
+    outputs: list[Path] = []
+    with tempfile.TemporaryDirectory(prefix="mesh2step_bodies_") as tmp:
+        tmpd = Path(tmp)
+        for i, (bverts, bfaces) in enumerate(components):
+            progress(f"Body {i + 1}/{n}: {len(bfaces):,} facets")
+            body_stl = tmpd / f"body_{i}.stl"
+            body_step = tmpd / f"body_{i}.step"
+            write_binary_stl(bverts, bfaces, body_stl)
+
+            def _body_progress(msg: str, _i=i) -> None:
+                progress(f"  [body {_i + 1}] {msg}")
+
+            res = convert(body_stl, body_step, body_cfg, on_progress=_body_progress)
+            body_stats.append({"body": i, "method": res.method,
+                               "is_solid": res.stats.get("is_solid"),
+                               "watertight": res.stats.get("watertight"),
+                               "quality": res.stats.get("quality"),
+                               "rtaf": res.stats.get("rtaf"),
+                               "bbox_delta_pct": res.stats.get("bbox_delta_pct")})
+            # Read the body's solids back and collect them for the compound.
+            for op in (res.outputs or [res.output_path]):
+                # Prefer the primary (watertight) output of a dual-output body.
+                if "_clean" in Path(op).name:
+                    continue
+                shp = Part.Shape()
+                shp.read(str(op))
+                solids.extend(getattr(shp, "Solids", []) or [shp])
+                break
+
+        compound = Part.makeCompound(solids)
+        builder.export_step(compound, output_path)
+        outputs.append(output_path)
+
+    # Aggregate stats across bodies.
+    all_solid = all(bool(b.get("is_solid")) for b in body_stats) and len(body_stats) == n
+    order = {"problems": 0, "warnings": 1, "good": 2}
+    worst = min((b.get("quality") or "problems" for b in body_stats),
+                key=lambda q: order.get(q, 0))
+    rtafs = [b["rtaf"] for b in body_stats if isinstance(b.get("rtaf"), (int, float))]
+    deltas = [b["bbox_delta_pct"] for b in body_stats
+              if isinstance(b.get("bbox_delta_pct"), (int, float))]
+    stats: dict = {
+        "solids": n,
+        "bodies": body_stats,
+        "is_solid": all_solid,
+        "watertight": all_solid,
+        "quality": worst,
+        "multi_body": True,
+    }
+    if rtafs:
+        stats["rtaf"] = round(max(rtafs), 4)  # worst (most-faceted) body
+    if deltas:
+        stats["bbox_delta_pct"] = max(deltas)
+    warnings: list[str] = []
+    if not all_solid:
+        warnings.append(
+            f"{sum(1 for b in body_stats if not b.get('is_solid'))} of {n} bodies "
+            f"did not convert to a watertight solid.")
+    stats["warnings"] = warnings
+
+    progress(f"Multi-body: exported {n}-solid compound "
+             f"({'all watertight' if all_solid else 'some bodies open'})")
+    if config.revalidate_export:
+        reval = builder.revalidate_step(output_path, expected_solids=n)
+        stats["export_revalidation"] = reval
+        if not reval.get("valid", False):
+            warnings.append(f"Exported compound re-reads invalid ({reval.get('reason')}).")
+            if all_solid:
+                stats["quality"] = "problems"
+    progress("Done")
+    return ConversionResult(output_path=output_path, method="multi-body",
+                            stats=stats, outputs=outputs)
 
 
 def _is_solid(shape) -> bool:
@@ -417,10 +540,13 @@ def _assess_quality(shape, input_dims, method: str, stats: dict,
                 f"Residual tessellation: {rtaf * 100:.0f}% of the output surface "
                 f"area is faceted (near-tangent planar strips on curved features).")
 
-    # Watertight solid?
+    # Watertight solid? "watertight" mirrors is_solid semantics (a single valid
+    # closed solid) and is populated as a stable, explicitly-named field so
+    # consumers reading stats["watertight"] get a real bool instead of None.
     solids = getattr(shape, "Solids", [])
     is_solid = bool(solids) and solids[0].isValid()
     stats["is_solid"] = is_solid
+    stats["watertight"] = is_solid
     if not is_solid:
         warnings.append("Result is not a single watertight solid (open shells present).")
 
@@ -463,15 +589,27 @@ def _assess_quality(shape, input_dims, method: str, stats: dict,
     if detected is not None and built is not None and built < detected:
         warnings.append(f"{detected - built} detected cylinder(s) could not be built as analytic faces.")
 
-    # Bounding-box sanity: exported solid vs input mesh.
+    # Bounding-box sanity: exported solid vs input mesh. A material distortion
+    # (a part that shipped visibly over- or under-sized in some axis) is a
+    # correctness problem, not a cosmetic one — a boolean fuse-back that extended
+    # geometry past the original silhouette can grow the box 15-30%. Surface it
+    # loudly: >2% is a warning line (and narrated via on_progress by the caller),
+    # >5% forces the quality verdict down to "problems" (set below).
+    bbox_delta = None
     try:
         bb = shape.BoundBox
         out_dims = sorted([bb.XLength, bb.YLength, bb.ZLength], reverse=True)
         stats["bbox_input_mm"] = [round(x, 3) for x in input_dims]
         stats["bbox_output_mm"] = [round(x, 3) for x in out_dims]
         rel = max((abs(o - i) / i) for o, i in zip(out_dims, input_dims) if i > 1e-9)
+        bbox_delta = rel
         stats["bbox_delta_pct"] = round(rel * 100, 2)
-        if rel > 0.01:
+        if rel > 0.05:
+            warnings.append(
+                f"Output bounding box differs from input by {rel * 100:.1f}% — the "
+                f"exported solid is materially off-dimension (input "
+                f"{stats['bbox_input_mm']} mm vs output {stats['bbox_output_mm']} mm).")
+        elif rel > 0.02:
             warnings.append(f"Output bounding box differs from input by {rel * 100:.1f}%.")
     except Exception:  # noqa: BLE001
         pass
@@ -483,8 +621,13 @@ def _assess_quality(shape, input_dims, method: str, stats: dict,
     export_invalid = (isinstance(final_reval, dict) and final_reval.get("valid") is False) \
         or stats.get("export_revalidated") is False
 
+    # A bounding box more than 5% off input is a correctness problem (the part
+    # shipped materially wrong-sized), so it forces "problems" the same way a
+    # non-solid or invalid export does — not the softer "warnings".
+    bbox_problem = bbox_delta is not None and bbox_delta > 0.05
+
     stats["warnings"] = warnings
-    if method == "faceted" or not is_solid or export_invalid:
+    if method == "faceted" or not is_solid or export_invalid or bbox_problem:
         stats["quality"] = "problems"
     elif warnings:
         stats["quality"] = "warnings"

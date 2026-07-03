@@ -55,6 +55,16 @@ class ConversionConfig:
     # Skip reconstruction entirely and emit the classic faceted solid.
     faceted: bool = False
 
+    # Multi-body support. A mesh can contain several disjoint bodies that touch
+    # nowhere (a print-in-place hinge's knuckle + pin, a snap-fit lid + base).
+    # The reconstruction/boolean pipeline assumes one connected body, so a
+    # multi-body mesh never closes into a single watertight solid. When enabled,
+    # disjoint connected components are detected up front and each is converted
+    # independently through the full pipeline, then combined into one STEP
+    # compound of N solids (watertightness is required per body). A single-body
+    # mesh is unaffected — it takes the ordinary path byte-for-byte.
+    multi_body: bool = True
+
     # Guarantee a watertight solid. If surface reconstruction can't close (common
     # for organic meshes, where analytic hole edges can't meet the faceted
     # surrounding surface), fall back to a watertight faceted solid. Slower, and
@@ -90,6 +100,16 @@ class ConversionConfig:
     # ~130k keeps it well under a minute per cut while admitting most decimated
     # bases. None disables the ceiling (unbounded — the old behaviour).
     fully_closed_boolean_ceiling_faces: int | None = 130000
+
+    # Bounding-box growth guard for boolean cut/fuse-back ops. A legitimate hole
+    # cut removes material and a boss/fillet fuse-back trues up a wall over its
+    # own extent — neither should enlarge the part's overall silhouette. A
+    # mis-detected feature (a spurious giant tilted cylinder fitted to a curved
+    # corner, an over-radius fillet) DOES grow the box, silently distorting the
+    # exported dimensions by 10-30%. Any boolean-clean step that expands a side of
+    # the solid's bounding box by more than this relative fraction is reverted
+    # (the feature is left faceted). None disables the guard.
+    boolean_max_bbox_growth: float | None = 0.02
 
     # Post-export re-validation. After writing the STEP, re-read it and confirm
     # the solid still loads, is valid, is closed, and the solid count matches the
@@ -217,6 +237,20 @@ class ConversionConfig:
     # Maximum coverage for a band to still be treated as a partial-arc fillet
     # (above this it is a real, near-full cylinder that detect_cylinders owns).
     max_fillet_coverage: float = 0.6
+
+    # Organic-surface guard for straight-edge fillet detection, by border reuse.
+    # A *real* straight-edge fillet rounds between two flats that belong to it
+    # alone: on a prismatic part each fillet has two dedicated bordering planar
+    # regions (each serves that one fillet). A smooth freeform / vase-mode wall
+    # segments into stacked rings, so a few large panels each border many "fillet"
+    # slices — the same border region is reused across a dozen candidates. That
+    # reuse is what cleanly separates a hex-planter vase wall (105 candidates over
+    # 22 border regions, max reuse 13) from a genuine multi-fillet part (a T-slot
+    # connector: 12 fillets, zero border reuse). A candidate whose either border
+    # region serves more than this many fillet candidates is rejected as a
+    # misclassified organic strip rather than built (which is what crashed OCC on
+    # the vase). 2 tolerates a flat legitimately shared by two adjacent fillets.
+    fillet_max_border_reuse: int = 2
 
     # --- Swept / extruded curved-wall reconstruction (M4). See
     # docs/CURVED_FEATURES.md §6a — 60%+ of residual facetedness on the corpus.
