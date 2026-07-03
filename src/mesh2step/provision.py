@@ -51,7 +51,13 @@ from pathlib import Path
 # that already have the bad numpy (e.g. from an earlier provisioning bug).
 REQUIRED_PACKAGES = ["manifold3d>=3.0"]
 OPTIONAL_PACKAGES = ["pymeshlab>=2023.12,<2025"]
-PREP_PACKAGES = REQUIRED_PACKAGES + OPTIONAL_PACKAGES
+# pynanoinstantmeshes (BSD) is the quad remesher for the organic multi-patch tier
+# (Candidate A). Fully optional: absent, the tier declines and the pipeline falls
+# back. Its only dependency is numpy (FreeCAD's bundled 1.26.4), so --no-deps
+# keeps it from shadowing numpy, exactly like the other prep wheels. Installed in
+# its own pip call so its failure never touches manifold3d / pymeshlab.
+ORGANIC_PACKAGES = ["pynanoinstantmeshes>=0.0.3"]
+PREP_PACKAGES = REQUIRED_PACKAGES + OPTIONAL_PACKAGES + ORGANIC_PACKAGES
 
 # The module whose presence gates "prep deps ready" (manifold3d — the required
 # one). pymeshlab importability is probed separately, crash-safely.
@@ -293,6 +299,12 @@ def ensure_prep_deps(freecad_python: str, log=None, force: bool = False) -> Path
     if not _pip_install_into(freecad_python, target, OPTIONAL_PACKAGES, log):
         _log(log, "  ⚠ pymeshlab install failed (optional); decimation will be "
                   "skipped — conversions still work.")
+
+    # ORGANIC group (quad remesher) in its own call: fully optional, its failure
+    # only disables the organic multi-patch tier (which falls back anyway).
+    if not _pip_install_into(freecad_python, target, ORGANIC_PACKAGES, log):
+        _log(log, "  ⚠ pynanoinstantmeshes install failed (optional); the organic "
+                  "multi-patch tier will be skipped — conversions still work.")
 
     # Belt-and-braces: strip any numpy pip still deposited (older pip ignores
     # --no-deps for already-cached wheels in some edge cases).

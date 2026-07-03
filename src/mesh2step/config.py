@@ -411,6 +411,62 @@ class ConversionConfig:
     # small doomed candidates can spend on rejected attempts.
     freeform_max_ops: int = 4
 
+    # --- Organic multi-patch (Candidate A). See
+    # docs/ORGANIC_CONVERSION_RESEARCH.md (Candidate A). A genuinely organic body
+    # that wraps past any single projection (a sculpted cat, an ergonomic handle,
+    # a curved shell) is not a height field, so the freeform-sheet path (Candidate
+    # B) declines it and it ships faceted. Candidate A rebuilds the WHOLE body as a
+    # quad-patch network: quad-remesh the mesh into a coarse all-quad control cage
+    # (pynanoinstantmeshes), least-squares shrink-wrap the cage so its Catmull-Clark
+    # LIMIT surface approximates the original mesh, subdivide 1-2x to isolate
+    # extraordinary vertices, then extract one exact bicubic B-spline patch per
+    # regular quad (Stam 1998) and cap the EV faces — sewing the patches into a
+    # shell. Because every face is a B-spline (not a planar strip), the RTAF of a
+    # successful result is ~0. Whole-body only for now (no analytic seam); routed
+    # by the after-analytic residual-area fraction (see organic_multipatch_min_
+    # residual). On ANY failure — remesh unavailable, cage not closed-manifold,
+    # shell won't close, or the result doesn't lower RTAF — the pipeline keeps its
+    # existing output (never regress).
+
+    # Attempt whole-body organic multi-patch reconstruction. Behind this flag so
+    # the whole feature can be disabled. Requires the optional pynanoinstantmeshes
+    # dependency; declines gracefully (falls back) when it is unavailable.
+    organic_multipatch: bool = True
+
+    # Route to Candidate A only when the after-analytic residual covers at least
+    # this fraction of the part's surface area (a mostly-organic body). Below it
+    # the part is prismatic-with-features and the analytic + Candidate-B tiers own
+    # it; whole-body quad remeshing would destroy their clean analytic faces.
+    organic_multipatch_min_residual: float = 0.6
+
+    # Target quad count for the control cage (before Catmull-Clark subdivision).
+    # Coarser = fewer patches + fewer extraordinary vertices (cleaner sew) but
+    # higher deviation; the remesher treats this as an edge-length target, so the
+    # realised count can differ. Scaled modestly by mesh size in the builder.
+    organic_multipatch_target_quads: int = 220
+
+    # Catmull-Clark subdivisions applied to the cage before patch extraction. Each
+    # step isolates extraordinary vertices (new vertices are valence-4), shrinking
+    # the irregular region geometrically; 1 is enough for most bodies, 2 for
+    # heavily-irregular cages. More steps = more patches (4x per step).
+    organic_multipatch_subdiv: int = 1
+
+    # Gauss-Newton/projection iterations for the cage shrink-wrap fit (step 3).
+    # 0 disables the fit (cage = raw remesh — the limit surface then shrinks
+    # inside the mesh); 2-3 lands the limit surface on the original mesh.
+    organic_multipatch_fit_iters: int = 3
+
+    # Accepted deviation (mm) of the reconstructed limit surface to the original
+    # mesh, resolution-scaled: max(this, this_rel * bbox_diagonal). Above it the
+    # multipatch result is rejected and the existing output kept.
+    organic_multipatch_dev_tol_abs: float = 1.0
+    organic_multipatch_dev_tol_rel: float = 0.02   # 2% of bbox diagonal
+
+    # Skip Candidate A when the input mesh exceeds this many triangles (the quad
+    # remesh + per-patch OCC build gets slow on huge scans; decimation upstream
+    # usually keeps it well under). None disables the guard.
+    organic_multipatch_max_faces: int | None = 200000
+
     # --- Spheres: domes and corner blends (M3). See docs/CURVED_FEATURES.md §3,
     # §4. A dome (grille cap, rounded boss top) or the spherical blend where three
     # fillets meet is a spherical cap: its facet normals fan out in all directions

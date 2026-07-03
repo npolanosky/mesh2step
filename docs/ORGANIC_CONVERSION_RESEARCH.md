@@ -542,3 +542,47 @@ this automatically, and it remains mesh2step's differentiator.
   (expected yes; smoke-test first).
 - Exact continuity order claimed by US 10,296,664 (G1 vs C²) if Candidate B
   ever grows cross-region stitching.
+
+### Candidate A implementation notes (v0.3.0-alpha; `organic_multipatch`)
+
+The full pipeline shipped as pure-numpy `catmull_clark.py` + `quadremesh.py`
+(BSD `pynanoinstantmeshes`, provisioned optional) and OCC assembly in
+`organic.py`, routed behind `organic_multipatch` by after-analytic RTAF.
+Findings from building + smoke-testing it against ground truth (a coarse quad
+sphere) and the target corpus (`low_poly_cat`, `3x1 Tweezer Mount`):
+
+- **VERIFIED, works:** `pynanoinstantmeshes` imports + runs on macOS arm64
+  cp311 (real wheel), emits **pure-quad, closed, manifold** cages on clean
+  closed inputs (`posy=4`, `deterministic=True`; `vertex_count` is an
+  edge-length target, not a hard cap — it subdivides coarse input). The numpy
+  Catmull-Clark subdivision, limit-stencil projection, cage shrink-wrap fit,
+  and Stam 4×4 regular-quad extraction are all correct: on an R=10 sphere the
+  exact bicubic patches reproduce the radius to **max 0.20 mm (2.0 %), mean
+  0.14 mm (1.4 %)** — the inherent coarse-cage limit-surface approximation.
+  `buildFromPolesMultsKnots` with uniform knots `[0..7]` clamps the domain to
+  the central span, so `bs.toShape()` returns exactly the per-quad patch face.
+- **BLOCKER (OCC/FreeCAD 7.8):** OpenCASCADE **does not reliably sew a network
+  of many independent trimmed B-spline faces into a closed shell**, even when
+  adjacent Stam patches share control rows and their boundary curves sample
+  byte-identically (confirmed at 3 decimals). Two adjacent patches sew fine
+  (the shared edge merges); at scale (~3 000 patches) most edges merge but the
+  extraordinary-vertex caps never re-sew — `makeFilledFace`/planar caps built
+  from the neighbour B-spline edges are not stitched back regardless of sew
+  tolerance (tested to 1.0 mm), `Shape.fix`/ShapeFix, or a STEP write/read
+  round-trip. Result on the ideal sphere: a **single connected shell covering
+  ~92 % of area with ~27 small open EV-region gaps**, ~500 free edges — never a
+  closed solid. This is an OCC B-rep-assembly limitation, not a geometry-math
+  error (the patches are correct and dimensionally honest).
+- **Consequence / current behaviour:** the tier attempts Candidate A on
+  mostly-organic bodies (RTAF ≥ `organic_multipatch_min_residual`) and, because
+  the shell does not close, **declines and keeps the existing output — never
+  regresses.** `low_poly_cat` and `3x1 Tweezer Mount` both keep their prior
+  watertight results (RTAF 0.528 / 0.817). The complete, tested infrastructure
+  is in place for when the closure is unblocked.
+- **Paths to unblock closure (for a follow-up):** (1) build the shell with
+  explicit **shared `TopoDS_Edge` topology** (one edge per cage half-edge,
+  faces referencing it, so no proximity sewing is needed) — needs pcurves on
+  each B-spline face (`Part.Face(surface, wire)` returned area 0 without them);
+  (2) fewer EVs via a vendored **QuadriFlow** cage (its global singularity
+  removal shrinks the cap set); (3) exact-G1 **ACC/Gregory** EV caps that meet
+  the neighbour patches within OCC sew tolerance instead of `makeFilledFace`.

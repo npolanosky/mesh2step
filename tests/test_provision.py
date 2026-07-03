@@ -26,14 +26,17 @@ def test_prep_deps_install_required_and_optional_separately(monkeypatch, tmp_pat
 
     result = provision.ensure_prep_deps("/fake/python", force=True)
 
-    # Two independent pip invocations, one per group.
-    assert len(calls) == 2
+    # Three independent pip invocations, one per group (manifold3d required,
+    # pymeshlab optional, pynanoinstantmeshes for the organic tier).
+    assert len(calls) == 3
     assert any("manifold3d" in " ".join(pkgs) for pkgs in calls)
     assert any("pymeshlab" in " ".join(pkgs) for pkgs in calls)
-    # No single call mixes the required and optional packages (would fail atomically).
+    assert any("pynanoinstantmeshes" in " ".join(pkgs) for pkgs in calls)
+    # No single call mixes package groups (a combined call would fail atomically).
     for pkgs in calls:
         joined = " ".join(pkgs)
         assert not ("manifold3d" in joined and "pymeshlab" in joined)
+        assert not ("manifold3d" in joined and "pynanoinstantmeshes" in joined)
     # manifold3d succeeded, so the deps dir is still returned despite pymeshlab failing.
     assert result == tmp_path
 

@@ -135,9 +135,62 @@ def convert(
         progress("Building faceted solid")
         shape = builder.build_faceted_solid(vertices, faces)
 
+    # Organic multi-patch (Candidate A): when the after-analytic reconstruction is
+    # mostly residual tessellation (a genuinely organic body — a sculpted cat, an
+    # ergonomic handle), attempt a whole-body quad-patch B-spline network that
+    # de-facets the whole surface. STRICT rollback: adopt only when it produces a
+    # watertight solid that LOWERS the RTAF and stays bbox-stable; on any failure
+    # keep the existing reconstruction (never regress). Behind organic_multipatch;
+    # requires the optional remesher (declines gracefully when absent).
+    if method == "reconstructed" and not config.faceted and config.organic_multipatch:
+        try:
+            from . import organic
+
+            # RTAF of the after-analytic reconstruction is the routing signal, and
+            # isn't computed until quality assessment — measure it here so the gate
+            # (and the improvement check) can use it. Computed even on an OPEN
+            # reconstruction: a mostly-faceted open shell is exactly the organic
+            # case (the analytic tiers couldn't claim the body).
+            rtaf_before = stats.get("rtaf")
+            if rtaf_before is None:
+                try:
+                    rtaf_before = builder.compute_rtaf(shape, config).get("rtaf")
+                    stats["rtaf"] = rtaf_before
+                except Exception:  # noqa: BLE001
+                    rtaf_before = None
+            if organic.should_attempt(stats, faces, config):
+                progress("Organic multi-patch: mostly-organic body — attempting "
+                         "whole-body quad-patch reconstruction")
+                org_shape, org_stats = organic.build_organic_shell(
+                    vertices, faces, config, on_progress=progress)
+                stats["organic"] = org_stats
+                if org_shape is not None and _is_solid(org_shape):
+                    rtaf_after = builder.compute_rtaf(org_shape, config).get("rtaf")
+                    org_stats["organic_rtaf"] = rtaf_after
+                    improves = (rtaf_before is None or rtaf_after is None
+                                or rtaf_after < rtaf_before - 1e-4)
+                    bbox_ok = _bbox_stable(shape, org_shape, config)
+                    if improves and bbox_ok:
+                        progress(f"Organic multi-patch: adopted (RTAF "
+                                 f"{rtaf_before} -> {rtaf_after}, "
+                                 f"{org_stats.get('organic_patches')} patches)")
+                        shape = org_shape
+                        method = "organic-multipatch"
+                        stats["rtaf"] = rtaf_after
+                    else:
+                        progress("Organic multi-patch: result did not improve/"
+                                 "stayed bbox-stable — keeping existing output")
+                else:
+                    progress(f"Organic multi-patch: declined "
+                             f"({org_stats.get('organic_reason', 'no solid')}) — "
+                             f"keeping existing output")
+        except Exception as exc:  # noqa: BLE001 - organic tier is best-effort
+            progress(f"Organic multi-patch skipped ({exc})")
+            stats["organic_error"] = str(exc)
+
     # Keep the clean (possibly open) reconstruction so we can also emit it when
     # the watertight version can only be produced with artifacts.
-    clean_shape = shape if method == "reconstructed" else None
+    clean_shape = shape if method in ("reconstructed", "organic-multipatch") else None
     dual = False
     # Set when the boolean back-off ladder already wrote (and re-validated) the
     # adopted solid to ``output_path`` — the final single-file export is skipped.
@@ -469,6 +522,24 @@ def _is_solid(shape) -> bool:
     """True if the shape is a single valid (watertight) solid."""
     solids = getattr(shape, "Solids", [])
     return bool(solids) and solids[0].isValid()
+
+
+def _bbox_stable(before, after, config: ConversionConfig, rel: float = 0.03) -> bool:
+    """True if ``after``'s bounding box matches ``before``'s within ``rel``.
+
+    Guards the organic multi-patch adoption: a quad-remesh + limit surface must
+    reproduce the part's silhouette, not shrink or bloat it. Uses the config's
+    bbox growth guard when tighter."""
+    try:
+        b, a = before.BoundBox, after.BoundBox
+        bd = sorted((b.XLength, b.YLength, b.ZLength), reverse=True)
+        ad = sorted((a.XLength, a.YLength, a.ZLength), reverse=True)
+        tol = rel
+        if config.boolean_max_bbox_growth is not None:
+            tol = max(tol, config.boolean_max_bbox_growth)
+        return all(abs(x - y) <= tol * max(x, 1e-9) for x, y in zip(bd, ad))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _finalize_quality_after_export(stats: dict, reval: dict) -> None:
