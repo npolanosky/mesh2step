@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mesh2step</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%A7%8A%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">mesh2step</span>
+      <span class="tagline">STL mesh → STEP solid · surface &amp; hole reconstruction</span>
+    </div>
+    <nav class="tabs">
+      <button class="navtab active" data-page="convert">Convert</button>
+      <button class="navtab" data-page="corpus">Corpus &amp; history</button>
+    </nav>
+    <div class="meta">
+      <span id="version" class="pill">—</span>
+      <span id="freecad-badge" class="pill pill-warn" title="FreeCAD status">FreeCAD?</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- ===================== CONVERT PAGE ===================== -->
+    <section id="page-convert" class="page active">
+      <div class="convert-grid">
+        <!-- Left: controls -->
+        <div class="panel controls">
+          <div class="card">
+            <h2>1 · Input mesh</h2>
+            <div id="dropzone" class="dropzone">
+              <div class="dz-icon">⤓</div>
+              <div class="dz-text">Drag an STL here, or <label class="link" for="file-input">browse</label></div>
+              <input type="file" id="file-input" accept=".stl" hidden>
+            </div>
+            <div id="mesh-name" class="filename" hidden></div>
+          </div>
+
+          <div class="card">
+            <h2>2 · Units &amp; options</h2>
+            <div class="row">
+              <label for="units">Source units</label>
+              <select id="units">
+                <option value="mm" selected>mm</option>
+                <option value="cm">cm</option>
+                <option value="m">m</option>
+                <option value="in">in</option>
+              </select>
+              <span class="hint">STEP output is always mm</span>
+            </div>
+            <label class="check"><input type="checkbox" id="opt-detect" checked>
+              Detect cylindrical holes / bosses (best-fit radius)</label>
+            <label class="check"><input type="checkbox" id="opt-repair" checked>
+              Repair mesh (fix self-intersections, duplicates, normals)</label>
+            <label class="check"><input type="checkbox" id="opt-closed" checked>
+              Fully closed (guarantee watertight; slower)</label>
+            <label class="check"><input type="checkbox" id="opt-faceted">
+              Faceted only (skip reconstruction)</label>
+            <label class="check"><input type="checkbox" id="opt-savefail">
+              Save failing models for regression testing</label>
+          </div>
+
+          <button id="convert-btn" class="btn-primary" disabled>Convert → STEP</button>
+
+          <div class="card progress-card" id="progress-card" hidden>
+            <div class="progress-head">
+              <span id="status-line" class="status">Ready</span>
+              <span id="elapsed" class="elapsed">0.0s</span>
+            </div>
+            <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+            <div id="verdict" class="verdict" hidden></div>
+            <div class="result-badges" id="result-badges" hidden></div>
+            <div class="result-actions" id="result-actions" hidden>
+              <a id="download-btn" class="btn-secondary" download>Download STEP</a>
+              <button id="flag-btn" class="btn-secondary" title="Flag this watertight result for a future reconstruction pass">Flag for improvement</button>
+            </div>
+          </div>
+
+          <details class="card log-card">
+            <summary>Log</summary>
+            <pre id="log" class="log"></pre>
+          </details>
+        </div>
+
+        <!-- Right: viewer -->
+        <div class="panel viewer-panel">
+          <div class="viewer-toolbar">
+            <div class="seg" id="view-tabs">
+              <button class="seg-btn active" data-view="stl">Input STL</button>
+              <button class="seg-btn" data-view="step" disabled>STEP</button>
+              <button class="seg-btn" data-view="heatmap" disabled>Deviation</button>
+            </div>
+            <div class="seg" id="shade-tabs">
+              <button class="seg-btn active" data-shade="shaded">Shaded</button>
+              <button class="seg-btn" data-shade="edges">Edges</button>
+              <button class="seg-btn" data-shade="wire">Wireframe</button>
+            </div>
+          </div>
+          <div id="viewer" class="viewer">
+            <div id="viewer-empty" class="viewer-empty">Select an STL to preview it here.</div>
+            <div id="scalebar" class="scalebar" hidden>
+              <div class="scalebar-grad"></div>
+              <div class="scalebar-labels"><span id="sb-hi">—</span><span>deviation (mm)</span><span>0</span></div>
+            </div>
+            <div id="dev-stats" class="dev-stats" hidden></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== CORPUS PAGE ===================== -->
+    <section id="page-corpus" class="page">
+      <div class="panel wide">
+        <div class="card">
+          <h2>Conversion history</h2>
+          <div id="history" class="table-wrap"><p class="muted">No conversions yet.</p></div>
+        </div>
+        <div class="card">
+          <h2>Failure corpus</h2>
+          <div class="muted" id="corpus-dest"></div>
+          <div id="corpus" class="table-wrap"><p class="muted">Corpus is empty.</p></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/vendor/three.min.js"></script>
+  <script src="/static/vendor/OrbitControls.js"></script>
+  <script src="/static/viewer.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

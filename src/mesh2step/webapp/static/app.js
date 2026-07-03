@@ -1,0 +1,351 @@
+/* mesh2step-web front-end controller. */
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const api = (path, opts) => fetch(path, opts).then((r) => {
+    if (!r.ok) return r.json().catch(() => ({})).then((e) => { throw new Error(e.detail || r.statusText); });
+    return r;
+  });
+
+  let viewer = null;
+  let selectedFile = null;       // File chosen but not yet converted
+  let currentJob = null;         // active/last job id
+  let jobDone = false;
+  let evtSource = null;
+  let timer = null;
+  const meshCache = {};          // view -> ArrayBuffer for the current job
+
+  // ---- viewer init (lazy, needs a sized container) ---------------------- //
+  function ensureViewer() {
+    if (!viewer) viewer = new Viewer($("viewer"));
+    return viewer;
+  }
+
+  // ---- page nav --------------------------------------------------------- //
+  document.querySelectorAll(".navtab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".navtab").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
+      btn.classList.add("active");
+      $("page-" + btn.dataset.page).classList.add("active");
+      if (btn.dataset.page === "corpus") loadCorpus();
+      if (btn.dataset.page === "convert" && viewer) viewer._resize();
+    });
+  });
+
+  // ---- health ----------------------------------------------------------- //
+  fetch("/api/health").then((r) => r.json()).then((h) => {
+    $("version").textContent = h.version || "";
+    const fb = $("freecad-badge");
+    if (h.freecad_ready) { fb.textContent = "FreeCAD ✓"; fb.classList.remove("pill-warn"); fb.classList.add("pill-ok"); fb.title = h.freecad; }
+    else { fb.textContent = "FreeCAD ✗"; fb.title = "FreeCAD not found — conversions will fail"; }
+    $("opt-savefail").checked = !!h.save_failures;
+  }).catch(() => {});
+
+  $("opt-savefail").addEventListener("change", (e) => {
+    api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ save_failures: e.target.checked }) });
+  });
+
+  // ---- file selection --------------------------------------------------- //
+  const dz = $("dropzone");
+  $("file-input").addEventListener("change", (e) => { if (e.target.files[0]) pickFile(e.target.files[0]); });
+  dz.addEventListener("click", () => $("file-input").click());
+  ["dragover", "dragenter"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
+  ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
+  dz.addEventListener("drop", (e) => { if (e.dataTransfer.files[0]) pickFile(e.dataTransfer.files[0]); });
+
+  function pickFile(f) {
+    if (!f.name.toLowerCase().endsWith(".stl")) { alert("Please choose a .stl file."); return; }
+    selectedFile = f;
+    $("mesh-name").textContent = f.name + "  (" + (f.size / 1024).toFixed(0) + " KB)";
+    $("mesh-name").hidden = false;
+    $("convert-btn").disabled = false;
+    // Reset any prior result view.
+    resetResult();
+    // Preview the input STL immediately by uploading a scratch job? No — we
+    // render the STL client-side from the raw file for instant feedback.
+    previewLocalStl(f);
+  }
+
+  // Parse a binary/ascii STL in the browser for instant input preview.
+  function previewLocalStl(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const blob = stlToM2SM(reader.result);
+        $("viewer-empty").hidden = true;
+        ensureViewer().load(blob, "stl", false);
+        setViewTab("stl");
+        viewer._resize();
+      } catch (err) { console.warn("local STL preview failed:", err); }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // Minimal client-side STL -> M2SM (positions + face normals), binary or ascii.
+  function stlToM2SM(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let tris;
+    const head = String.fromCharCode.apply(null, bytes.slice(0, 5)).toLowerCase();
+    const dv = new DataView(buffer);
+    const isBinaryByCount = buffer.byteLength >= 84 && (84 + 50 * dv.getUint32(80, true) === buffer.byteLength);
+    if (head === "solid" && !isBinaryByCount) {
+      tris = parseAsciiStl(new TextDecoder("latin1").decode(bytes));
+    } else {
+      tris = parseBinaryStl(dv);
+    }
+    return buildM2SM(tris);
+  }
+  function parseBinaryStl(dv) {
+    const n = dv.getUint32(80, true);
+    const tris = new Float32Array(n * 9);
+    let off = 84, o = 0;
+    for (let i = 0; i < n; i++) {
+      off += 12; // skip normal
+      for (let v = 0; v < 9; v++) { tris[o++] = dv.getFloat32(off, true); off += 4; }
+      off += 2; // attr
+    }
+    return tris;
+  }
+  function parseAsciiStl(text) {
+    const nums = [];
+    const re = /vertex\s+(\S+)\s+(\S+)\s+(\S+)/g; let m;
+    while ((m = re.exec(text))) { nums.push(+m[1], +m[2], +m[3]); }
+    return new Float32Array(nums);
+  }
+  function buildM2SM(pos) {
+    const nverts = pos.length / 3;
+    const normals = new Float32Array(pos.length);
+    for (let i = 0; i < nverts; i += 3) {
+      const ax = pos[i*3], ay = pos[i*3+1], az = pos[i*3+2];
+      const bx = pos[i*3+3], by = pos[i*3+4], bz = pos[i*3+5];
+      const cx = pos[i*3+6], cy = pos[i*3+7], cz = pos[i*3+8];
+      let nx = (by-ay)*(cz-az)-(bz-az)*(cy-ay);
+      let ny = (bz-az)*(cx-ax)-(bx-ax)*(cz-az);
+      let nz = (bx-ax)*(cy-ay)-(by-ay)*(cx-ax);
+      const len = Math.hypot(nx, ny, nz) || 1; nx/=len; ny/=len; nz/=len;
+      for (let k = 0; k < 3; k++) { normals[(i+k)*3]=nx; normals[(i+k)*3+1]=ny; normals[(i+k)*3+2]=nz; }
+    }
+    const header = new ArrayBuffer(16);
+    const hv = new DataView(header);
+    hv.setUint8(0,77); hv.setUint8(1,50); hv.setUint8(2,83); hv.setUint8(3,77); // "M2SM"
+    hv.setUint32(4,1,true); hv.setUint32(8,1,true); hv.setUint32(12,nverts,true); // flags=normals
+    const out = new Uint8Array(16 + pos.byteLength + normals.byteLength);
+    out.set(new Uint8Array(header), 0);
+    out.set(new Uint8Array(pos.buffer, pos.byteOffset, pos.byteLength), 16);
+    out.set(new Uint8Array(normals.buffer), 16 + pos.byteLength);
+    return out.buffer;
+  }
+
+  // ---- convert ---------------------------------------------------------- //
+  $("convert-btn").addEventListener("click", () => {
+    if (!selectedFile) return;
+    const options = {
+      source_units: $("units").value,
+      detect_cylinders: $("opt-detect").checked,
+      repair_mesh: $("opt-repair").checked,
+      full_closed: $("opt-closed").checked,
+      faceted: $("opt-faceted").checked,
+    };
+    const fd = new FormData();
+    fd.append("file", selectedFile, selectedFile.name);
+    fd.append("options", JSON.stringify(options));
+    $("convert-btn").disabled = true;
+    resetResult();
+    $("progress-card").hidden = false;
+    setStatus("Uploading…", 2);
+    api("/api/convert", { method: "POST", body: fd })
+      .then((r) => r.json())
+      .then((d) => watchJob(d.id))
+      .catch((err) => { setStatus("Failed: " + err.message, 0); $("convert-btn").disabled = false; });
+  });
+
+  function resetResult() {
+    jobDone = false;
+    for (const k in meshCache) delete meshCache[k];
+    $("verdict").hidden = true;
+    $("result-badges").hidden = true;
+    $("result-actions").hidden = true;
+    $("log").textContent = "";
+    $("scalebar").hidden = true;
+    $("dev-stats").hidden = true;
+    $("view-tabs").querySelectorAll(".seg-btn").forEach((b) => { if (b.dataset.view !== "stl") b.disabled = true; });
+  }
+
+  function setStatus(text, pct) {
+    $("status-line").textContent = text;
+    if (pct != null) $("progress-bar").style.width = pct + "%";
+  }
+  function appendLog(line, cls) {
+    const el = $("log");
+    const span = document.createElement("span");
+    span.className = cls || "";
+    span.textContent = line + "\n";
+    el.appendChild(span); el.scrollTop = el.scrollHeight;
+  }
+
+  function watchJob(id) {
+    currentJob = id;
+    const t0 = Date.now();
+    clearInterval(timer);
+    timer = setInterval(() => { if (!jobDone) $("elapsed").textContent = ((Date.now()-t0)/1000).toFixed(1) + "s"; }, 100);
+    if (evtSource) evtSource.close();
+    evtSource = new EventSource("/api/jobs/" + id + "/events");
+    evtSource.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+      if (ev.type === "snapshot") {
+        setStatus(ev.status || "Working…", ev.progress || 2);
+        (ev.log || []).forEach((l) => appendLog(l.startsWith("PROGRESS:") ? l.slice(9).trim() : l,
+          l.startsWith("PROGRESS:") ? "l-stage" : ""));
+      } else if (ev.type === "progress") {
+        setStatus(ev.message, ev.progress);
+        appendLog(ev.message, "l-stage");
+      } else if (ev.type === "log") {
+        appendLog(ev.message, /error|traceback/i.test(ev.message) ? "l-err" : "");
+      } else if (ev.type === "state" && (ev.state === "done" || ev.state === "failed")) {
+        evtSource.close();
+        finishJob(id, ev.state, ev.error);
+      }
+    };
+    evtSource.onerror = () => { /* SSE auto-reconnects; ignore transient drops */ };
+  }
+
+  function finishJob(id, state, error) {
+    jobDone = true;
+    $("convert-btn").disabled = false;
+    fetch("/api/jobs/" + id).then((r) => r.json()).then((job) => renderResult(job, state, error));
+  }
+
+  function renderResult(job, state, error) {
+    const v = $("verdict");
+    if (state === "failed") {
+      v.className = "verdict problems"; v.textContent = "✖ Conversion failed";
+      v.hidden = false;
+      appendLog(error || "unknown error", "l-err");
+      setStatus("Failed", 100);
+      return;
+    }
+    const s = (job.result && job.result.stats) || {};
+    const quality = s.quality || "good";
+    const label = { good: "✔ GOOD", warnings: "⚠ OK — with warnings", problems: "✖ PROBLEMS" }[quality] || "done";
+    v.className = "verdict " + quality; v.textContent = label; v.hidden = false;
+    setStatus("Done → " + (job.outputs[0] || "step"), 100);
+
+    // Badges: watertight, valid, method, faces, RTAF, timing.
+    const badges = [];
+    badges.push(bdg(s.is_solid ? "watertight ✓" : "not watertight", s.is_solid ? "b-ok" : "b-err"));
+    if (job.result && job.result.method) badges.push(bdg(job.result.method, ""));
+    if (s.faces_out != null) badges.push(bdg("faces " + (s.faces_in||"?") + "→" + s.faces_out, ""));
+    if (s.rtaf != null) badges.push(bdg("RTAF " + (s.rtaf*100).toFixed(0) + "%", s.rtaf >= 0.05 ? "b-warn" : "b-ok"));
+    if (job.elapsed) badges.push(bdg(job.elapsed.toFixed(1) + "s", ""));
+    const bc = $("result-badges"); bc.innerHTML = ""; badges.forEach((b) => bc.appendChild(b)); bc.hidden = false;
+
+    for (const w of (s.warnings || [])) appendLog("⚠ " + w, "l-err");
+
+    // Result actions.
+    $("result-actions").hidden = false;
+    const dl = $("download-btn");
+    dl.href = "/api/jobs/" + job.id + "/download";
+    dl.setAttribute("download", job.outputs[0] || "output.step");
+    $("flag-btn").disabled = !s.is_solid;
+    $("flag-btn").onclick = () => {
+      $("flag-btn").disabled = true;
+      api("/api/jobs/" + job.id + "/flag", { method: "POST" })
+        .then(() => appendLog("Flagged for improvement (faceted_improvable).", "l-ok"))
+        .catch((e) => appendLog("flag failed: " + e.message, "l-err"));
+    };
+
+    // Enable STEP + heatmap viewer tabs.
+    $("view-tabs").querySelectorAll(".seg-btn").forEach((b) => b.disabled = false);
+    loadView("step");  // auto-jump to the converted result
+  }
+  function bdg(text, cls) { const s = document.createElement("span"); s.className = "badge " + (cls||""); s.textContent = text; return s; }
+
+  // ---- viewer tabs ------------------------------------------------------ //
+  $("view-tabs").addEventListener("click", (e) => {
+    const b = e.target.closest(".seg-btn"); if (!b || b.disabled) return;
+    loadView(b.dataset.view);
+  });
+  $("shade-tabs").addEventListener("click", (e) => {
+    const b = e.target.closest(".seg-btn"); if (!b) return;
+    $("shade-tabs").querySelectorAll(".seg-btn").forEach((x) => x.classList.remove("active"));
+    b.classList.add("active");
+    if (viewer) viewer.setShade(b.dataset.shade);
+  });
+  function setViewTab(view) {
+    $("view-tabs").querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  }
+
+  function loadView(view) {
+    setViewTab(view);
+    $("scalebar").hidden = view !== "heatmap";
+    $("dev-stats").hidden = view !== "heatmap";
+    if (view === "stl" && selectedFile && !currentJob) return; // already local-previewed
+    const url = "/api/jobs/" + currentJob + "/mesh/" + view;
+    if (meshCache[view]) { renderMesh(meshCache[view].buf, view, meshCache[view].stats); return; }
+    $("viewer-empty").hidden = true;
+    fetch(url).then((r) => {
+      const stats = r.headers.get("X-Deviation-Stats");
+      return r.arrayBuffer().then((buf) => ({ buf, stats: stats ? JSON.parse(stats) : null }));
+    }).then(({ buf, stats }) => {
+      meshCache[view] = { buf, stats };
+      renderMesh(buf, view, stats);
+    }).catch((err) => appendLog("viewer load failed (" + view + "): " + err.message, "l-err"));
+  }
+
+  function renderMesh(buf, view, stats) {
+    ensureViewer().load(buf, view, false);
+    viewer._resize();
+    if (view === "heatmap" && stats) {
+      $("sb-hi").textContent = stats.clamp.toFixed(3);
+      $("dev-stats").innerHTML =
+        "max " + stats.max.toFixed(4) + " mm<br>" +
+        "rms " + stats.rms.toFixed(4) + " mm<br>" +
+        "p95 " + stats.p95.toFixed(4) + " mm";
+      $("dev-stats").hidden = false;
+    }
+  }
+
+  // ---- corpus + history ------------------------------------------------- //
+  function loadCorpus() {
+    fetch("/api/jobs").then((r) => r.json()).then((d) => renderHistory(d.jobs));
+    fetch("/api/corpus").then((r) => r.json()).then((d) => renderCorpus(d));
+  }
+  function renderHistory(jobs) {
+    const el = $("history");
+    if (!jobs.length) { el.innerHTML = '<p class="muted">No conversions yet.</p>'; return; }
+    let h = "<table><thead><tr><th>File</th><th>State</th><th>Quality</th><th>Watertight</th><th>Method</th><th>Elapsed</th><th></th></tr></thead><tbody>";
+    for (const j of jobs) {
+      const s = (j.result && j.result.stats) || {};
+      h += "<tr><td class='wrap'>" + esc(j.filename) + "</td>" +
+        "<td><span class='tag " + j.state + "'>" + j.state + "</span></td>" +
+        "<td>" + (s.quality || "—") + "</td>" +
+        "<td>" + (s.is_solid == null ? "—" : (s.is_solid ? "✓" : "✗")) + "</td>" +
+        "<td>" + ((j.result && j.result.method) || "—") + "</td>" +
+        "<td>" + (j.elapsed ? j.elapsed.toFixed(1) + "s" : "—") + "</td>" +
+        "<td><button class='btn-secondary' data-rerun='" + j.id + "'>Re-run</button></td></tr>";
+    }
+    el.innerHTML = h + "</tbody></table>";
+    el.querySelectorAll("[data-rerun]").forEach((b) => b.addEventListener("click", () => {
+      api("/api/jobs/" + b.dataset.rerun + "/rerun", { method: "POST" })
+        .then((r) => r.json()).then((d) => { alert("Re-run queued (job " + d.id + ")."); loadCorpus(); });
+    }));
+  }
+  function renderCorpus(d) {
+    $("corpus-dest").textContent = "→ " + d.dest;
+    const el = $("corpus");
+    if (!d.files.length) { el.innerHTML = '<p class="muted">Corpus is empty.</p>'; return; }
+    let h = "<table><thead><tr><th>File</th><th>Category</th><th>Quality</th><th>RTAF</th><th>First seen</th><th class='wrap'>Reason</th></tr></thead><tbody>";
+    for (const f of d.files) {
+      h += "<tr><td class='wrap'>" + esc(f.original_name || f.file) + "</td>" +
+        "<td><span class='tag'>" + esc(f.category || "?") + "</span></td>" +
+        "<td>" + (f.quality || "—") + "</td>" +
+        "<td>" + (f.rtaf != null ? (f.rtaf*100).toFixed(0) + "%" : "—") + "</td>" +
+        "<td>" + esc((f.first_seen || "").slice(0, 10)) + "</td>" +
+        "<td class='wrap muted'>" + esc(f.error || "") + "</td></tr>";
+    }
+    el.innerHTML = h + "</tbody></table>";
+  }
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+})();

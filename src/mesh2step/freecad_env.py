@@ -28,9 +28,12 @@ _CANDIDATE_GLOBS = {
     "linux": [
         "/usr/lib/freecad/lib",
         "/usr/lib/freecad-python3/lib",
+        "/usr/lib/freecad-daily/lib",             # freecad-daily PPA
         "/usr/local/lib/freecad/lib",
         "/opt/freecad*/lib",
-        str(Path.home() / "squashfs-root/usr/lib"),  # extracted AppImage
+        "/snap/freecad/current/usr/lib",           # snap package
+        str(Path.home() / "squashfs-root/usr/lib"),  # extracted AppImage (cwd=$HOME)
+        str(Path.home() / "freecad*/squashfs-root/usr/lib"),  # AppImage extracted in a subdir
     ],
 }
 
@@ -100,12 +103,28 @@ _PYTHON_GLOBS = {
         str(Path.home() / "Applications/FreeCAD*.app/Contents/Resources/bin/python*"),
     ],
     "linux": [
-        "/usr/bin/freecadcmd",
-        "/usr/bin/freecad-python3",
-        "/opt/freecad*/bin/python*",
+        # Interpreters that can run ``python -m mesh2step.worker`` come first:
+        # an extracted AppImage bundles its own python (the ideal worker), and
+        # apt installs use the system python3 with FreeCAD.so on PYTHONPATH
+        # (resolved by freecad_lib_dir). freecadcmd stays as a last resort for
+        # callers that only need *a* FreeCAD marker — it cannot run ``-m``.
         str(Path.home() / "squashfs-root/usr/bin/python*"),
+        str(Path.home() / "freecad*/squashfs-root/usr/bin/python*"),
+        "/opt/freecad*/bin/python*",
+        "/usr/bin/freecad-python3",
+        "/usr/bin/freecadcmd",
     ],
 }
+
+# Debian/Ubuntu apt installs have no bundled interpreter at all: FreeCAD.so is
+# built against the SYSTEM python3 and lives in one of these lib dirs. When one
+# exists, /usr/bin/python3 is a valid worker interpreter (freecad_lib_dir puts
+# the lib dir on PYTHONPATH). Checked only on Linux, only as a fallback.
+_LINUX_SYSTEM_LIB_DIRS = (
+    "/usr/lib/freecad-python3/lib",
+    "/usr/lib/freecad/lib",
+    "/usr/lib/freecad-daily/lib",
+)
 
 
 def find_freecad_python(explicit: str | None = None) -> str | None:
@@ -130,7 +149,27 @@ def find_freecad_python(explicit: str | None = None) -> str | None:
             continue
     for c in candidates:
         if c.is_file():
+            # freecadcmd cannot run ``-m`` worker jobs; prefer the system
+            # python3 when an apt-style FreeCAD library dir exists (Linux).
+            if sys.platform.startswith("linux") and c.name == "freecadcmd":
+                sys_py = _linux_system_python()
+                if sys_py:
+                    return sys_py
             return str(c)
+    if sys.platform.startswith("linux"):
+        return _linux_system_python()
+    return None
+
+
+def _linux_system_python() -> str | None:
+    """``/usr/bin/python3`` if an apt-style FreeCAD library dir exists, else None.
+
+    Guarded by the lib-dir check so a FreeCAD-less system python is never
+    offered as a worker interpreter.
+    """
+    py = Path("/usr/bin/python3")
+    if py.is_file() and any(Path(d).is_dir() for d in _LINUX_SYSTEM_LIB_DIRS):
+        return str(py)
     return None
 
 
@@ -160,6 +199,15 @@ def freecad_lib_dir(freecad_python: str | None) -> str | None:
                 return str(d)
         except OSError:
             continue
+    # Linux apt installs: the worker interpreter is the system python3, whose
+    # exe-relative dirs never contain FreeCAD.so — probe the known apt lib dirs.
+    if sys.platform.startswith("linux"):
+        for d in _LINUX_SYSTEM_LIB_DIRS:
+            try:
+                if (Path(d) / "FreeCAD.so").is_file():
+                    return d
+            except OSError:
+                continue
     # Fall back to the sibling lib/ if it exists even without a probed extension
     # (unusual layouts); better than nothing so the worker can still try.
     lib = exe.parent.parent / "lib"

@@ -32,6 +32,11 @@ viewer = ["pyvista>=0.43"]          # STL/STEP overlay + deviation heatmap
 # Install into *FreeCAD's* Python (that's where the conversion worker runs):
 #   & "C:/Program Files/FreeCAD 1.1/bin/python.exe" -m pip install pymeshlab manifold3d
 prep = ["pymeshlab>=2023.12", "manifold3d>=3.0"]
+# Local web app (mesh2step-web): FastAPI + uvicorn. The web process itself never
+# imports FreeCAD — it drives the same worker subprocess the GUI does. three.js
+# is vendored into the package (webapp/static/vendor), so there is no npm/JS
+# build step: `pip install ".[web]"` then `mesh2step-web` is all that's needed.
+web = ["fastapi>=0.110", "uvicorn>=0.23", "python-multipart>=0.0.9"]
 
 [project.urls]
 Homepage = "https://github.com/npolanosky/mesh2step"
@@ -40,12 +45,18 @@ Issues = "https://github.com/npolanosky/mesh2step/issues"
 [project.scripts]
 mesh2step = "mesh2step.cli:main"
 mesh2step-view = "mesh2step.viewer:main"
+mesh2step-web = "mesh2step.webapp.server:main"
 
 [project.gui-scripts]
 mesh2step-gui = "mesh2step.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Ship the web UI assets (HTML/CSS/JS + vendored three.js) inside the wheel so
+# `pip install ".[web]"` gives a fully self-contained, offline app.
+[tool.setuptools.package-data]
+"mesh2step.webapp" = ["static/*", "static/vendor/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
