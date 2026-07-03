@@ -19,12 +19,15 @@ import numpy as np
 from .config import ConversionConfig
 from .boundary import _chain_loops, _directed_boundary_edges
 from .segmentation import (
+    FreeformRegion,
     MeshResolution,
     Region,
     SweptRegion,
     build_edge_adjacency,
     face_normals_and_areas,
     mesh_resolution,
+    sample_freeform_grid,
+    segment_freeform_sheets,
 )
 
 
@@ -1906,3 +1909,97 @@ def detect_spheres(
             spheres.append(sph)
             claimed.update(sph.face_indices)
     return spheres
+
+
+# --------------------------------------------------------------------------- #
+# Freeform B-spline sheets (Candidate B). Region selection + (u,v) grid sampling
+# live here + in segmentation (pure numpy); the OCC B-spline approximation and
+# boolean integration live in the builder (the only FreeCAD-touching steps), per
+# the project's FreeCAD-free-until-emission rule.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class FreeformSheet:
+    """A doubly-curved height-field region sampled into a (u,v) grid, ready for
+    OCC B-spline approximation + guarded boolean integration in the builder.
+
+    ``grid`` is an ``(ng, ng, 3)`` array of 3D sample points over the region's
+    footprint; ``axis`` the injective projection direction (facet normals sit on
+    its +side). ``dev_tol`` is the resolution-scaled deviation the fitted sheet
+    must meet against ``face_indices``' facets. ``missing`` is the fraction of
+    grid cells that fell outside the footprint (filled by nearest-centroid
+    height) — a quality signal.
+    """
+
+    grid: np.ndarray
+    axis: np.ndarray
+    face_indices: list[int]
+    area: float
+    curvature: float
+    foldover: float
+    missing: float
+    dev_tol: float
+
+    def as_dict(self) -> dict:
+        return {
+            "facets": len(self.face_indices),
+            "area": round(float(self.area), 1),
+            "curvature": round(float(self.curvature), 3),
+            "foldover": round(float(self.foldover), 3),
+            "grid": int(self.grid.shape[0]),
+            "missing": round(float(self.missing), 3),
+            "axis": [round(float(x), 3) for x in self.axis],
+        }
+
+
+def fit_freeform_sheets(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    claimed: set[int],
+    config: ConversionConfig | None = None,
+    resolution: MeshResolution | None = None,
+) -> list[FreeformSheet]:
+    """Detect residual doubly-curved height-field regions and sample each into a
+    (u,v) grid for B-spline fitting. Pure numpy; no FreeCAD.
+
+    Returns a :class:`FreeformSheet` per region that (a) passes the injectivity
+    /curvature/area gates in :func:`segment_freeform_sheets` and (b) samples
+    into a non-degenerate grid. The builder approximates the grid to a B-spline
+    face and integrates it via a guarded boolean, adopting only when the result
+    is watertight, bbox-stable, and lowers RTAF. Best-effort: any failure yields
+    no sheets and leaves the region faceted (never raises)."""
+    config = config or ConversionConfig()
+    if not config.fit_freeform_sheets:
+        return []
+    if resolution is None:
+        resolution = mesh_resolution(vertices, faces, config)
+    regions: list[FreeformRegion] = segment_freeform_sheets(
+        vertices, faces, claimed, config)
+    ng = int(config.freeform_grid)
+    out: list[FreeformSheet] = []
+    for region in regions:
+        sampled = sample_freeform_grid(vertices, faces, region, ng)
+        if sampled is None:
+            continue
+        grid, missing = sampled
+        # Too many footprint misses => a ragged / non-rectangular region whose
+        # grid is mostly fabricated; leave it faceted.
+        if missing > config.freeform_max_missing:
+            continue
+        edge = resolution.edge_for(region.face_indices)
+        dev_tol = max(config.freeform_dev_tol_abs,
+                      config.freeform_dev_tol_rel * edge)
+        out.append(
+            FreeformSheet(
+                grid=grid,
+                axis=region.axis,
+                face_indices=region.face_indices,
+                area=region.area,
+                curvature=region.curvature,
+                foldover=region.foldover,
+                missing=missing,
+                dev_tol=dev_tol,
+            )
+        )
+    return out

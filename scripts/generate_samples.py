@@ -259,11 +259,67 @@ def domed_plate():
     )
 
 
+def freeform_bump():
+    """A plate whose top is a doubly-curved sinusoidal bump — ground truth for
+    Candidate B (freeform B-spline sheet). z = amp*sin(0.3x)*cos(0.25y) over a
+    40x40 footprint on a slab; the surface curves in BOTH parametric directions
+    (not a cylinder, cone, sphere, or constant-cross-section sweep), so only a
+    fitted B-spline sheet can reproduce it. Tessellation shatters it into a fan
+    of thin planar strips (high RTAF); the freeform detector must collapse that
+    fan into one analytic B-spline face (RTAF -> ~0, deviation < tol).
+
+    Built by lofting the bump's isocurves into a B-spline face, then making a
+    solid between that top and a flat base with vertical side walls.
+    """
+    import math
+
+    span = 40.0
+    amp = 3.0
+    base_z = 0.0
+    mid = 6.0  # mean height of the bump top above the base
+
+    def zf(x, y):
+        return amp * math.sin(x * 0.3) * math.cos(y * 0.25) + mid
+
+    # Loft isocurves (one B-spline curve per x-row) into the top B-spline face.
+    nu = 24
+    xs = [span * i / (nu - 1) for i in range(nu)]
+    ys = [span * j / (nu - 1) for j in range(nu)]
+    curves = []
+    for x in xs:
+        pts = [App.Vector(x, y, zf(x, y)) for y in ys]
+        c = Part.BSplineCurve()
+        c.interpolate(pts)
+        curves.append(c.toShape())
+    top = Part.makeLoft(curves, False, True)  # smooth loft, not a solid
+    top_face = top.Faces[0] if top.Faces else top
+
+    # Thin plate: a short box (top well above the bump's peak) with the bump
+    # carved out of its top by cutting the half-space above the top face. The
+    # box is only as tall as the bump peak + margin, so the side walls are a
+    # thin rim (not a tall block that would dwarf the curved top).
+    top_of_box = mid + amp + 2.0
+    box = Part.makeBox(span, span, top_of_box - base_z, App.Vector(0, 0, base_z))
+    tool = top_face.extrude(App.Vector(0, 0, top_of_box + 5.0))
+    part = box.cut(tool).removeSplitter()
+    if not (part.Solids and part.Solids[0].isValid()):
+        raise RuntimeError("freeform_bump: could not build a valid solid")
+    return save(
+        part,
+        "freeform_bump",
+        {"kind": "freeform_bump",
+         "dims_mm": [span, span, round(mid + amp - base_z, 3)],
+         "cylinders": [], "spheres": [],
+         "freeform": {"amp": amp, "span": span,
+                      "form": "amp*sin(0.3x)*cos(0.25y)+6"}},
+    )
+
+
 def main():
     print(f"Writing samples to {OUT} (deflection={DEFLECTION} mm)")
     truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe(),
               countersink_plate(), angled_hole_plate(), fillet_chamfer_plate(),
-              swept_wavy_wall(), domed_plate()]
+              swept_wavy_wall(), domed_plate(), freeform_bump()]
     (OUT / "samples.json").write_text(json.dumps(truths, indent=2))
     print(f"Wrote {len(truths)} samples + samples.json")
 

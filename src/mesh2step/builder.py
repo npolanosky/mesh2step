@@ -25,6 +25,7 @@ from .fitting import (
     detect_fillets_straight,
     detect_spheres,
     detect_swept_walls,
+    fit_freeform_sheets,
     sphere_consensus_regions,
 )
 from .segmentation import (
@@ -626,6 +627,170 @@ def _boolean_clean_swept(solid, profile: SweptProfile, seg, Part):
     return _guarded_cut(solid, tool, max_removed_frac=0.5)
 
 
+def _freeform_sheet_surface(sheet, Part):
+    """Approximate a freeform sheet's (u,v) grid to a ``Part.BSplineSurface``.
+
+    C1 / degree-3 with centripetal parametrisation — the robust regime: C2 /
+    degree-5 explodes catastrophically on mesh-sampled (noisy) grids (poles
+    blow up, deviation → millions). Tightens the tolerance progressively and
+    REJECTS a fit whose pole count saturates near the grid size (a signal the
+    approximation couldn't hit tolerance and merely interpolated mesh noise).
+    Also rejects a fit whose max deviation to the region facets exceeds the
+    sheet's resolution-scaled tolerance. Returns the surface or ``None``.
+    """
+    import FreeCAD  # type: ignore
+
+    ng = sheet.grid.shape[0]
+    pts = [[FreeCAD.Vector(*sheet.grid[i, j]) for j in range(sheet.grid.shape[1])]
+           for i in range(ng)]
+    surf = None
+    for tol in (sheet.dev_tol, 2.0 * sheet.dev_tol, 4.0 * sheet.dev_tol):
+        cand = Part.BSplineSurface()
+        try:
+            cand.approximate(Points=pts, DegMin=3, DegMax=3, Tolerance=float(tol),
+                             Continuity=1, ParamType="Centripetal")
+        except Exception:  # noqa: BLE001 - OCC "Surface not done" etc.
+            continue
+        if cand.NbUPoles >= ng - 1 or cand.NbVPoles >= ng - 1:
+            continue  # pole saturation — interpolated, not approximated
+        surf = cand
+        break
+    if surf is None:
+        return None
+    return surf
+
+
+def _freeform_sheet_deviation(surf, grid, stride: int = 2) -> float:
+    """Max distance from the sampled grid points to the fitted B-spline surface.
+
+    Uses each grid point's nearest projection on the surface (parameter search),
+    so it measures how well the sheet reproduces the resampled mesh heights.
+    Subsamples the grid by ``stride`` (the fit is smooth; every other point is
+    a faithful deviation estimate) to keep the parameter search cheap."""
+    import FreeCAD  # type: ignore
+
+    ng = grid.shape[0]
+    worst = 0.0
+    for i in range(0, ng, stride):
+        for j in range(0, ng, stride):
+            p = FreeCAD.Vector(*grid[i, j])
+            try:
+                u, v = surf.parameter(p)
+                q = surf.value(u, v)
+                d = float((q - p).Length)
+            except Exception:  # noqa: BLE001
+                continue
+            if d > worst:
+                worst = d
+    return worst
+
+
+def _boolean_clean_freeform(solid, sheet, surf, Part):
+    """Replace a faceted doubly-curved region with the analytic B-spline sheet
+    via a guarded boolean, following the M4 cut/fuse pattern.
+
+    The sheet is oversized (sampled slightly past the region footprint) so its
+    boundary falls in empty space and the boolean itself clips it against the
+    surrounding walls — no analytic-vs-mesh edge matching needed. The tool is
+    the half-space on the +axis side of the sheet (extruded a bounding-diagonal
+    along ``axis``); CUTTING it removes the faceted overshoot outside the true
+    surface. A guarded fuse of the −axis half-space (clipped to the base
+    footprint) would add the sliver in troughs, but the cut alone lands the
+    analytic face and is the robust op; the caller adopts only if it validates
+    and improves RTAF. Raises on any failure so ``_try_boolean_step`` reverts.
+    """
+    import FreeCAD  # type: ignore
+
+    face = surf.toShape()
+    if not face.isValid() or face.Area <= 0.0:
+        raise ValueError("freeform sheet face invalid")
+    bb = solid.BoundBox
+    diag = math.sqrt(bb.XLength ** 2 + bb.YLength ** 2 + bb.ZLength ** 2) or 1.0
+    axis = np.asarray(sheet.axis, float)
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    tool = face.extrude(FreeCAD.Vector(*(axis * diag)))
+    if not getattr(tool, "Solids", []):
+        raise ValueError("freeform tool is not a solid")
+    result = solid.cut(tool)
+    solids = getattr(result, "Solids", [])
+    if len(solids) != 1 or not solids[0].isValid():
+        raise ValueError("freeform cut did not yield one valid solid")
+    # The cut must actually plant the analytic sheet as B-spline face(s).
+    n_before = sum(1 for f in solid.Faces if "BSpline" in f.Surface.TypeId)
+    n_after = sum(1 for f in result.Faces if "BSpline" in f.Surface.TypeId)
+    if n_after <= n_before:
+        raise ValueError("freeform cut planted no B-spline face")
+    return result
+
+
+def _apply_freeform_sheets(solid, sheets, config, Part, progress):
+    """Integrate freeform B-spline sheets into a valid solid, adopting each only
+    when it validates, stays bbox-stable, and LOWERS the RTAF (never trades a
+    faceted strip fan for something worse). Returns ``(solid, attempted, built)``.
+
+    Every op goes through ``_try_boolean_step`` (reverts on invalidity), plus a
+    per-op RTAF check: the whole point is de-faceting, so an op that doesn't
+    reduce residual tessellation is rolled back. Bounded by a base-face cost
+    ceiling (the boolean of a doubly-curved sheet is O(base_faces))."""
+    if not sheets:
+        return solid, 0, 0
+    limit = config.freeform_max_base_faces
+    try:
+        base_faces = len(solid.Faces)
+    except Exception:  # noqa: BLE001
+        base_faces = 0
+    if limit is not None and base_faces > limit:
+        progress(f"  freeform sheets skipped: base {base_faces} faces > "
+                 f"ceiling {limit} (left faceted)")
+        return solid, len(sheets), 0
+    # Each boolean cut is O(base_faces) (seconds on a dense shell); cap the
+    # number of attempts and try the largest-area sheets first, so a part with
+    # many small doomed candidates can't spend minutes on rejected attempts.
+    sheets = sorted(sheets, key=lambda s: -s.area)[:config.freeform_max_ops]
+    bbox_guard = config.boolean_max_bbox_growth
+    built = 0
+    attempted = 0
+    # RTAF only changes after a *successful* op, so cache it and refresh on adopt
+    # (compute_rtaf is O(faces·edges) — do not pay it per rejected attempt).
+    try:
+        rtaf_before = compute_rtaf(solid, config).get("rtaf")
+    except Exception:  # noqa: BLE001
+        rtaf_before = None
+    for sheet in sheets:
+        attempted += 1
+        surf = _freeform_sheet_surface(sheet, Part)
+        if surf is None:
+            continue
+        dev = _freeform_sheet_deviation(surf, sheet.grid)
+        if dev > sheet.dev_tol * 1.5:
+            progress(f"  freeform sheet rejected: deviation {dev:.2f} mm > "
+                     f"tol {sheet.dev_tol:.2f} ({len(sheet.face_indices)} facets)")
+            continue
+        candidate, ok = _try_boolean_step(
+            solid, lambda s, sh=sheet, sf=surf: _boolean_clean_freeform(s, sh, sf, Part),
+            max_bbox_growth=bbox_guard)
+        if not ok:
+            continue
+        # RTAF-improvement gate: adopt only if the sheet actually de-facets.
+        rtaf_after = None
+        if rtaf_before is not None:
+            try:
+                rtaf_after = compute_rtaf(candidate, config).get("rtaf")
+            except Exception:  # noqa: BLE001
+                rtaf_after = None
+            if rtaf_after is not None and rtaf_after >= rtaf_before - 1e-4:
+                progress(f"  freeform sheet reverted: RTAF {rtaf_before:.3f} -> "
+                         f"{rtaf_after:.3f} (no improvement)")
+                continue
+        solid = candidate
+        if rtaf_after is not None:
+            rtaf_before = rtaf_after
+        built += 1
+        progress(f"  freeform sheet built ({len(sheet.face_indices)} facets, "
+                 f"area {sheet.area:.0f}, dev {dev:.2f} mm)")
+    return solid, attempted, built
+
+
 def build_reconstructed_solid(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -686,6 +851,28 @@ def build_reconstructed_solid(
 
     progress("Segmenting planar regions")
     regions = segment_planar(vertices, faces_sub, config)
+
+    # Freeform B-spline sheets (Candidate B): residual doubly-curved height-field
+    # regions, detected BEFORE swept walls so a doubly-curved shell's rows are
+    # attributed to a sheet rather than mis-fit as constant-cross-section swept
+    # strips. The double-curvature gate keeps single-curvature walls out, so this
+    # never steals a legitimate sweep. Detection uses a snapshot ``claimed`` so
+    # the sew tier still BUILDS + sews the strips (that closes the shell); once
+    # the solid is closed and valid, the boolean sheet ops true them into one
+    # analytic face — exactly how swept/sphere ops already work here. The swept
+    # ops and freeform ops both run post-close, guarded and RTAF-gated, so a
+    # region claimed by both simply keeps whichever op improves it and reverts
+    # the other; no explicit hand-off is needed in this tier.
+    freeform_sheets = []
+    if config.fit_freeform_sheets:
+        try:
+            freeform_sheets = fit_freeform_sheets(vertices, faces, claimed, config)
+        except Exception as exc:  # noqa: BLE001 - detection is best-effort
+            progress(f"Freeform sheet detection skipped ({exc})")
+            freeform_sheets = []
+        if freeform_sheets:
+            progress(f"Found {len(freeform_sheets)} freeform sheet region(s) "
+                     f"({sum(len(s.face_indices) for s in freeform_sheets)} facets)")
 
     # Swept/extruded curved walls (M4): fit profiles for chains of thin strips
     # perpendicular to a common extrusion direction. The strips are still built
@@ -819,6 +1006,20 @@ def build_reconstructed_solid(
             solids = getattr(shape, "Solids", [])
             is_solid = bool(solids) and solids[0].isValid()
 
+    # Freeform B-spline sheets (Candidate B): last, on a valid closed solid.
+    freeform_ops = 0
+    freeform_ok = 0
+    if is_solid and freeform_sheets:
+        shape, freeform_ops, freeform_ok = _apply_freeform_sheets(
+            shape, freeform_sheets, config, Part, progress)
+        if freeform_ok:
+            backup = shape.copy()
+            simplified = _safe_remove_splitter(shape, Part)
+            shape = simplified if _is_valid_solid(simplified) else backup
+            progress(f"  freeform sheets built {freeform_ok}/{freeform_ops}")
+            solids = getattr(shape, "Solids", [])
+            is_solid = bool(solids) and solids[0].isValid()
+
     stats = {
         "faces_in": int(len(faces)),
         "planar_faces": reconstructed,
@@ -844,6 +1045,9 @@ def build_reconstructed_solid(
         "swept_arc_ops": swept_ops,
         "swept_tangency_snaps": sum(p.tangency_snaps for p in swept_profiles),
         "swept_detail": [p.as_dict() for p in swept_profiles],
+        "freeform_sheets_detected": len(freeform_sheets),
+        "freeform_sheets_built": freeform_ok,
+        "freeform_detail": [s.as_dict() for s in freeform_sheets],
         "skipped_facets": skipped,
         "is_solid": is_solid,
     }
@@ -1497,6 +1701,25 @@ def build_boolean_clean_solid(
     for s in spheres:
         claimed.update(s.face_indices)
 
+    # Freeform B-spline sheets (Candidate B): genuinely doubly-curved
+    # height-field regions. Detected BEFORE swept walls (which would otherwise
+    # mis-claim a doubly-curved shell's rows as constant-cross-section strips —
+    # the double-curvature gate keeps single-curvature walls out, so this never
+    # steals a legitimate sweep). Facets claimed here are removed from the swept
+    # pool. Integrated by a guarded boolean below.
+    freeform_sheets = []
+    if config.fit_freeform_sheets:
+        try:
+            freeform_sheets = fit_freeform_sheets(vertices, faces, claimed, config)
+        except Exception as exc:  # noqa: BLE001 - detection is best-effort
+            progress(f"Freeform sheet detection skipped ({exc})")
+            freeform_sheets = []
+        for sh in freeform_sheets:
+            claimed.update(sh.face_indices)
+        if freeform_sheets:
+            progress(f"Found {len(freeform_sheets)} freeform sheet region(s) "
+                     f"({sum(len(s.face_indices) for s in freeform_sheets)} facets)")
+
     # Swept/extruded curved walls (M4), after fillets in the detector ladder.
     # Fitted on the facets no other detector claimed; each arc segment becomes a
     # boolean lens op (cut/fuse) against the faceted base below.
@@ -1642,8 +1865,22 @@ def build_boolean_clean_solid(
             sphere_ok += ok
         progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
 
-    total = len(cylinders) + len(cones) + len(fillets) + len(spheres) + swept_ops
-    cleaned = cyl_ok + cone_ok + fillet_ok + sphere_ok + swept_ok
+    # Freeform B-spline sheets (Candidate B): last, on a valid solid, each
+    # adopted only if it validates, stays bbox-stable, and lowers RTAF.
+    freeform_ops = 0
+    freeform_ok = 0
+    if freeform_sheets and _is_valid_solid(solid):
+        solid, freeform_ops, freeform_ok = _apply_freeform_sheets(
+            solid, freeform_sheets, config, Part, progress)
+        if freeform_ok:
+            backup = solid.copy()
+            simplified = _safe_remove_splitter(solid, Part)
+            solid = simplified if _is_valid_solid(simplified) else backup
+            progress(f"  freeform sheets built {freeform_ok}/{freeform_ops}")
+
+    total = (len(cylinders) + len(cones) + len(fillets) + len(spheres)
+             + swept_ops + freeform_ops)
+    cleaned = cyl_ok + cone_ok + fillet_ok + sphere_ok + swept_ok + freeform_ok
     progress(f"Boolean clean-up: {cleaned}/{total} features replaced with analytic geometry "
              f"({total - cleaned} left faceted)")
 
@@ -1680,6 +1917,9 @@ def build_boolean_clean_solid(
         "swept_tangency_snaps": sum(p.tangency_snaps for p in swept_profiles),
         "swept_slivers_removed": slivers_removed,
         "swept_detail": [p.as_dict() for p in swept_profiles],
+        "freeform_sheets_detected": len(freeform_sheets),
+        "freeform_sheets_built": freeform_ok,
+        "freeform_detail": [s.as_dict() for s in freeform_sheets],
         "boolean_cleaned": cleaned,
         "boolean_failed": total - cleaned,
         "artifact_free": artifact_free,

@@ -538,3 +538,342 @@ def segment_swept_walls(
             )
         )
     return sweeps
+
+
+# --------------------------------------------------------------------------- #
+# Freeform sheet regions (Candidate B, docs/ORGANIC_CONVERSION_RESEARCH.md). The
+# residual after all analytic + swept + sphere detectors is dominated, on some
+# parts, by genuinely doubly-curved regions (an ergonomic shell, a curved lid,
+# a camera-adapter panel) that no analytic fit and no constant-cross-section
+# sweep claims. Where such a region is a *height field* — injective under a
+# projection axis (its facet normals all sit on one side of the axis, no
+# foldover) — it can be resampled on a (u,v) grid and fitted with a single
+# trimmed B-spline face.
+#
+# Region growth (the key to injectivity): fix a projection axis from a seed
+# facet's normal and grow across smooth dihedral steps, admitting a neighbour
+# only while its normal stays on the +axis side (n·axis > tol). The axis is
+# refreshed to the region's running mean normal so the patch can follow gentle
+# curvature further, but the +side test guarantees the grown region never wraps
+# past its own silhouette (which would fold over under projection). Strongly
+# doubly-curved surfaces that wrap past a silhouette (a closed organic blob)
+# simply fragment into several injective patches or are rejected by the final
+# foldover gate — never mis-fit as one multivalued sheet.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class FreeformRegion:
+    """A residual doubly-curved height-field region to fit as one B-spline sheet.
+
+    ``axis`` is the injective projection direction (facet normals sit on its
+    +side); the profile grid lives in the plane perpendicular to it. ``e1``,
+    ``e2`` are the in-plane basis, ``origin`` the grid origin. ``curvature`` is
+    the region's peak-to-peak height variation about its mean plane (mm) — the
+    doubly-curved signal that separates a genuine freeform sheet from a flat
+    strip that happens to be residual. ``foldover`` is the injectivity defect
+    (area fraction of facets facing away from ``axis``; ~0 for a clean field).
+    """
+
+    face_indices: list[int]
+    axis: np.ndarray
+    e1: np.ndarray
+    e2: np.ndarray
+    origin: np.ndarray
+    area: float
+    curvature: float
+    foldover: float
+
+    @property
+    def size(self) -> int:
+        return len(self.face_indices)
+
+
+def _axis_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """A right-handed in-plane basis (e1, e2) perpendicular to ``axis``."""
+    t = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = np.cross(axis, t)
+    e1 = e1 / (np.linalg.norm(e1) or 1.0)
+    e2 = np.cross(axis, e1)
+    return e1, e2
+
+
+def segment_freeform_sheets(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    claimed: set[int],
+    config: ConversionConfig | None = None,
+) -> list[FreeformRegion]:
+    """Group unclaimed residual facets into doubly-curved height-field regions.
+
+    Pure numpy. Grows injective (single-valued) regions via adaptive-axis
+    height-field growth, then keeps only regions that are (a) large enough
+    (``freeform_min_facets`` / ``freeform_min_area``), (b) genuinely
+    doubly-curved (peak-to-peak height about the mean plane exceeds a
+    resolution-scaled floor — a flat residual strip is left to the planar path),
+    and (c) injective (foldover below ``freeform_max_foldover``). Everything
+    else is left faceted (no regression).
+    """
+    config = config or ConversionConfig()
+    n_faces = len(faces)
+    if n_faces == 0:
+        return []
+    normals, areas = face_normals_and_areas(vertices, faces)
+    adjacency = build_edge_adjacency(faces)
+    nbr: list[list[int]] = [[] for _ in range(n_faces)]
+    for incident in adjacency.values():
+        if len(incident) == 2:
+            nbr[incident[0]].append(incident[1])
+            nbr[incident[1]].append(incident[0])
+
+    cos_flat = config.angle_tol_cos
+    cos_sharp = float(np.cos(np.radians(config.curve_max_deg)))
+    ndot_tol = float(config.freeform_ndot_tol)
+    unclaimed = [i for i in range(n_faces) if i not in claimed]
+
+    # Only CURVED facets seed a region: a facet with at least one smooth-step
+    # neighbour (a curved surface), not a flat-wall facet (all neighbours
+    # coplanar). Seeding from a flat wall grows a 2-facet stub and fragments the
+    # pool; seeding from the curved surface lets the height field span it. Among
+    # curved seeds, largest area first for stable growth.
+    def is_curved_seed(i: int) -> bool:
+        ni = normals[i]
+        for y in nbr[i]:
+            if y in claimed:
+                continue
+            d = float(np.clip(abs(ni @ normals[y]), 0.0, 1.0))
+            if cos_sharp < d < cos_flat:
+                return True
+        return False
+
+    seeds_pool = [i for i in unclaimed if is_curved_seed(i)]
+    order = sorted(seeds_pool, key=lambda i: -float(areas[i]))
+    assigned: set[int] = set()
+    out: list[FreeformRegion] = []
+
+    res = mesh_resolution(vertices, faces, config)
+
+    def grow_from(seed: int, axis0: np.ndarray, blocked: set[int]) -> list[int]:
+        """Flood from ``seed`` across smooth steps, admitting a neighbour only
+        while its normal stays on the +``axis0`` side (n·axis0 ≥ ndot_tol). The
+        axis is FIXED for the pass (not drifting), so the region is a genuine
+        height field about ``axis0`` and cannot wander onto a perpendicular
+        face. ``blocked`` are facets already owned by other regions."""
+        comp = [seed]
+        local = {seed}
+        stack = [seed]
+        while stack:
+            x = stack.pop()
+            for y in nbr[x]:
+                if y in local or y in blocked or y in claimed:
+                    continue
+                d = float(np.clip(abs(normals[x] @ normals[y]), 0.0, 1.0))
+                if d <= cos_sharp:
+                    continue
+                if float(normals[y] @ axis0) < ndot_tol:
+                    continue
+                local.add(y)
+                comp.append(y)
+                stack.append(y)
+        return comp
+
+    for seed in order:
+        if seed in assigned:
+            continue
+        # Iterate growth to convergence: seed the axis from the seed normal, grow
+        # a height field, refresh the axis to the region's area-weighted mean
+        # normal, and re-grow — twice. A fixed axis per pass keeps each region a
+        # true height field (no wander), while the refresh lets the axis settle
+        # on the surface's real facing (Z for a bump top) rather than the tilted
+        # seed facet. Converges the region to the maximal field around the seed.
+        axis = normals[seed].astype(float).copy()
+        comp = grow_from(seed, axis, assigned)
+        for _ in range(2):
+            fa0 = np.array(comp, dtype=int)
+            mn0 = (normals[fa0] * areas[fa0][:, None]).sum(axis=0)
+            nmn = float(np.linalg.norm(mn0))
+            if nmn < 1e-6:
+                break
+            new_axis = mn0 / nmn
+            if float(new_axis @ axis) > 0.9995:
+                break
+            axis = new_axis
+            comp = grow_from(seed, axis, assigned)
+        for c in comp:
+            assigned.add(c)
+
+        if len(comp) < config.freeform_min_facets:
+            # Release the small component's members (except the seed, to avoid
+            # re-seeding it) so its facets can join a neighbouring region.
+            for c in comp:
+                if c != seed:
+                    assigned.discard(c)
+            continue
+
+        fa = np.array(comp, dtype=int)
+        area = float(areas[fa].sum())
+        if area < config.freeform_min_area:
+            for c in comp:
+                if c != seed:
+                    assigned.discard(c)
+            continue
+
+        # Projection axis = the region's AREA-WEIGHTED MEAN NORMAL. This is the
+        # natural height-field direction (the surface's average facing); using
+        # the eigenvector of minimum normal-scatter instead can tilt the axis to
+        # graze the surface and manufacture a spurious one-directional bend. The
+        # foldover under the mean-normal axis is then the honest injectivity
+        # measure for this projection.
+        n = normals[fa]
+        ar = areas[fa]
+        tot = float(ar.sum())
+        mn = (n * ar[:, None]).sum(axis=0)
+        na = float(np.linalg.norm(mn))
+        if na < 1e-6:
+            continue
+        axis = mn / na
+        # Drop stragglers whose normal is near-perpendicular to the mean axis (a
+        # side wall the growth reached over a smooth edge): they are not part of
+        # this height field and would corrupt its curvature/extent. Recompute the
+        # axis once from the trimmed set for stability.
+        keep_mask = (n @ axis) >= ndot_tol
+        if keep_mask.sum() < config.freeform_min_facets:
+            continue
+        fa = fa[keep_mask]
+        n = normals[fa]
+        ar = areas[fa]
+        tot = float(ar.sum())
+        mn = (n * ar[:, None]).sum(axis=0)
+        na = float(np.linalg.norm(mn))
+        if na < 1e-6:
+            continue
+        axis = mn / na
+        dots = n @ axis
+        best_fold = float(ar[dots < -0.05].sum()) / tot if tot > 0 else 1.0
+        if best_fold > config.freeform_max_foldover:
+            continue
+
+        e1, e2 = _axis_basis(axis)
+        pts = vertices[faces[fa]].reshape(-1, 3)
+        origin = pts.mean(axis=0)
+        # Height field h(u,v) about the mean plane.
+        rel = pts - origin
+        u = rel @ e1
+        w = rel @ e2
+        h = rel @ axis
+        curvature = float(h.max() - h.min())
+        edge = res.edge_for(fa.tolist())
+        curv_floor = max(config.freeform_min_curvature,
+                         config.freeform_min_curvature_edges * edge)
+        if curvature < curv_floor:
+            continue
+
+        # Double-curvature gate: the surface must bend in BOTH in-plane
+        # directions, else it is a single-curvature wall that the swept detector
+        # owns (and de-facets more cheaply). Fit h ≈ a·u + b·w + c·u² + d·w² +
+        # e·uw by least squares; the two second-order coefficients (c, d) are the
+        # principal curvatures of the height field. A cylinder/sweep has one ≈ 0;
+        # a genuine freeform sheet has both non-negligible. We require the
+        # smaller |curvature term| over the region's span to exceed a floor
+        # (fraction of the peak-to-peak height), so a flat-along-one-axis wall is
+        # rejected here and left to the sweep.
+        try:
+            span_u = float(u.max() - u.min()) or 1.0
+            span_w = float(w.max() - w.min()) or 1.0
+            un = u / span_u
+            wn = w / span_w
+            A = np.column_stack([un, wn, un * un, wn * wn, un * wn,
+                                 np.ones_like(un)])
+            coef, *_ = np.linalg.lstsq(A, h, rcond=None)
+            bend_u = abs(float(coef[2]))  # curvature along e1 (over normalised u)
+            bend_w = abs(float(coef[3]))  # curvature along e2
+        except Exception:  # noqa: BLE001
+            bend_u = bend_w = 0.0
+        double = min(bend_u, bend_w)
+        pk = max(curvature, 1e-6)
+        if double < config.freeform_double_curve_frac * pk:
+            continue
+
+        out.append(
+            FreeformRegion(
+                face_indices=sorted(int(i) for i in fa),
+                axis=axis,
+                e1=e1,
+                e2=e2,
+                origin=origin,
+                area=float(ar.sum()),
+                curvature=curvature,
+                foldover=best_fold,
+            )
+        )
+    return out
+
+
+def sample_freeform_grid(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    region: FreeformRegion,
+    ng: int,
+) -> tuple[np.ndarray, float] | None:
+    """Resample the mesh over ``region``'s (u,v) footprint into an ``ng``×``ng``
+    grid of 3D points (height along ``axis`` from the outermost surface hit).
+
+    Pure numpy: for each grid (u,v) the height is the max axis-projection over
+    the region facets whose 2D barycentric coordinates contain (u,v) — the
+    outermost sheet along the projection. Cells outside the footprint fall back
+    to the nearest facet-centroid height. Returns ``(grid, missing_fraction)``
+    or ``None`` if the footprint is degenerate. The grid feeds the OCC B-spline
+    approximation in the builder (the only FreeCAD-touching step)."""
+    fa = np.array(region.face_indices, dtype=int)
+    axis, e1, e2, origin = region.axis, region.e1, region.e2, region.origin
+    tri = vertices[faces[fa]]
+    A, B, C = tri[:, 0], tri[:, 1], tri[:, 2]
+    Au = np.column_stack(((A - origin) @ e1, (A - origin) @ e2))
+    Bu = np.column_stack(((B - origin) @ e1, (B - origin) @ e2))
+    Cu = np.column_stack(((C - origin) @ e1, (C - origin) @ e2))
+    Ah = (A - origin) @ axis
+    Bh = (B - origin) @ axis
+    Ch = (C - origin) @ axis
+
+    allpts = tri.reshape(-1, 3)
+    uv = np.column_stack(((allpts - origin) @ e1, (allpts - origin) @ e2))
+    umin, umax = float(uv[:, 0].min()), float(uv[:, 0].max())
+    vmin, vmax = float(uv[:, 1].min()), float(uv[:, 1].max())
+    if umax - umin < 1e-6 or vmax - vmin < 1e-6:
+        return None
+
+    # Barycentric denominators, precomputed once.
+    v0 = Bu - Au
+    v1 = Cu - Au
+    d00 = np.einsum("ij,ij->i", v0, v0)
+    d01 = np.einsum("ij,ij->i", v0, v1)
+    d11 = np.einsum("ij,ij->i", v1, v1)
+    denom = d00 * d11 - d01 * d01
+    denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+    cent = tri.mean(axis=1)
+    cu = (cent - origin) @ e1
+    cv = (cent - origin) @ e2
+
+    us = np.linspace(umin, umax, ng)
+    vs = np.linspace(vmin, vmax, ng)
+    grid = np.zeros((ng, ng, 3))
+    missing = 0
+    for i, uu in enumerate(us):
+        pp0 = uu - Au[:, 0]
+        for j, vv in enumerate(vs):
+            pp1 = vv - Au[:, 1]
+            d20 = v0[:, 0] * pp0 + v0[:, 1] * pp1
+            d21 = v1[:, 0] * pp0 + v1[:, 1] * pp1
+            vb = (d11 * d20 - d01 * d21) / denom
+            wb = (d00 * d21 - d01 * d20) / denom
+            ub = 1.0 - vb - wb
+            inside = (ub >= -0.03) & (vb >= -0.03) & (wb >= -0.03)
+            if inside.any():
+                h = float(np.max((ub * Ah + vb * Bh + wb * Ch)[inside]))
+            else:
+                missing += 1
+                k = int(np.argmin((cu - uu) ** 2 + (cv - vv) ** 2))
+                h = float(Ah[k] * (1 - vb[k] - wb[k]) + Bh[k] * vb[k] + Ch[k] * wb[k]) \
+                    if False else float(((cent[k] - origin) @ axis))
+            grid[i, j] = origin + uu * e1 + vv * e2 + h * axis
+    return grid, missing / float(ng * ng)

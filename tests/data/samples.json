@@ -233,5 +233,22 @@
     ],
     "file": "domed_plate.stl",
     "triangles": 2266
+  },
+  {
+    "kind": "freeform_bump",
+    "dims_mm": [
+      40.0,
+      40.0,
+      9.0
+    ],
+    "cylinders": [],
+    "spheres": [],
+    "freeform": {
+      "amp": 3.0,
+      "span": 40.0,
+      "form": "amp*sin(0.3x)*cos(0.25y)+6"
+    },
+    "file": "freeform_bump.stl",
+    "triangles": 1730
   }
 ]

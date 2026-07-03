@@ -334,6 +334,83 @@ class ConversionConfig:
     swept_defeature_slivers: bool = True
     swept_sliver_max_area: float = 0.5
 
+    # --- Freeform B-spline sheets (Candidate B). See
+    # docs/ORGANIC_CONVERSION_RESEARCH.md (Candidate B). The residual after all
+    # analytic + swept + sphere detectors can include genuinely doubly-curved
+    # regions (a curved lid, an ergonomic shell, a camera-adapter panel) that no
+    # analytic fit and no constant-cross-section sweep claims. Where such a
+    # region is a *height field* (injective under a projection axis), we resample
+    # the mesh on a (u,v) grid, fit a single trimmed B-spline face, and replace
+    # the faceted region via a guarded boolean cut/fuse (the M4 rollback net) —
+    # adopted ONLY when the result is watertight, bbox-stable, and lowers RTAF.
+    # Strongly-wrapping surfaces (a closed organic blob) fail the injectivity
+    # gate and are left faceted (no regression) — they need the quad-remesh
+    # Candidate A pipeline, not a single sheet.
+
+    # Detect and rebuild doubly-curved height-field regions as B-spline sheets.
+    # Behind this flag so the whole feature can be disabled if it ever regresses.
+    fit_freeform_sheets: bool = True
+
+    # A neighbour facet joins the growing height field only while its normal
+    # stays on the +axis side by at least this dot product. Larger keeps the
+    # region flatter/smaller (safer injectivity); smaller lets it wrap further.
+    freeform_ndot_tol: float = 0.2
+
+    # Minimum facets and surface area (mm^2) a residual region must have to be
+    # worth fitting as a sheet — small residuals stay faceted (negligible RTAF).
+    freeform_min_facets: int = 40
+    freeform_min_area: float = 50.0
+
+    # Injectivity gate: the fraction of region facet area facing *away* from the
+    # projection axis (foldover) must stay below this. ~0 is a clean height
+    # field; a strongly-curved surface that wraps past its silhouette exceeds it
+    # and is deferred (Candidate A territory).
+    freeform_max_foldover: float = 0.06
+
+    # Doubly-curved gate: peak-to-peak height (mm, about the region's mean plane)
+    # must exceed max(this, freeform_min_curvature_edges * local_edge). A flat
+    # residual strip reads ~0 and is left to the planar path, not fit as a sheet.
+    freeform_min_curvature: float = 0.3
+    freeform_min_curvature_edges: float = 1.0
+
+    # Double-curvature gate: a freeform sheet must bend in BOTH in-plane
+    # directions (a paraboloid-like height field), else it is a single-curvature
+    # wall the swept detector owns (and de-facets more cheaply). We fit a
+    # quadratic height field and require the smaller principal curvature term to
+    # be at least this fraction of the peak-to-peak height. A cylinder/sweep has
+    # one principal curvature ~0 and is rejected here; a genuine doubly-curved
+    # shell passes. Runs BEFORE swept detection so true freeform is claimed first.
+    freeform_double_curve_frac: float = 0.08
+
+    # (u,v) grid resolution for resampling the mesh under a freeform region. The
+    # B-spline is approximated (not interpolated) from this grid; the fit is
+    # rejected if the pole count saturates near the grid size (a signal it could
+    # not approximate within tolerance and merely interpolated mesh noise).
+    freeform_grid: int = 26
+
+    # Accepted deviation (mm) of the fitted sheet to the region's facets,
+    # resolution-scaled: max(this, freeform_dev_tol_rel * local_edge). Above it
+    # the fit is rejected and the region left faceted.
+    freeform_dev_tol_abs: float = 0.25
+    freeform_dev_tol_rel: float = 0.6
+
+    # Reject a sampled region whose (u,v) grid has more than this fraction of
+    # cells outside the footprint (a ragged / non-rectangular region whose grid
+    # is mostly fabricated by nearest-centroid fallback). Such regions don't fit
+    # cleanly as one rectangular sheet and are left faceted.
+    freeform_max_missing: float = 0.35
+
+    # Cost ceiling: the guarded boolean of a doubly-curved sheet against the
+    # faceted base is O(base_faces) and can be slow. Skip freeform integration
+    # when the base exceeds this many faces (leave the region faceted) rather
+    # than grinding. None disables the guard.
+    freeform_max_base_faces: int | None = 20000
+
+    # Max freeform boolean attempts per part (largest-area sheets first). Each
+    # attempt is an O(base_faces) boolean; this caps the time a part with many
+    # small doomed candidates can spend on rejected attempts.
+    freeform_max_ops: int = 4
+
     # --- Spheres: domes and corner blends (M3). See docs/CURVED_FEATURES.md §3,
     # §4. A dome (grille cap, rounded boss top) or the spherical blend where three
     # fillets meet is a spherical cap: its facet normals fan out in all directions
