@@ -1,23 +1,23 @@
 # mesh2step-web — Portainer-stack-ready compose.
 #
-# Two ways to deploy this in Portainer (see docker/README.md for the walk-through):
-#   A) Build from a Git repository: point the stack at this repo; Portainer runs
-#      the build using the `build:` block below.
-#   B) Use a prebuilt image: comment out `build:`, uncomment `image:` and set it
-#      to your registry tag.
+# Default: pull the prebuilt PRIVATE image from GHCR (built by
+# .github/workflows/docker.yml on every push to main). See docker/README.md
+# for the full private-registry Portainer walk-through.
+#
+# To build locally instead (e.g. hacking on the Dockerfile), comment out
+# `image:` below and uncomment the `build:` block.
 #
 # The service binds 0.0.0.0 inside the container (set via the image env) and is
 # published on the host at ${MESH2STEP_PORT:-8799}.
 
 services:
   mesh2step-web:
-    # --- Option A: build from this repo (Portainer "Git repository" stack) ---
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    # --- Option B: prebuilt image (comment out `build:` above to use this) ---
-    # image: your-registry.example/mesh2step-web:latest
-    image: mesh2step-web:latest
+    # --- Default: prebuilt private image from GHCR ---
+    image: ghcr.io/npolanosky/mesh2step-web:latest
+    # --- Fallback: build from this repo instead (uncomment to use) ---
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
     container_name: mesh2step-web
     restart: unless-stopped
 

@@ -38,42 +38,54 @@ volume — it is an image artifact, so an upgraded image ships fresh deps.
 
 ## Deploy in Portainer
 
-### Option A — build from this Git repo (recommended)
+The repo (and the `mesh2step-web` package on GHCR) are **private**. Every push
+to `main` that touches `src/mesh2step/**`, `docker/**`, or `pyproject.toml`
+triggers `.github/workflows/docker.yml`, which builds a multi-arch
+(`linux/amd64` + `linux/arm64`) image and pushes it to
+`ghcr.io/npolanosky/mesh2step-web` tagged `latest` + the short commit SHA (and
+semver tags on version-tag pushes). `docker/docker-compose.yml` already points
+at that image by default, so Portainer just needs pull credentials.
+
+### One-time: give Portainer a GHCR pull credential
+
+GHCR requires auth to pull a private image even with `docker.io`-style
+anonymous pulls disabled, so set this up once:
+
+1. GitHub → **Settings → Developer settings → Personal access tokens → Tokens
+   (classic)** → **Generate new token**.
+   * Scope: **`read:packages`** only.
+   * Expiration: your call (rotate it when it expires).
+2. Portainer → **Registries → Add registry**.
+   * *Registry type:* **GitHub Container Registry** (or "Custom registry" with
+     URL `ghcr.io` if your Portainer version doesn't have a GHCR preset).
+   * *Username:* `npolanosky`.
+   * *Password:* the PAT you just created.
+3. Save. Portainer can now pull `ghcr.io/npolanosky/mesh2step-web` images.
+
+### Deploy the stack
 
 1. Portainer → **Stacks → Add stack**.
 2. Name it `mesh2step-web`.
-3. **Build method → Git repository.**
-   * *Repository URL:* `https://github.com/npolanosky/mesh2step`
-   * *Reference:* `refs/heads/main` (or a tag)
-   * *Compose path:* `docker/docker-compose.yml`
+3. Either:
+   * **Repository** build method pointed at
+     `https://github.com/npolanosky/mesh2step` (Portainer needs a GitHub PAT
+     with `repo` read access configured under **Settings → Git** for private
+     repos), compose path `docker/docker-compose.yml`; or
+   * **Web editor**, paste the contents of `docker/docker-compose.yml`
+     directly (simplest — no repo credentials needed for the stack file
+     itself, only the registry credential from above for the image pull).
 4. (Optional) **Environment variables** — see the table below.
-5. **Deploy the stack.** The first deploy builds the image (FreeCAD apt install +
-   prep-dep bake — expect several minutes and a few hundred MB downloaded once).
+5. **Deploy the stack.** Portainer pulls
+   `ghcr.io/npolanosky/mesh2step-web:latest` using the registry credential and
+   starts the container.
 6. Open `http://<server-ip>:8799`.
 
-The `build:` block in `docker/docker-compose.yml` uses `context: ..` so the
-build sees the whole repo (it needs `pyproject.toml`, `README.md`, `LICENSE`,
-`src/`). Nothing else to configure.
+### Building locally instead (optional)
 
-### Option B — prebuilt image
-
-If you'd rather build once and push to a registry:
-
-```bash
-# on a build host (see "Building the image manually" below)
-docker build -f docker/Dockerfile -t your-registry.example/mesh2step-web:latest .
-docker push your-registry.example/mesh2step-web:latest
-```
-
-Then in the stack's compose, comment out the `build:` block and set
-`image: your-registry.example/mesh2step-web:latest`. Deploy the stack; Portainer
-pulls the image.
-
-### Option C — paste the stackfile
-
-Portainer → **Stacks → Add stack → Web editor**, paste the contents of
-`docker/docker-compose.yml`, and use **Option B** (a prebuilt `image:`), since
-the web editor has no repo context to build from.
+If you'd rather build on the server itself instead of pulling from GHCR,
+edit `docker/docker-compose.yml`: comment out `image:` and uncomment the
+`build:` block (`context: ..`, `dockerfile: docker/Dockerfile`), then deploy
+with the **Repository** build method so Portainer has the full repo context.
 
 ---
 
@@ -139,21 +151,23 @@ curl -s   http://localhost:8799/api/health | python3 -m json.tool
 
 Job history and the failure corpus live in named volumes, so upgrades keep them.
 
-**Git-repo stack (Option A):**
+**Default (prebuilt GHCR image):**
 
-1. Push/pull the new code (or move the stack's Git reference to a new tag).
+1. Merge/push to `main` (touching `src/mesh2step/**`, `docker/**`, or
+   `pyproject.toml`) — this triggers the `docker.yml` workflow, which builds
+   and pushes a fresh `ghcr.io/npolanosky/mesh2step-web:latest`. You can also
+   trigger it manually from the Actions tab (`workflow_dispatch`) or watch it
+   with `gh run watch`.
+2. Portainer → the stack → **Pull and redeploy** (tick *Re-pull image*). This
+   pulls the new `latest` from GHCR and recreates the container against the
+   same volumes.
+
+**Building locally instead:**
+
+1. Push/pull the new code.
 2. Portainer → the stack → **Pull and redeploy** (tick *Re-pull image and
    rebuild* / *Re-fetch repository*). This rebuilds the image, giving you fresh
    FreeCAD + prep deps, and recreates the container against the same volumes.
-
-**Prebuilt-image stack (Option B):**
-
-```bash
-docker build -f docker/Dockerfile -t your-registry.example/mesh2step-web:latest .
-docker push your-registry.example/mesh2step-web:latest
-```
-
-Then Portainer → the stack → **Update / Pull and redeploy**.
 
 **Fresh start (wipe history):** delete the `mesh2step-web-data` volume. Delete
 `mesh2step-corpus` to also clear the failure corpus. Both are safe to remove

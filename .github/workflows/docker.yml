@@ -1,0 +1,78 @@
+name: Build and push Docker image
+
+# Builds docker/Dockerfile and pushes to GHCR (private package, same
+# visibility as this repo). Triggers on pushes to main that touch the app
+# source, the docker/ directory, or pyproject.toml; on version tags; and
+# manually via workflow_dispatch.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/mesh2step/**"
+      - "docker/**"
+      - "pyproject.toml"
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to main) so we
+# don't burn build minutes on stale commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/mesh2step-web
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for linux/arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # latest (branch pushes + manual runs only) + short-sha always +
+      # semver tags (major.minor.patch, major.minor) when triggered by a
+      # version tag push.
+      - name: Compute image tags/labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA cache backend: the FreeCAD apt-install layer is large, so
+          # caching it here saves most of the build time on unrelated changes.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
