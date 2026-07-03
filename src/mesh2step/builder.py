@@ -17,12 +17,15 @@ from .boundary import FaceLoops, extract_face_loops
 from .config import ConversionConfig
 from .fitting import (
     Cylinder,
+    Sphere,
     SweptProfile,
     _connected_components,
     detect_cones,
     detect_cylinders,
     detect_fillets_straight,
+    detect_spheres,
     detect_swept_walls,
+    sphere_consensus_regions,
 )
 from .segmentation import (
     build_edge_adjacency,
@@ -299,7 +302,7 @@ def _arc_mid_point2(seg) -> np.ndarray:
 
 
 def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
-                          max_ops: int = 200) -> tuple:
+                          max_ops: int = 200, config: ConversionConfig | None = None) -> tuple:
     """Apply one boolean lens op per fitted swept-arc segment to a valid solid.
 
     Shared by both tiers: the sew tier runs it on the closed reconstructed
@@ -308,6 +311,12 @@ def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
     reverts and can never cost watertightness. Wide arcs are skipped (their
     chord<->arc lens grows fat enough to reach unrelated geometry), as is
     anything beyond the op budget on pathological meshes.
+
+    Cost budget (M4 gear regression): each op is a boolean against the current
+    solid, cost ~O(faces); the whole batch is O(distinct_arcs × faces). When that
+    product exceeds ``config.swept_op_budget`` the batch is SKIPPED wholesale
+    (walls stay faceted) rather than grinding for minutes — the repeated-arc
+    guard already drops gear-tooth profiles, this catches any residual blow-up.
 
     Returns ``(solid, ops_attempted, ops_succeeded)``.
     """
@@ -353,6 +362,23 @@ def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
     todo = todo[:max_ops]
     if not todo:
         return solid, 0, 0
+
+    # Cost budget: distinct_arcs × base_faces. Skip the whole batch when it would
+    # grind (a gear's hundreds of tooth arcs on a dense base). The repeated-arc
+    # guard in detect_swept_walls already drops the classic gear profile; this is
+    # the belt-and-braces ceiling for any residual blow-up.
+    budget = config.swept_op_budget if config is not None else None
+    if budget is not None:
+        try:
+            base_faces = len(solid.Faces)
+        except Exception:  # noqa: BLE001
+            base_faces = 0
+        cost = len(todo) * base_faces
+        if base_faces and cost > budget:
+            progress(f"  swept lens ops skipped: cost {len(todo)} arcs × "
+                     f"{base_faces} faces = {cost:,} exceeds budget {budget:,} "
+                     f"(walls left faceted)")
+            return solid, len(todo), 0
 
     def run(start_solid, deep):
         s = start_solid
@@ -639,6 +665,16 @@ def build_reconstructed_solid(
     # "do NOT rely on sewing"), where a bad step reverts and stays watertight.
     fillets: list[Cylinder] = _detect_fillets(vertices, faces, claimed, config, progress)
 
+    # Spheres (M3): domes + corner blends, after fillets and BEFORE swept walls.
+    # A dome's facets are claimed here so the swept detector never fits doomed
+    # lens ops to its latitude rows. The analytic sphere surface is delivered by
+    # the boolean-clean tier (design §4: "do NOT rely on sewing"); in the sew
+    # tier its strips build as thin planar faces (which sew), and the boolean
+    # lens/ball ops below true them up on the closed solid.
+    # DOME pass before swept (see the boolean tier for the dome/blend split).
+    spheres: list[Sphere] = _detect_spheres(
+        vertices, faces, claimed, config, progress, mode="dome")
+
     # Exact end-circles of the analytic faces, used to replace matching faceted
     # boundary loops so their edges coincide and sew.
     circles = _analytic_circles(cylinders, cones)
@@ -658,6 +694,15 @@ def build_reconstructed_solid(
     # analytic surface via a boolean lens op below — booleans recompute the
     # intersection geometry, so no analytic-vs-chordal edge matching is needed.
     swept_profiles = _fit_swepts(vertices, faces_sub, regions, config, progress)
+    # Claim swept facets (mapped to original indices), then the BLEND pass finds
+    # corner blends on what's left — without stealing swept-wall corners.
+    for prof in swept_profiles:
+        claimed.update(keep[i] for i in prof.face_indices)
+    blend_spheres = _detect_spheres(vertices, faces, claimed, config, progress,
+                                    mode="blend")
+    spheres = spheres + blend_spheres
+    for s in blend_spheres:
+        claimed.update(s.face_indices)
 
     progress(f"Building {len(regions):,} planar faces")
     occ_faces = []
@@ -745,18 +790,32 @@ def build_reconstructed_solid(
     # Swept-wall lens ops (M4): on a closed, valid solid, replace each fitted
     # arc segment's chordal strip fan with the analytic surface via a boolean
     # cut/fuse. Every op reverts on invalidity, so this can only improve the
-    # surface, never cost watertightness.
+    # surface, never cost watertightness. Swept lens ops FIRST (the dominant win),
+    # then sphere ball ops: a sphere fuse reshapes the wall geometry a later swept
+    # lens op keys off, so doing spheres first can make the swept ops miss (seen
+    # on the tweezer: 8 swept walls -> 0). Each op reverts on invalidity.
     swept_ops = 0
     swept_built = 0
     if is_solid and swept_profiles:
         shape, swept_ops, swept_built = _apply_swept_lens_ops(
-            shape, swept_profiles, Part, progress)
+            shape, swept_profiles, Part, progress, config=config)
         if swept_built:
             # Simplify a snapshot: the OCC call can corrupt its input in place.
             backup = shape.copy()
             simplified = _safe_remove_splitter(shape, Part)
             shape = simplified if _is_valid_solid(simplified) else backup
             shape, _slivers = _defeature_sliver_chains(shape, config, Part, progress)
+            solids = getattr(shape, "Solids", [])
+            is_solid = bool(solids) and solids[0].isValid()
+
+    sphere_ok = 0
+    if is_solid and spheres:
+        for sph in spheres:
+            shape, ok = _try_boolean_step(
+                shape, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part))
+            sphere_ok += ok
+        if sphere_ok:
+            progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
             solids = getattr(shape, "Solids", [])
             is_solid = bool(solids) and solids[0].isValid()
 
@@ -777,6 +836,9 @@ def build_reconstructed_solid(
         "fillets_detected": len(fillets),
         "fillets": [f.as_dict() for f in fillets],
         "fillet_radius_source": _radius_source_breakdown(fillets),
+        "spheres_detected": len(spheres),
+        "spheres_built": sphere_ok,
+        "spheres": [s.as_dict() for s in spheres],
         "swept_walls_detected": len(swept_profiles),
         "swept_walls_built": swept_built,
         "swept_arc_ops": swept_ops,
@@ -820,6 +882,103 @@ def _detect_fillets(vertices, faces, claimed: set, config: ConversionConfig, pro
         progress(f"Found {len(fillets)} straight-edge fillet(s) "
                  f"({tan} tangency-snapped) from {n_band} band(s)")
     return fillets
+
+
+def _dedupe_spheres(spheres):
+    """Merge spheres sharing a (centre, radius) — a fragmented cap found twice.
+
+    Two spheres are the same when their centres coincide within a radius-scaled
+    tolerance and their radii agree; the merged sphere keeps the union of their
+    facets so its metadata (facet count / coverage) reflects the whole cap.
+    """
+    kept: list = []
+    for s in spheres:
+        merged = False
+        for k in kept:
+            rtol = 0.05 * max(s.radius, k.radius) + 0.2
+            if (abs(s.radius - k.radius) <= rtol
+                    and float(np.linalg.norm(np.asarray(s.center) - np.asarray(k.center)))
+                    <= rtol):
+                k.face_indices = sorted(set(k.face_indices) | set(s.face_indices))
+                merged = True
+                break
+        if not merged:
+            kept.append(s)
+    return kept
+
+
+def _detect_spheres(vertices, faces, claimed: set, config: ConversionConfig,
+                    progress, mode: str = "all"):
+    """Detect spherical caps/domes + corner blends (design §3, task §3).
+
+    Two paths, run on the facets no cylinder/cone/fillet claimed:
+
+    1. **Tessellated domes** (``mode`` in ``all``/``dome``) — a dome (a grille
+       cap) shatters into many strips, none compact enough to read as a sphere
+       alone. The cross-region sphere *consensus* clusters those strips by shared
+       (centre, R) and fits one sphere to the union. Run BEFORE swept-wall fitting
+       so the dome's facets are removed from the pool (otherwise M4 fits doomed
+       lens ops to the latitude rows).
+    2. **Compact caps/blends** (``mode`` in ``all``/``blend``) —
+       ``segment_smooth_bands`` groups the residual curved strips; ``cap``/
+       ``blend``-classed regions whose normals fan out fit one sphere each (corner
+       blends get the tangency prior from their flats). Run AFTER swept-wall
+       detection so a corner blend that is really part of a swept curved wall is
+       claimed by the sweep first — otherwise the blend cannibalises the sweep's
+       facets and drops swept walls (seen on drive_bay: 35 -> 28 built).
+
+    Returns a list of ``Sphere`` objects; updates ``claimed`` in place. Best-
+    effort: any failure leaves the regions faceted (never raises).
+    """
+    if not config.detect_spheres:
+        return []
+    dome_spheres: list[Sphere] = []
+    try:
+        resolution = mesh_resolution(vertices, faces, config)
+        keep = [i for i in range(len(faces)) if i not in claimed]
+        if not keep:
+            return []
+        faces_sub = faces[keep]
+        regions = segment_planar(vertices, faces_sub, config)
+        # Map sub-region facet rows back to original indices for claiming.
+        def to_orig(sub_ids):
+            return [keep[i] for i in sub_ids]
+
+        spheres: list[Sphere] = []
+        if mode in ("all", "dome"):
+            # Dome consensus over ALL planar strips (candidate regions).
+            candidate_regions = [r.face_indices for r in regions]
+            dome_spheres, _dc = sphere_consensus_regions(
+                vertices, faces_sub, candidate_regions, config, resolution)
+            for sph in dome_spheres:
+                sph.face_indices = to_orig(sph.face_indices)
+                spheres.append(sph)
+                claimed.update(sph.face_indices)
+
+        if mode in ("all", "blend"):
+            # Compact caps/blends over the residual strips.
+            bands = segment_smooth_bands(vertices, faces_sub, set(), regions, config)
+            cap_spheres = detect_spheres(
+                vertices, faces_sub, bands, regions, set(), config, resolution)
+            for sph in cap_spheres:
+                sph.face_indices = to_orig(sph.face_indices)
+                spheres.append(sph)
+                claimed.update(sph.face_indices)
+
+        # A single cap can fragment into >1 smooth band (an apex/seam split), so
+        # two spheres of the same (centre, R) get built as identical redundant
+        # balls. Merge them — the boolean op is idempotent but the extra op is
+        # wasted time, and one analytic face reads cleaner than two.
+        spheres = _dedupe_spheres(spheres)
+    except Exception as exc:  # noqa: BLE001 - sphere detection is best-effort
+        progress(f"Sphere detection skipped ({exc})")
+        return []
+    if spheres:
+        domes = len(dome_spheres)
+        tan = sum(1 for s in spheres if s.radius_source == "tangency")
+        progress(f"Found {len(spheres)} sphere(s) "
+                 f"({domes} dome(s) via consensus, {tan} tangency-snapped)")
+    return spheres
 
 
 def _safe_remove_splitter(shape, Part):
@@ -1143,6 +1302,54 @@ def _boolean_clean_cone(solid, cone, Part, **_):
     return solid.cut(cut)
 
 
+def _boolean_clean_sphere(solid, sph, Part, **_):
+    """Replace a faceted dome / corner blend with an exact analytic sphere via a
+    boolean op (design §4).
+
+    Convex cap (dome / rounded boss top, ``outward=True``): the faceted cap is
+    inscribed — material stops short of the true surface — so FUSE a solid ball
+    of radius R+eps to true it up. Guarded so a mis-fit sphere that would bulge
+    into open air is rejected. Concave dish (``outward=False``): material
+    overshoots the true sphere, so CUT the ball to trim it back.
+
+    A ball fuse/cut is far more localised than a lens — the tool is exactly the
+    fitted sphere, so booleans recompute the trim against whatever flats/fillets
+    bound the cap. Uses ``Part.makeSphere`` (design §4 boolean tool).
+    """
+    R = float(sph.radius)
+    eps = _clean_cut_eps(R)
+    center = np.asarray(sph.center, dtype=float)
+    # Build only the CAP (a partial-sphere solid), not the whole ball — a full
+    # ball fuse would add the far hemisphere sticking out of the part, and a full
+    # ball cut would gouge past the dish. ``Part.makeSphere(r, pnt, dir, a1, a2,
+    # a3)`` builds the solid wedge between latitudes a1..a2 (from -90 at the south
+    # pole along ``dir`` to +90 at the north). The cap of angular radius ``alpha``
+    # about ``cap_axis`` is latitudes [90-alpha, 90]; pad alpha generously so the
+    # detected facets (whose near-tangent rim rows are absorbed into the flat) and
+    # their sagitta slivers are fully covered, capped so it stays a cap not a ball.
+    tool = None
+    if sph.cap_axis is not None:
+        cap_axis = np.asarray(sph.cap_axis, dtype=float)
+        cap_axis /= np.linalg.norm(cap_axis) or 1.0
+        cov = min(0.98, max(1e-3, float(sph.coverage)))
+        alpha = math.degrees(math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * cov))))
+        alpha = min(150.0, alpha + 40.0)  # generous pad, still a cap
+        lat0 = max(-89.0, 90.0 - alpha)
+        try:
+            tool = Part.makeSphere(R + eps, _vec(center), _vec(cap_axis),
+                                   lat0, 90.0, 360.0)
+        except Exception:  # noqa: BLE001 - fall back to the full ball below
+            tool = None
+    if tool is None:
+        tool = Part.makeSphere(R + eps, _vec(center))
+    if sph.outward:
+        # A correct dome fuse adds only the sliver between the inscribed facets
+        # and the true cap; a mis-classified/oversized sphere adds most of the
+        # cap. Keep the guard reasonably tight.
+        return _guarded_fuse(solid, tool, max_added_frac=0.5)
+    return _guarded_cut(solid, tool, max_removed_frac=0.6)
+
+
 def _is_valid_solid(shape) -> bool:
     solids = getattr(shape, "Solids", [])
     return bool(solids) and solids[0].isValid()
@@ -1281,6 +1488,15 @@ def build_boolean_clean_solid(
     for f in fillets:
         claimed.update(f.face_indices)
 
+    # Spheres — DOME pass (M3): tessellated domes via cross-region consensus,
+    # BEFORE swept walls, so a dome's latitude rows are claimed and M4 never fits
+    # doomed lens ops to them. Corner blends are deferred to the BLEND pass below
+    # (after swept) so a blend that is really part of a swept curved wall doesn't
+    # cannibalise the sweep's facets and drop swept walls (drive_bay: 35 -> 28).
+    spheres = _detect_spheres(vertices, faces, claimed, config, progress, mode="dome")
+    for s in spheres:
+        claimed.update(s.face_indices)
+
     # Swept/extruded curved walls (M4), after fillets in the detector ladder.
     # Fitted on the facets no other detector claimed; each arc segment becomes a
     # boolean lens op (cut/fuse) against the faceted base below.
@@ -1294,6 +1510,18 @@ def build_boolean_clean_solid(
             regions_sw = []
         if regions_sw:
             swept_profiles = _fit_swepts(vertices, faces_sw, regions_sw, config, progress)
+            # Claim the swept walls' facets (mapped back to original indices) so
+            # the blend pass below leaves swept-wall corners to the sweep.
+            for prof in swept_profiles:
+                claimed.update(keep_sw[i] for i in prof.face_indices)
+
+    # Spheres — BLEND pass (M3): compact corner blends / end-cap domes on the
+    # facets no cylinder/cone/fillet/dome/sweep claimed.
+    blend_spheres = _detect_spheres(vertices, faces, claimed, config, progress,
+                                    mode="blend")
+    spheres = spheres + blend_spheres
+    for s in blend_spheres:
+        claimed.update(s.face_indices)
 
     progress("Building faceted watertight solid (base)")
     solid = build_faceted_solid(vertices, faces)
@@ -1381,7 +1609,7 @@ def build_boolean_clean_solid(
     pre_swept = solid.copy()
     pre_rogue = set(_rogue_radii(solid, detected_r))
     solid, swept_ops, swept_ok = _apply_swept_lens_ops(
-        solid, swept_profiles, Part, progress)
+        solid, swept_profiles, Part, progress, config=config)
 
     # removeSplitter is an optimization; on shells dense with fresh boolean
     # seams it can occasionally produce an invalid solid — AND the underlying
@@ -1400,8 +1628,22 @@ def build_boolean_clean_solid(
         solid = simplified if _is_valid_solid(simplified) else backup
         solid, slivers_removed = _defeature_sliver_chains(solid, config, Part, progress)
 
-    total = len(cylinders) + len(cones) + len(fillets) + swept_ops
-    cleaned = cyl_ok + cone_ok + fillet_ok + swept_ok
+    # Spheres (M3) after the swept block: a sphere fuse reshapes wall geometry a
+    # swept lens op keys off, so doing spheres first can make the swept ops miss
+    # (seen in the sew tier on the tweezer). A convex dome fuses its cap ball, a
+    # concave dish cuts, each reverting on invalidity so a bad sphere never breaks
+    # the solid.
+    sphere_ok = 0
+    if spheres and _is_valid_solid(solid):
+        for sph in spheres:
+            solid, ok = _try_boolean_step(
+                solid, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part),
+                max_bbox_growth=bbox_guard)
+            sphere_ok += ok
+        progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
+
+    total = len(cylinders) + len(cones) + len(fillets) + len(spheres) + swept_ops
+    cleaned = cyl_ok + cone_ok + fillet_ok + sphere_ok + swept_ok
     progress(f"Boolean clean-up: {cleaned}/{total} features replaced with analytic geometry "
              f"({total - cleaned} left faceted)")
 
@@ -1426,6 +1668,9 @@ def build_boolean_clean_solid(
         "fillets_detected": len(fillets),
         "fillet_faces": fillet_ok,
         "fillet_radius_source": _radius_source_breakdown(fillets),
+        "spheres_detected": len(spheres),
+        "spheres_built": sphere_ok,
+        "spheres": [s.as_dict() for s in spheres],
         "cylinders": [c.as_dict() for c in cylinders],
         "cones": [c.as_dict() for c in cones],
         "fillets": [f.as_dict() for f in fillets],

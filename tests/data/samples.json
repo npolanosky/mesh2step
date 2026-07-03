@@ -210,5 +210,28 @@
     ],
     "file": "swept_wavy_wall.stl",
     "triangles": 212
+  },
+  {
+    "kind": "domed_plate",
+    "dims_mm": [
+      60,
+      60,
+      16.0
+    ],
+    "cylinders": [],
+    "spheres": [
+      {
+        "radius": 20.0,
+        "center": [
+          30.0,
+          30.0,
+          -4.0
+        ],
+        "cap_height": 6.0,
+        "outward": true
+      }
+    ],
+    "file": "domed_plate.stl",
+    "triangles": 2266
   }
 ]

@@ -104,6 +104,47 @@ class Cone:
         }
 
 
+@dataclass
+class Sphere:
+    """A best-fit sphere for a compact smoothly-curved region (dome / corner blend).
+
+    A dome (grille cap, rounded boss top) or a corner blend where three fillets
+    meet is a spherical cap: its facet normals fan out in every direction (no
+    single axis — ``_region_axis`` returns ``None``), and its vertices lie on one
+    sphere. ``trim`` bounds the built cap's parametric extent; ``outward`` marks a
+    convex cap (bulges out, material inside — fuse) vs a concave dish (material
+    outside — cut). ``tangent`` records a radius snapped to adjacent flats.
+    """
+
+    center: np.ndarray       # (3,) sphere centre
+    radius: float
+    rms: float               # RMS radial residual (mm)
+    face_indices: list[int]
+    outward: bool = True     # convex cap (material inside) vs concave dish
+    coverage: float = 1.0    # solid-angle fraction of the full sphere the cap spans
+    tangent: bool = False    # radius/centre snapped to adjacent flats
+    radius_source: str = "fit"  # "fit" | "tangency"
+    # Cap-clip geometry so the boolean tool is only the cap, not the whole ball
+    # (a full-ball fuse would add the far hemisphere sticking out of the part).
+    # ``cap_axis`` points from the centre toward the cap (outward for a dome);
+    # ``cap_base`` is the min signed distance along that axis of the cap's own
+    # facet vertices — the cap is the ball portion beyond ``cap_base``.
+    cap_axis: np.ndarray | None = None
+    cap_base: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {
+            "radius": float(self.radius),
+            "center": [float(x) for x in self.center],
+            "rms": float(self.rms),
+            "facets": len(self.face_indices),
+            "role": "dome" if self.outward else "dish",
+            "coverage": float(self.coverage),
+            "tangent": bool(self.tangent),
+            "radius_source": self.radius_source,
+        }
+
+
 def _connected_components(
     pool: list[int], neighbors: list[list[int]]
 ) -> list[list[int]]:
@@ -1467,6 +1508,34 @@ def _dist_point_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(p - (a + t * ab)))
 
 
+def _is_repeated_arc_pattern(profile: SweptProfile, config: ConversionConfig) -> bool:
+    """True when a profile is a repeated-tooth pattern (gear teeth), not a wall.
+
+    An involute gear (or a splined shaft) fits as one swept region whose profile
+    is DOZENS of near-identical short arcs marching around the perimeter — the
+    tessellated tooth flanks. Grinding one boolean lens op per arc against the
+    faceted base is O(arcs × base_faces): on gear_box_gear_v2 that is 456 arcs ×
+    12 k faces and never finishes (M4 regression). Teeth are faceted-through by
+    design for now, so we skip such profiles wholesale.
+
+    Signature: many arcs (>= ``swept_repeat_arc_min``) whose radii cluster into
+    only a few distinct values (the involute flank radii repeat every tooth), so
+    ``distinct_radii / n_arcs`` is small. A genuine wall has a handful of arcs of
+    distinct radii, which this never trips.
+    """
+    arc_radii = [float(s.radius) for s in profile.segments if s.kind == "arc"]
+    n = len(arc_radii)
+    if n < config.swept_repeat_arc_min:
+        return False
+    # Count distinct radius clusters (round to a relative grid).
+    reps: list[float] = []
+    for r in sorted(arc_radii):
+        if not reps or abs(r - reps[-1]) > config.swept_repeat_radius_rel * max(r, reps[-1]) + 0.1:
+            reps.append(r)
+    distinct = len(reps)
+    return (distinct / n) <= config.swept_repeat_distinct_frac
+
+
 def detect_swept_walls(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -1474,7 +1543,12 @@ def detect_swept_walls(
     config: ConversionConfig | None = None,
     resolution: MeshResolution | None = None,
 ) -> list[SweptProfile]:
-    """Fit swept profiles for every swept region (design §2, §3, M4)."""
+    """Fit swept profiles for every swept region (design §2, §3, M4).
+
+    Profiles that are repeated-tooth patterns (gear teeth: dozens of near-
+    identical short arcs) are dropped — building one lens op per tooth arc is
+    O(arcs × base_faces) and never converges (see ``_is_repeated_arc_pattern``).
+    """
     config = config or ConversionConfig()
     if not config.detect_swept_walls:
         return []
@@ -1483,6 +1557,352 @@ def detect_swept_walls(
     out: list[SweptProfile] = []
     for sw in swept_regions:
         prof = fit_swept_profile(vertices, faces, sw, config, resolution)
-        if prof is not None:
-            out.append(prof)
+        if prof is None:
+            continue
+        if _is_repeated_arc_pattern(prof, config):
+            continue  # gear teeth / splines: leave faceted (design: for now)
+        out.append(prof)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Spheres — domes and corner blends (Milestone 3, design §3, §4). A dome (grille
+# cap, rounded boss top) or the spherical blend where three fillets meet is a
+# spherical cap: its facet normals fan out in every direction (no single axis —
+# ``_region_axis`` returns None) and its vertices lie on one sphere. We fit the
+# 4-parameter linear (Kasa-style) sphere, sagitta-bias-correct the radius,
+# gate with resolution-scaled tolerance + coverage + radius sanity, and snap the
+# radius/centre to the adjacent flats when the cap meets them near-tangent.
+# --------------------------------------------------------------------------- #
+
+
+def _fit_sphere(pts: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Algebraic (linear) sphere fit. Returns (center(3,), radius, rms_residual).
+
+    Solves ``2x·cx + 2y·cy + 2z·cz + c = x²+y²+z²`` in least squares — the
+    4-parameter linear analogue of :func:`_fit_circle_2d`. ``radius`` is then
+    ``sqrt(c + |center|²)`` and ``rms`` the RMS of the signed radial residual.
+    """
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+    A = np.column_stack((2 * x, 2 * y, 2 * z, np.ones_like(x)))
+    rhs = x * x + y * y + z * z
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    cx, cy, cz, c = sol
+    center = np.array([cx, cy, cz])
+    radius = float(np.sqrt(max(c + cx * cx + cy * cy + cz * cz, 0.0)))
+    resid = np.linalg.norm(pts - center, axis=1) - radius
+    rms = float(np.sqrt(np.mean(resid ** 2))) if len(resid) else float("inf")
+    return center, radius, rms
+
+
+def _sphere_coverage(pts: np.ndarray, center: np.ndarray, radius: float) -> float:
+    """Solid-angle fraction (0..1) of the sphere the points span.
+
+    A cap subtending half-angle ``alpha`` from the centre covers
+    ``(1 - cos alpha) / 2`` of the sphere. ``alpha`` is the max angle between the
+    cap's mean radial direction and each point's radial direction — a robust
+    proxy for the cap's angular extent. A full sphere reads ~1.0, a shallow cap
+    a small fraction; used to reject sliver clusters that algebraically fit a
+    huge sphere but barely wrap it.
+    """
+    rel = pts - center
+    n = np.linalg.norm(rel, axis=1)
+    ok = n > 1e-9
+    if ok.sum() < 3:
+        return 0.0
+    u = rel[ok] / n[ok, None]
+    mean = u.mean(axis=0)
+    mn = float(np.linalg.norm(mean))
+    if mn < 1e-9:
+        return 1.0  # points fill all directions -> (near) full sphere
+    mean /= mn
+    cos_alpha = float(np.min(u @ mean))
+    cos_alpha = max(-1.0, min(1.0, cos_alpha))
+    return (1.0 - cos_alpha) / 2.0
+
+
+def _sphere_region_axis_is_none(
+    component: list[int], comp_set: set[int], normals: np.ndarray,
+    neighbors: list[list[int]], config: ConversionConfig,
+) -> bool:
+    """True when the region has no single curvature axis (a sphere signature).
+
+    Reuses :func:`_region_axis`: a cylinder/cone wall's adjacent-normal cross
+    products align on one axis (returns a vector); a sphere's fan out in all
+    directions (returns None). Design §2: "``_region_axis`` returns None ... a
+    positive sphere signal on a compact region."
+    """
+    return _region_axis(component, comp_set, normals, neighbors, config) is None
+
+
+def _fit_sphere_for_region(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    face_ids: list[int],
+    normals: np.ndarray,
+    config: ConversionConfig,
+    resolution: MeshResolution,
+    max_radius: float,
+    plane_normals: list[np.ndarray] | None = None,
+    plane_points: list[np.ndarray] | None = None,
+) -> Sphere | None:
+    """Fit + validate a sphere for one compact smooth region's facets.
+
+    Algebraic fit on the region's vertices, sagitta-bias-corrected (the chordal
+    facets sit inside the true sphere by ~edge²/(8R), so the free fit under-reads
+    the radius), resolution-scaled RMS gate, coverage / radius-sanity / min-facet
+    guards. When adjacent flats are supplied and the cap meets them near-tangent
+    (design §1.2), the radius is re-derived from the tangency constraint and the
+    centre snapped along the flats' normals.
+    """
+    if len(face_ids) < config.min_sphere_facets:
+        return None
+    vert_ids = np.unique(faces[face_ids].reshape(-1))
+    pts = vertices[vert_ids]
+    if len(pts) < 4:
+        return None
+    center, radius, rms = _fit_sphere(pts)
+    if radius <= 0:
+        return None
+
+    local_edge = resolution.edge_for(face_ids)
+    tol = _local_tol(config, local_edge)
+    # Sagitta-bias correction: chordal facet vertices sit ON the true sphere but
+    # the *fit* balances residuals and lands a hair inside; nudge the radius out
+    # by half the chordal sagitta (matches the RMS-about-fit convention in
+    # _local_tol). Small and radius-capped so it can't inflate a bad fit.
+    sagitta = (local_edge * local_edge) / (8.0 * radius) if radius > 1e-9 else 0.0
+    radius_fit = radius + min(0.5 * sagitta, 0.05 * radius)
+
+    if rms > tol:
+        return None
+    min_r = max(config.min_sphere_radius,
+                config.min_sphere_radius_edges * local_edge)
+    if radius_fit < min_r or radius_fit > max_radius:
+        return None
+
+    coverage = _sphere_coverage(pts, center, radius)
+    if coverage < config.min_sphere_coverage:
+        return None
+
+    # Concave dish vs convex dome: do the facet normals point away from the
+    # centre (convex, material inside -> fuse) or toward it (concave -> cut)?
+    fcent = vertices[faces[face_ids]].mean(axis=1)
+    radial = fcent - center
+    radial /= np.linalg.norm(radial, axis=1, keepdims=True) + 1e-12
+    outward = bool(np.mean(np.sum(normals[face_ids] * radial, axis=1)) > 0)
+
+    # Cap-clip geometry: the cap axis points from the centre toward the cap's
+    # facet centroid mean; cap_base is the min signed distance (along that axis,
+    # relative to the centre) of the cap's own vertices — the boolean tool keeps
+    # only the ball portion beyond it, so a fuse can't add the far hemisphere.
+    cap_dir = fcent.mean(axis=0) - center
+    cn = float(np.linalg.norm(cap_dir))
+    cap_axis = cap_dir / cn if cn > 1e-9 else None
+    cap_base = 0.0
+    if cap_axis is not None:
+        proj = (pts - center) @ cap_axis
+        cap_base = float(proj.min())
+
+    radius = radius_fit
+    radius_source = "fit"
+    tangent = False
+    # Tangency prior: a cap meeting flats near-tangent is design intent — snap
+    # the radius from the flats (chord-bias-free). A plane tangent to a sphere
+    # sits at distance == radius from the centre; solve the radius that makes the
+    # mean flat distance match, then re-check it improves the residual.
+    if plane_normals and plane_points:
+        dists = []
+        for pn, pp in zip(plane_normals, plane_points):
+            pn = pn / (np.linalg.norm(pn) or 1.0)
+            dists.append(abs(float((center - pp) @ pn)))
+        if dists:
+            r_tan = float(np.mean(dists))
+            thresh = tangency_threshold_deg(config, resolution)
+            frac = min(1.0, abs(r_tan - radius) / radius) if radius > 1e-9 else 1.0
+            defect = float(np.degrees(np.arcsin(frac)))
+            if defect <= thresh and min_r <= r_tan <= max_radius:
+                resid_tan = np.linalg.norm(pts - center, axis=1) - r_tan
+                rms_tan = float(np.sqrt(np.mean(resid_tan ** 2)))
+                if rms_tan <= tol:
+                    radius = r_tan
+                    rms = rms_tan
+                    radius_source = "tangency"
+                    tangent = True
+
+    return Sphere(
+        center=center,
+        radius=float(radius),
+        rms=float(rms),
+        face_indices=list(face_ids),
+        outward=outward,
+        coverage=float(coverage),
+        tangent=tangent,
+        radius_source=radius_source,
+        cap_axis=cap_axis,
+        cap_base=cap_base,
+    )
+
+
+def sphere_consensus_regions(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    candidate_regions: list[list[int]],
+    config: ConversionConfig,
+    resolution: MeshResolution,
+) -> tuple[list[Sphere], set[int]]:
+    """Cross-region sphere consensus for dome routing (design §3, task §3).
+
+    A tessellated dome (fan_panel's R≈74.7 grille cap) segments into many thin
+    planar strips; NO single strip is compact enough to read as a sphere on its
+    own (the per-region gate the M4 report notes as failing). But *many* strips
+    share one (centre, radius): fitting a sphere to each candidate region and
+    clustering by (centre, radius), a dominant cluster whose members' vertices
+    all lie on one sphere is a dome signature. We merge each such cluster's
+    facets and fit ONE sphere to the union.
+
+    Returns ``(spheres, claimed_faces)`` — the merged-region spheres and the set
+    of facet indices they consume (so swept detection skips them).
+    """
+    if not config.detect_spheres or not candidate_regions:
+        return [], set()
+
+    extent = vertices.max(axis=0) - vertices.min(axis=0)
+    max_radius = config.max_sphere_radius or (config.max_sphere_radius_frac * float(extent.max()))
+
+    # Per-region provisional fits: (center, radius, faces). Only regions whose
+    # own vertices fit a plausible sphere (loose RMS) join the vote — a flat or
+    # cylindrical strip fits a wild sphere the radius-sanity gate rejects.
+    fits: list[tuple[np.ndarray, float, list[int]]] = []
+    for face_ids in candidate_regions:
+        if len(face_ids) < config.sphere_consensus_min_region_facets:
+            continue
+        vert_ids = np.unique(faces[face_ids].reshape(-1))
+        pts = vertices[vert_ids]
+        if len(pts) < 4:
+            continue
+        center, radius, rms = _fit_sphere(pts)
+        if radius <= 0 or radius > max_radius:
+            continue
+        local_edge = resolution.edge_for(face_ids)
+        # Loose per-strip gate: a thin strip's few vertices fit a sphere with
+        # some slack, so admit up to a multiple of the surface tolerance; the
+        # consensus clustering is what actually confirms the dome.
+        if rms > config.sphere_consensus_rms_mult * _local_tol(config, local_edge):
+            continue
+        fits.append((center, radius, list(face_ids)))
+
+    if len(fits) < config.sphere_consensus_min_regions:
+        return [], set()
+
+    # Cluster fits by shared (centre, radius): two strips belong to the same
+    # dome when their centres are within a radius-scaled tolerance AND their
+    # radii agree. Greedy single-link clustering over the (small) candidate set.
+    used = [False] * len(fits)
+    spheres: list[Sphere] = []
+    claimed: set[int] = set()
+    normals, _ = face_normals_and_areas(vertices, faces)
+    adjacency = build_edge_adjacency(faces)
+    neighbors: list[list[int]] = [[] for _ in range(len(faces))]
+    for incident in adjacency.values():
+        for i in incident:
+            for j in incident:
+                if i != j:
+                    neighbors[i].append(j)
+    for i in range(len(fits)):
+        if used[i]:
+            continue
+        ci, ri, _ = fits[i]
+        cluster = [i]
+        used[i] = True
+        for j in range(i + 1, len(fits)):
+            if used[j]:
+                continue
+            cj, rj, _ = fits[j]
+            rtol = config.sphere_consensus_radius_rel * max(ri, rj) + 0.5
+            ctol = config.sphere_consensus_center_rel * max(ri, rj) + 0.5
+            if abs(ri - rj) <= rtol and float(np.linalg.norm(ci - cj)) <= ctol:
+                cluster.append(j)
+                used[j] = True
+        if len(cluster) < config.sphere_consensus_min_regions:
+            continue
+        merged: list[int] = []
+        for k in cluster:
+            merged.extend(fits[k][2])
+        merged = sorted(set(merged))
+        # Sphere-signature gate on the MERGED region: a true dome's normals fan
+        # out (``_region_axis`` is None); a smooth freeform / vase-mode wall's
+        # stacked rings ALSO cluster by (centre, R) — but their normals rotate
+        # about ONE axis, so _region_axis returns a vector and the region is
+        # rejected. This is what stops the consensus firing on organic vase walls
+        # (the false-positive the design §7 risk register warns about).
+        if _region_axis(merged, set(merged), normals, neighbors, config) is not None:
+            continue
+        sph = _fit_sphere_for_region(
+            vertices, faces, merged, normals, config, resolution, max_radius)
+        if sph is None:
+            continue
+        spheres.append(sph)
+        claimed.update(sph.face_indices)
+    return spheres, claimed
+
+
+def detect_spheres(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    smooth_bands,
+    regions: list[Region],
+    claimed: set[int],
+    config: ConversionConfig | None = None,
+    resolution: MeshResolution | None = None,
+) -> list[Sphere]:
+    """Detect sphere caps (domes) and corner blends (design §3, §4, M3).
+
+    Driven from the ``cap``/``blend``-classed smooth regions: a ``cap`` borders
+    <=1 flat (a dome / end cap), a ``blend`` borders >=3 (a corner where three
+    fillets meet). Each compact region whose normals fan out (``_region_axis`` is
+    None) is fitted to a sphere; a ``blend``'s adjacent flats supply the tangency
+    prior. Returns ``Sphere`` objects; the builder cuts (concave) or fuses
+    (convex) them. Best-effort — never raises on a bad region.
+    """
+    config = config or ConversionConfig()
+    if not config.detect_spheres:
+        return []
+    if resolution is None:
+        resolution = mesh_resolution(vertices, faces, config)
+    normals, _ = face_normals_and_areas(vertices, faces)
+    adjacency = build_edge_adjacency(faces)
+    neighbors: list[list[int]] = [[] for _ in range(len(faces))]
+    for incident in adjacency.values():
+        for i in incident:
+            for j in incident:
+                if i != j:
+                    neighbors[i].append(j)
+
+    extent = vertices.max(axis=0) - vertices.min(axis=0)
+    max_radius = config.max_sphere_radius or (config.max_sphere_radius_frac * float(extent.max()))
+
+    spheres: list[Sphere] = []
+    for band in smooth_bands:
+        if band.class_hint not in ("cap", "blend"):
+            continue
+        face_ids = [fi for fi in band.face_indices if fi not in claimed]
+        if len(face_ids) < config.min_sphere_facets:
+            continue
+        comp_set = set(face_ids)
+        # Sphere signature: no single curvature axis over this region.
+        if not _sphere_region_axis_is_none(
+                face_ids, comp_set, normals, neighbors, config):
+            continue
+        plane_normals = None
+        plane_points = None
+        if band.border_regions:
+            plane_normals = [regions[r].plane_normal for r in band.border_regions]
+            plane_points = [regions[r].plane_point for r in band.border_regions]
+        sph = _fit_sphere_for_region(
+            vertices, faces, face_ids, normals, config, resolution, max_radius,
+            plane_normals=plane_normals, plane_points=plane_points)
+        if sph is not None:
+            spheres.append(sph)
+            claimed.update(sph.face_indices)
+    return spheres

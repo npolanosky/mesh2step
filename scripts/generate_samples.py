@@ -225,11 +225,45 @@ def swept_wavy_wall():
     )
 
 
+def domed_plate():
+    """A flat plate with a convex spherical cap (dome) on top — ground truth for
+    M3 sphere detection. The dome is a portion of a sphere of known radius R=20
+    fused onto a 60x60x10 plate, so the fitted sphere must recover R=20 (and the
+    cap's centre) while a prismatic part yields no false-positive sphere.
+
+    The cap is built as the part of a ball of radius R centred above the plate top
+    that pokes above it: centre at (30,30, 10 + (R - h)) where ``h`` is the cap
+    height, so the sphere meets the plate top tangentially around a circle. Fusing
+    the whole ball and keeping only the material above the plate would need a
+    trim; instead we intersect the ball with a tall box over the plate footprint
+    and fuse that cap, which leaves a clean dome tangent to the top face.
+    """
+    R = 20.0
+    H = 6.0  # cap height above the plate top (a shallow cap, small sagitta)
+    plate = Part.makeBox(60, 60, 10)
+    # Sphere centre sits BELOW the plate top by (R - H) so only a shallow spherical
+    # cap of height H rises above z=10 — apex at z = cz + R = 10 + H = 16.
+    cz = 10.0 - (R - H)
+    ball = Part.makeSphere(R, App.Vector(30, 30, cz))
+    # Keep only the portion above the plate top (z >= 10): intersect with a slab.
+    slab = Part.makeBox(60, 60, R, App.Vector(0, 0, 10.0))
+    cap = ball.common(slab)
+    part = plate.fuse(cap).removeSplitter()
+    return save(
+        part,
+        "domed_plate",
+        {"kind": "domed_plate", "dims_mm": [60, 60, 10 + H],
+         "cylinders": [],
+         "spheres": [{"radius": R, "center": [30.0, 30.0, round(cz, 4)],
+                      "cap_height": H, "outward": True}]},
+    )
+
+
 def main():
     print(f"Writing samples to {OUT} (deflection={DEFLECTION} mm)")
     truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe(),
               countersink_plate(), angled_hole_plate(), fillet_chamfer_plate(),
-              swept_wavy_wall()]
+              swept_wavy_wall(), domed_plate()]
     (OUT / "samples.json").write_text(json.dumps(truths, indent=2))
     print(f"Wrote {len(truths)} samples + samples.json")
 

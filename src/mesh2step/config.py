@@ -301,6 +301,31 @@ class ConversionConfig:
     # line+arc+line profile). Otherwise the run goes to a line/B-spline.
     swept_arc_tol_rel: float = 0.001
 
+    # Repeated-tooth guard (M4 gear regression). An involute gear / splined shaft
+    # fits as one swept region whose profile is dozens of near-identical short
+    # arcs (the tessellated tooth flanks). Building one boolean lens op per arc is
+    # O(arcs × base_faces) and never converges (gear_box_gear_v2 timed out >2 min
+    # at 456 arcs). Such a profile is dropped wholesale (teeth stay faceted by
+    # design for now). A profile trips the guard when it has >= swept_repeat_arc_min
+    # arcs whose radii cluster into only <= swept_repeat_distinct_frac of that
+    # count of distinct values (radii within swept_repeat_radius_rel are one).
+    swept_repeat_arc_min: int = 12
+    swept_repeat_distinct_frac: float = 0.5
+    swept_repeat_radius_rel: float = 0.05
+
+    # Per-part swept lens-op cost budget (M4 gear regression). Each lens op is a
+    # boolean against the faceted base, cost ~O(base_faces); the whole batch is
+    # O(distinct_arcs × base_faces). When that product exceeds this budget the
+    # batch is skipped wholesale with a clear log (the walls stay faceted) rather
+    # than grinding for minutes on a pathological mesh. The repeated-arc guard
+    # already drops the gear-tooth profiles (0 arcs), so this is a belt-and-braces
+    # ceiling for any residual blow-up — set well ABOVE the corpus's real swept
+    # parts (tweezer ~50 arcs × ~9 k faces = 447 k built fine; USB-holder /
+    # drive_bay similar) so it never vetoes a legitimate reconstruction, while
+    # still catching a runaway (a gear's raw 456 arcs × 12 k = 5.5 M). None
+    # disables the budget (unbounded — the old behaviour).
+    swept_op_budget: int | None = 1_500_000
+
     # After the swept lens ops, remove micro-sliver planar faces (below this
     # area, mm^2) that drag a large flat into a smooth chain — decimation and
     # boolean-seam wedges of negligible area that read as residual tessellation.
@@ -308,6 +333,66 @@ class ConversionConfig:
     # OCC defeaturing with validity/volume guards (reverts wholesale).
     swept_defeature_slivers: bool = True
     swept_sliver_max_area: float = 0.5
+
+    # --- Spheres: domes and corner blends (M3). See docs/CURVED_FEATURES.md §3,
+    # §4. A dome (grille cap, rounded boss top) or the spherical blend where three
+    # fillets meet is a spherical cap: its facet normals fan out in all directions
+    # (_region_axis returns None) and its vertices lie on one sphere. We fit the
+    # 4-parameter linear sphere, sagitta-bias-correct, gate, and snap to adjacent
+    # flats when near-tangent. Domes that tessellate into many strips are routed
+    # here via a cross-region sphere consensus BEFORE swept-wall fitting.
+
+    # Detect and rebuild spherical caps / corner blends. Behind this flag so the
+    # whole feature can be disabled if it ever regresses a part.
+    detect_spheres: bool = True
+
+    # Minimum facets a compact smooth region must have to attempt a sphere fit.
+    min_sphere_facets: int = 8
+
+    # Reject fitted spheres below this radius (mm) — sub-facet blobs on organic
+    # surfaces fit tiny spheres. The effective floor is the larger of this and
+    # min_sphere_radius_edges * local_edge (a sphere can't be finer than a facet).
+    min_sphere_radius: float = 0.5
+    min_sphere_radius_edges: float = 0.5
+
+    # Reject fitted radii larger than this (mm). None -> derived from the part
+    # size (see max_sphere_radius_frac).
+    max_sphere_radius: float | None = None
+
+    # When max_sphere_radius is None, cap the fitted radius at this fraction of
+    # the part's largest bounding-box dimension. A dome / corner blend is a
+    # feature ON the part, well under its overall size; a spurious fit over an
+    # organic / vase-mode wall lands at a near-part-size sphere. domed_plate's
+    # R=20 on a 60 mm part is 0.33; the vase's bogus R≈87 on a 130 mm part is
+    # 0.67 — so 0.45 admits real caps while dropping the organic false positives.
+    max_sphere_radius_frac: float = 0.45
+
+    # Minimum solid-angle fraction (0..1) of the sphere a cap must span. Rejects
+    # sliver clusters that algebraically fit a huge sphere but barely wrap it.
+    # A shallow but genuine dome covers ~0.15 (domed_plate), so this stays low;
+    # the organic-wall false positive (a vase ring-stack fitting a bogus
+    # part-size sphere) is dropped by the radius-vs-part-size cap above, not here.
+    min_sphere_coverage: float = 0.03
+
+    # --- Dome routing via cross-region sphere consensus (task §3). A tessellated
+    # dome segments into many thin planar strips; no single strip reads as a
+    # sphere (the per-region gate fails), but many strips share one (centre, R).
+    # We fit each candidate region, cluster by (centre, R), and a dominant cluster
+    # is a dome — routed to the sphere detector BEFORE swept-wall fitting so M4
+    # never wastes minutes fitting doomed lens ops to a dome's latitude rows.
+
+    # Minimum facets a strip must have to join the consensus vote.
+    sphere_consensus_min_region_facets: int = 3
+    # A strip joins the vote only if its own sphere fit RMS is within this
+    # multiple of the surface tolerance (loose — the clustering confirms the dome).
+    sphere_consensus_rms_mult: float = 4.0
+    # Minimum candidate strips overall, and minimum members in a cluster, to
+    # accept a dome (many regions sharing one sphere is the dome signature).
+    sphere_consensus_min_regions: int = 4
+    # Two strips share a dome when their fitted radii agree within this relative
+    # fraction and their centres within this fraction of the radius (+ mm floor).
+    sphere_consensus_radius_rel: float = 0.06
+    sphere_consensus_center_rel: float = 0.06
 
     # --- RTAF: Residual Tessellation Area Fraction (post-conversion quality
     # metric). See docs/CURVED_FEATURES.md §6a. Fraction of the output solid's
