@@ -43,3 +43,6 @@ Thumbs.db
 # Large real-world test meshes live locally, not in git (see tests/data/real).
 tests/data/real/*
 !tests/data/real/README.md
+
+#LLM stuff
+./claude
