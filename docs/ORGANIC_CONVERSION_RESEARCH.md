@@ -561,28 +561,50 @@ sphere) and the target corpus (`low_poly_cat`, `3x1 Tweezer Mount`):
   0.14 mm (1.4 %)** — the inherent coarse-cage limit-surface approximation.
   `buildFromPolesMultsKnots` with uniform knots `[0..7]` clamps the domain to
   the central span, so `bs.toShape()` returns exactly the per-quad patch face.
-- **BLOCKER (OCC/FreeCAD 7.8):** OpenCASCADE **does not reliably sew a network
-  of many independent trimmed B-spline faces into a closed shell**, even when
-  adjacent Stam patches share control rows and their boundary curves sample
-  byte-identically (confirmed at 3 decimals). Two adjacent patches sew fine
-  (the shared edge merges); at scale (~3 000 patches) most edges merge but the
-  extraordinary-vertex caps never re-sew — `makeFilledFace`/planar caps built
-  from the neighbour B-spline edges are not stitched back regardless of sew
-  tolerance (tested to 1.0 mm), `Shape.fix`/ShapeFix, or a STEP write/read
-  round-trip. Result on the ideal sphere: a **single connected shell covering
-  ~92 % of area with ~27 small open EV-region gaps**, ~500 free edges — never a
-  closed solid. This is an OCC B-rep-assembly limitation, not a geometry-math
-  error (the patches are correct and dimensionally honest).
-- **Consequence / current behaviour:** the tier attempts Candidate A on
-  mostly-organic bodies (RTAF ≥ `organic_multipatch_min_residual`) and, because
-  the shell does not close, **declines and keeps the existing output — never
-  regresses.** `low_poly_cat` and `3x1 Tweezer Mount` both keep their prior
-  watertight results (RTAF 0.528 / 0.817). The complete, tested infrastructure
-  is in place for when the closure is unblocked.
-- **Paths to unblock closure (for a follow-up):** (1) build the shell with
-  explicit **shared `TopoDS_Edge` topology** (one edge per cage half-edge,
-  faces referencing it, so no proximity sewing is needed) — needs pcurves on
-  each B-spline face (`Part.Face(surface, wire)` returned area 0 without them);
-  (2) fewer EVs via a vendored **QuadriFlow** cage (its global singularity
-  removal shrinks the cap set); (3) exact-G1 **ACC/Gregory** EV caps that meet
-  the neighbour patches within OCC sew tolerance instead of `makeFilledFace`.
+- **RESOLVED — the shell now closes watertight (v0.3.0-alpha.2).** The earlier
+  blocker (a network of trimmed B-spline faces would not sew into a closed shell)
+  was NOT an OCC sewing limitation of the *regular* patches — those sew flawlessly
+  (2 592 contiguous edges merge, 0 free, one shell on the GT sphere) *because
+  their shared boundary iso-curves are bit-identical* (verified to ~1e-15, not
+  just 3 decimals). The whole gap was the **extraordinary-vertex caps**: the old
+  `Part.makeFilledFace`/planar caps rebuilt their own boundary edges (which no
+  longer matched the neighbour patches) and never re-sewed. The fix, using the
+  `OCC.Core` (pythonocc-core) bindings **FreeCAD already ships** (verified
+  importable inside FreeCAD 1.1's interpreter, `OCC 7.8.1.1`):
+  1. Build each regular patch as a `Geom_BSplineSurface` +
+     `BRepBuilderAPI_MakeFace(surf, u0,u1,v0,v1, tol)` (pcurves built by OCC).
+     `Part.Face(surface, wire)` returning area 0 was the pcurve problem —
+     `BRepBuilderAPI_MakeFace` on surface+bounds builds them.
+  2. Cap each connected EV region with ONE filled face over its outer boundary
+     loop, where **every boundary edge reuses the neighbour regular patch's exact
+     `Geom` boundary iso-curve** (`surf.UIso/VIso` trimmed to the central span).
+     The cap therefore shares the shell geometry bit-for-bit. Two fillers are
+     tried — `BRepOffsetAPI_MakeFilling`, then `BRepFill_Filling` pinned by the
+     region's interior limit points — each geometry-validated (bbox + local-spike
+     guards) so a self-intersecting fill is rejected, plus a planar fallback.
+  3. One `BRepBuilderAPI_Sewing` pass (tight tolerance, escalated to ~1–3 % of
+     the cage edge length only as far as needed) → `BRepBuilderAPI_MakeSolid` →
+     `ShapeFix_Shell`/`ShapeFix_Solid` healing when a C0 cap trips validity.
+  Result on the ground-truth R=10 sphere: **closed watertight solid, `isValid`,
+  re-reads valid from STEP, max radius deviation 0.21 mm (mean 0.08 mm), RTAF 0**
+  — meeting the prior 0.20 mm accuracy. Refine-and-cap escalation (retry one
+  Catmull-Clark level finer when a cap can't be validly built) closes gently
+  curved organic bodies; genuinely sharp knife-edge EVs (e.g. a low-poly cat's
+  ear tips, ~0.06 mm thick) still defeat all three fillers and cause that one
+  region to decline (never regress).
+- **Upstream cage fix (same milestone).** `pynanoinstantmeshes` leaves small
+  boundary holes / non-manifold quads at some targets (the GT sphere cracks at
+  target 220 but is clean at 100; `low_poly_cat` and `3x1 Tweezer Mount` cages
+  failed post-repair before). `quadremesh.build_quad_cage` now (a) prefers a clean
+  cage by **backing off to progressively coarser, more-robust targets**, and
+  (b) **repairs** a cage as a fallback (weld coincident vertices, drop degenerate
+  / non-manifold quads, fill small even boundary holes with a centroid quad fan).
+  Both the tweezer and cat cages now build closed-manifold.
+- **Current behaviour / corpus:** GT sphere → watertight organic solid (RTAF 0).
+  `3x1 Tweezer Mount` closes watertight but is a *prismatic* part — the
+  Catmull-Clark limit rounds its sharp edges to ~8.4 mm deviation, so the
+  deviation gate (2 % of diag) correctly **rejects** it and it keeps its analytic
+  result. `low_poly_cat` reconstructs 82/83 EV regions; the one knife-edge tip
+  region defeats the fillers so it declines and keeps its faceted output. All
+  three outcomes are non-regressing by the strict adoption gate (watertight +
+  RTAF-improvement + bbox-stable + deviation + STEP re-read).

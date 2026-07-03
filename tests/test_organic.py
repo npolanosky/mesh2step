@@ -186,6 +186,17 @@ except Exception:  # noqa: BLE001
     HAVE_PNIM = False
 
 
+try:  # pragma: no cover - environment probe
+    import FreeCAD  # type: ignore  # noqa: F401
+    import Part  # type: ignore  # noqa: F401
+
+    from mesh2step.organic import _occ
+
+    HAVE_OCC = _occ()
+except Exception:  # noqa: BLE001
+    HAVE_OCC = False
+
+
 @pytest.mark.skipif(not HAVE_PNIM, reason="pynanoinstantmeshes not installed")
 def test_quad_remesh_produces_closed_all_quad_cage():
     from mesh2step.quadremesh import quad_remesh, validate_quad_cage
@@ -198,3 +209,65 @@ def test_quad_remesh_produces_closed_all_quad_cage():
     ok, detail = validate_quad_cage(quads)
     # The remesher is robust on a clean closed sphere; the cage should validate.
     assert ok, f"quad cage should be closed-manifold: {detail}"
+
+
+def test_repair_quad_cage_fills_boundary_hole():
+    """A quad cage with one small even boundary hole is repaired to closed-manifold
+    by the centroid-fan fill (pure numpy, no remesher/FreeCAD)."""
+    from mesh2step.quadremesh import repair_quad_cage, validate_quad_cage
+
+    v, q = _quad_sphere(nu=16, nv=10, r=10.0)
+    # Punch a hole: drop 4 quads forming an even boundary loop.
+    holed = np.array([row for i, row in enumerate(q) if i not in (0, 1, 16, 17)])
+    ok0, _ = validate_quad_cage(holed)
+    assert not ok0, "punched cage should be open"
+    rv, rq = repair_quad_cage(v, holed)
+    ok1, detail = validate_quad_cage(rq)
+    assert ok1, f"repaired cage should be closed-manifold: {detail}"
+
+
+@pytest.mark.skipif(not HAVE_PNIM, reason="pynanoinstantmeshes not installed")
+def test_build_quad_cage_backs_off_to_clean_target():
+    """build_quad_cage returns a usable closed-manifold cage on a clean sphere,
+    backing off to a coarser (cleaner) target if the requested one isn't clean."""
+    from mesh2step.quadremesh import build_quad_cage
+
+    v, q = _quad_sphere(nu=24, nv=16, r=10.0)
+    tris = np.array([[a, b, c] for a, b, c, d in q] + [[a, c, d] for a, b, c, d in q])
+    qv, quads, detail = build_quad_cage(v, tris, 220)
+    assert detail.get("ok"), f"cage should be usable: {detail}"
+    assert quads is not None and quads.shape[1] == 4
+
+
+@pytest.mark.skipif(not (HAVE_PNIM and HAVE_OCC),
+                    reason="needs pynanoinstantmeshes + FreeCAD OCC bindings")
+def test_organic_shell_closes_watertight_sphere():
+    """End-to-end: the whole-body organic pipeline reconstructs a ground-truth
+    sphere as a WATERTIGHT solid that re-reads valid, with deviation and RTAF at
+    the expected accuracy. This is the closure regression guard."""
+    import Part  # type: ignore
+
+    from mesh2step import organic
+    from mesh2step.config import ConversionConfig
+
+    v, q = _quad_sphere(nu=24, nv=16, r=10.0)
+    tris = np.array([[a, b, c] for a, b, c, d in q] + [[a, c, d] for a, b, c, d in q])
+    shape, stats = organic.build_organic_shell(v, tris, ConversionConfig())
+    assert stats.get("organic_watertight"), stats.get("organic_reason")
+    assert shape is not None and shape.isValid()
+    assert shape.Solids and shape.Solids[0].Shells[0].isClosed()
+    assert stats.get("organic_free_edges") == 0
+    # Re-read via STEP round-trip (the pipeline's export-revalidation gate).
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".step", delete=False) as tmp:
+        shape.exportStep(tmp.name)
+        reread = Part.Shape()
+        reread.read(tmp.name)
+    assert reread.isValid() and len(reread.Solids) == 1
+    assert reread.Solids[0].Shells[0].isClosed()
+    # Radius deviation of the reconstructed surface to the true R=10 sphere.
+    tess = shape.tessellate(0.05)
+    sv = np.array([[p.x, p.y, p.z] for p in tess[0]])
+    dev = np.abs(np.linalg.norm(sv, axis=1) - 10.0)
+    assert dev.max() < 0.5, f"radius deviation too high: {dev.max():.3f} mm"

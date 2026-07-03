@@ -123,3 +123,186 @@ def validate_quad_cage(quads: np.ndarray) -> tuple[bool, dict]:
     if not ok:
         detail["reason"] = "not closed-manifold"
     return ok, detail
+
+
+def _weld_vertices(qv: np.ndarray, quads: np.ndarray, tol: float):
+    """Merge cage vertices closer than ``tol`` (union-find). The remesher emits a
+    few coincident-but-distinct vertices that read as seams; welding them recovers
+    the shared topology. Returns ``(verts, quads)`` re-indexed."""
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:  # noqa: BLE001
+        return qv, quads
+    parent = list(range(len(qv)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, j in cKDTree(qv).query_pairs(tol):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+    remap: dict[int, int] = {}
+    newv = []
+    for i in range(len(qv)):
+        r = find(i)
+        if r not in remap:
+            remap[r] = len(newv)
+            newv.append(qv[r])
+    newq = np.array([[remap[find(int(x))] for x in q] for q in quads], dtype=int)
+    return np.array(newv, dtype=float), newq
+
+
+def _boundary_loops(quads: np.ndarray) -> list[list[int]]:
+    """Ordered vertex loops of the cage's boundary (edges on exactly one face).
+
+    The remesher occasionally leaves small holes; each is a simple closed loop of
+    boundary edges. Returns one vertex list per loop (open loops are dropped)."""
+    from collections import defaultdict
+
+    from .catmull_clark import quad_edge_faces
+
+    ef = quad_edge_faces(quads)
+    adj: dict[int, list[int]] = defaultdict(list)
+    for (a, b), fs in ef.items():
+        if len(fs) == 1:
+            adj[a].append(b)
+            adj[b].append(a)
+    seen: set[int] = set()
+    loops: list[list[int]] = []
+    for start in list(adj):
+        if start in seen or len(adj[start]) != 2:
+            continue
+        loop = [start]
+        seen.add(start)
+        prev, cur = None, start
+        closed = False
+        while True:
+            nxts = [x for x in adj[cur] if x != prev]
+            if not nxts:
+                break
+            nb = nxts[0]
+            if nb == loop[0]:
+                closed = True
+                break
+            if nb in seen:
+                break
+            loop.append(nb)
+            seen.add(nb)
+            prev, cur = cur, nb
+        if closed and len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+
+def repair_quad_cage(qv: np.ndarray, quads: np.ndarray, *, max_hole: int = 64):
+    """Best-effort repair of a remesher cage toward closed-manifold-all-quad.
+
+    Steps: (1) weld near-coincident vertices; (2) drop degenerate quads; (3) drop
+    the excess faces on any non-manifold edge; (4) fill each small boundary hole
+    with a quad fan around a new centroid vertex (even loops split into quads
+    pairwise; odd loops are left, so a cage with an odd hole stays open and is
+    declined upstream). The added centroids become extraordinary vertices, which
+    the EV-cap machinery already handles. Returns ``(verts, quads)`` — the caller
+    re-validates; this never raises."""
+    qv = np.asarray(qv, dtype=float)
+    quads = np.asarray(quads, dtype=int)
+    if quads.ndim != 2 or quads.shape[1] != 4 or len(quads) == 0:
+        return qv, quads
+    # Median edge length sets the weld tolerance (a small fraction of it).
+    el = [float(np.linalg.norm(qv[int(q[k])] - qv[int(q[(k + 1) % 4])]))
+          for q in quads for k in range(4)]
+    med = float(np.median(el)) if el else 1.0
+    qv, quads = _weld_vertices(qv, quads, 0.05 * med)
+
+    # Drop degenerate quads.
+    quads = np.array([q for q in quads if len({int(x) for x in q}) == 4], dtype=int)
+    if len(quads) == 0:
+        return qv, quads
+
+    # Drop excess faces on non-manifold edges (keep the first two per edge).
+    from .catmull_clark import quad_edge_faces
+    ef = quad_edge_faces(quads)
+    bad = set()
+    for fs in ef.values():
+        if len(fs) > 2:
+            bad.update(fs[2:])
+    if bad:
+        quads = np.array([q for i, q in enumerate(quads) if i not in bad], dtype=int)
+
+    # Fill boundary holes with a centroid fan of quads.
+    loops = _boundary_loops(quads)
+    if loops:
+        newv = list(qv)
+        newq = list(quads)
+        for loop in loops:
+            n = len(loop)
+            if n < 4 or n % 2 != 0 or n > max_hole:
+                continue  # odd/large holes left open -> caller declines
+            centroid = np.mean([qv[i] for i in loop], axis=0)
+            ci = len(newv)
+            newv.append(centroid)
+            for i in range(0, n, 2):
+                a, b, c = loop[i], loop[(i + 1) % n], loop[(i + 2) % n]
+                newq.append([ci, a, b, c])
+        qv = np.array(newv, dtype=float)
+        quads = np.array([q for q in newq if len({int(x) for x in q}) == 4], dtype=int)
+    return qv, quads
+
+
+def build_quad_cage(vertices, faces, target_quads, on_progress=None):
+    """Remesh + repair + target back-off -> a closed-manifold-all-quad cage.
+
+    The remesher (pynanoinstantmeshes) is more robust at coarser targets: a fine
+    target can leave small holes / non-manifold quads while a coarser one on the
+    same input is clean. We try the requested target, repair the cage, and if it
+    still doesn't validate, back off to progressively coarser targets (repairing
+    each). Returns ``(qv, quads, detail)`` with ``detail['ok']`` set; on failure
+    ``detail`` explains why so the caller can decline (never regress)."""
+    def progress(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
+
+    target = int(target_quads)
+    ladder = [target]
+    for frac in (0.5, 0.3, 0.18):
+        t = max(40, int(target * frac))
+        if t < ladder[-1]:
+            ladder.append(t)
+    last_detail: dict = {}
+    repaired_fallback = None   # (qv, quads, detail) — used only if no clean cage
+    for t in ladder:
+        try:
+            qv, quads = quad_remesh(vertices, faces, t)
+        except Exception as exc:  # noqa: BLE001
+            last_detail = {"reason": f"remesh failed: {exc}", "target": t}
+            continue
+        ok, detail = validate_quad_cage(quads)
+        if ok:
+            # A clean, unrepaired cage is best (no artificial hole-fill EVs) — take
+            # it immediately. The remesher is cleaner at coarser targets, so the
+            # ladder trends this way anyway.
+            detail["target"] = t
+            detail["repaired"] = False
+            return qv, quads, {**detail, "ok": True}
+        # Remember the first repairable cage as a fallback, but keep trying coarser
+        # targets for a clean one (repair adds a high-valence EV per filled hole).
+        if repaired_fallback is None:
+            rv, rq = repair_quad_cage(qv, quads)
+            ok2, detail2 = validate_quad_cage(rq)
+            if ok2:
+                detail2["target"] = t
+                detail2["repaired"] = True
+                repaired_fallback = (rv, rq, {**detail2, "ok": True})
+        last_detail = {**detail, "target": t}
+        progress(f"Organic: cage at target {t} not clean "
+                 f"({detail.get('reason')}); trying coarser")
+    if repaired_fallback is not None:
+        rv, rq, rdetail = repaired_fallback
+        progress(f"Organic: no clean cage; using repaired cage at target "
+                 f"{rdetail.get('target')} ({rdetail.get('quads')} quads)")
+        return rv, rq, rdetail
+    return None, None, {**last_detail, "ok": False}
