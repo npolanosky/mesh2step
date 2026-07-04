@@ -315,11 +315,161 @@ def freeform_bump():
     )
 
 
+def threaded_rod():
+    """A cylinder with a real helical thread of KNOWN pitch — ground truth for
+    M5.2 thread detection. A V thread profile is swept along a helix of pitch
+    P=2.0 mm over an R=6 mm core (depth 1.0 mm) and fused to the core, so the
+    detector must recover the pitch and suppress the band to a cylinder.
+
+    Built with Part.makeHelix + Part.BRepOffsetAPI.MakePipeShell (the profile is
+    a WIRE, per the OCC API). A finer tessellation keeps the flanks sampled so the
+    helix phase-fit has a clean signal.
+    """
+    R = 6.0        # core radius
+    P = 2.0        # pitch (mm) — the ground truth to recover
+    H = 20.0       # threaded length
+    depth = 1.0    # thread depth
+    core = Part.makeCylinder(R, H)
+    helix = Part.makeHelix(P, H, R)
+    # Symmetric V thread profile as a WIRE in the x-z plane at the helix start.
+    a = App.Vector(R, 0, -P * 0.35)
+    b = App.Vector(R + depth, 0, 0)
+    c = App.Vector(R, 0, P * 0.35)
+    wire = Part.makePolygon([a, b, c, a])
+    mps = Part.BRepOffsetAPI.MakePipeShell(helix)
+    mps.setFrenetMode(True)
+    mps.add(wire)
+    mps.build()
+    mps.makeSolid()
+    solid = core.fuse(mps.shape()).removeSplitter()
+    if not (solid.Solids and solid.Solids[0].isValid()):
+        raise RuntimeError("threaded_rod: could not build a valid solid")
+    # Finer deflection than the default so the thread flanks stay sampled.
+    mesh = Mesh.Mesh()
+    pts, facets = solid.tessellate(0.03)
+    mesh.addFacets([(pts[a2], pts[b2], pts[c2]) for a2, b2, c2 in facets])
+    path = OUT / "threaded_rod.stl"
+    mesh.write(str(path))
+    truth = {"kind": "threaded_rod",
+             "dims_mm": [2 * (R + depth), 2 * (R + depth), H],
+             "cylinders": [],
+             "threads": [{"pitch": P, "core_radius": R, "depth": depth,
+                          "starts": 1, "handedness": "right", "is_internal": False}],
+             "file": path.name, "triangles": mesh.CountFacets}
+    print(f"  {path.name}: {mesh.CountFacets} triangles")
+    return truth
+
+
+def knurled_band():
+    """A cylinder whose mid-section is a diamond knurl — ground truth for M5.1.
+
+    Two crossing families of shallow helical grooves are cut into an R=10 mm
+    cylinder over a central band, giving the micro-roughness a knurl detector
+    keys off. The detector must claim the band and SUPPRESS it to a cylinder near
+    R (crest radius). Note (design §3): a helical-cut synthetic knurl can read as
+    a *thread* rather than a diamond — that is harmless, since both suppress the
+    band to the same cylinder; the test checks the geometric suppression, not the
+    metadata label.
+    """
+    R = 10.0
+    H = 24.0
+    band_lo, band_hi = 8.0, 16.0
+    depth = 0.35
+    rod = Part.makeCylinder(R, H)
+    tools = []
+    for left in (False, True):   # right- and left-hand helices (a diamond)
+        helix = Part.makeHelix(8.0, band_hi - band_lo, R, 0, left)
+        s = 0.7
+        a = App.Vector(R - depth, -s, 0)
+        b = App.Vector(R + depth, -s, 0)
+        c = App.Vector(R + depth, s, 0)
+        d = App.Vector(R - depth, s, 0)
+        wire = Part.makePolygon([a, b, c, d, a])
+        try:
+            mps = Part.BRepOffsetAPI.MakePipeShell(
+                helix.translated(App.Vector(0, 0, band_lo)))
+            mps.setFrenetMode(True)
+            mps.add(wire)
+            mps.build()
+            mps.makeSolid()
+            tools.append(mps.shape())
+        except Exception:  # noqa: BLE001
+            pass
+    solid = rod
+    for t in tools:
+        try:
+            cut = solid.cut(t)
+            if cut.Solids and cut.Solids[0].isValid():
+                solid = cut
+        except Exception:  # noqa: BLE001
+            pass
+    solid = solid.removeSplitter()
+    if not (solid.Solids and solid.Solids[0].isValid()):
+        solid = rod  # a plain rod still exercises "no knurl on a smooth cylinder"
+    mesh = Mesh.Mesh()
+    # Coarser deflection + a short band keep the sample small for git (a fine
+    # knurl tessellates into hundreds of thousands of facets); the tolerant test
+    # only needs the band claimed near R, not the full micro-roughness a scan has.
+    pts, facets = solid.tessellate(0.3)
+    mesh.addFacets([(pts[a2], pts[b2], pts[c2]) for a2, b2, c2 in facets])
+    path = OUT / "knurled_band.stl"
+    mesh.write(str(path))
+    truth = {"kind": "knurled_band", "dims_mm": [2 * R, 2 * R, H],
+             "cylinders": [],
+             "knurling": [{"nominal_radius": R, "pattern": "diamond",
+                           "band": [band_lo, band_hi], "outward": True}],
+             "file": path.name, "triangles": mesh.CountFacets}
+    print(f"  {path.name}: {mesh.CountFacets} triangles")
+    return truth
+
+
+def spur_gear():
+    """A small spur gear (extruded involute-ish outline) — ground truth for M5.3.
+
+    A closed toothed cross-section is extruded along Z and a central bore cut, so
+    the whole-outline extrusion path must claim the outline as ONE extruded solid
+    (a single guarded fuse, not per-tooth ops) with the bore surviving.
+    """
+    import math
+
+    teeth = 12
+    r_root = 8.0
+    r_tip = 10.0
+    thick = 6.0
+    bore = 3.0
+    pts = []
+    for t in range(teeth):
+        base = 2 * math.pi * t / teeth
+        # simple trapezoidal tooth: root arc, rising flank, tip arc, falling flank
+        prof = [(0.0, r_root), (0.25, r_root), (0.4, r_tip),
+                (0.6, r_tip), (0.75, r_root), (1.0, r_root)]
+        for frac, rr in prof:
+            ang = base + (2 * math.pi / teeth) * frac
+            pts.append(App.Vector(rr * math.cos(ang), rr * math.sin(ang), 0))
+    pts.append(pts[0])
+    wire = Part.makePolygon(pts)
+    face = Part.Face(wire)
+    solid = face.extrude(App.Vector(0, 0, thick))
+    hole = Part.makeCylinder(bore, thick, App.Vector(0, 0, 0))
+    part = solid.cut(hole).removeSplitter()
+    if not (part.Solids and part.Solids[0].isValid()):
+        raise RuntimeError("spur_gear: could not build a valid solid")
+    return save(
+        part,
+        "spur_gear",
+        {"kind": "spur_gear", "dims_mm": [2 * r_tip, 2 * r_tip, thick],
+         "cylinders": [{"radius": bore, "axis": [0, 0, 1], "through": True}],
+         "gears": [{"teeth": teeth, "r_root": r_root, "r_tip": r_tip,
+                    "extent": thick, "bore": bore}]},
+    )
+
+
 def main():
     print(f"Writing samples to {OUT} (deflection={DEFLECTION} mm)")
     truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe(),
               countersink_plate(), angled_hole_plate(), fillet_chamfer_plate(),
-              swept_wavy_wall(), domed_plate(), freeform_bump()]
+              swept_wavy_wall(), domed_plate(), freeform_bump(),
+              threaded_rod(), knurled_band(), spur_gear()]
     (OUT / "samples.json").write_text(json.dumps(truths, indent=2))
     print(f"Wrote {len(truths)} samples + samples.json")
 

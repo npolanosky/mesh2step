@@ -148,6 +148,63 @@ class Sphere:
         }
 
 
+@dataclass
+class KnurlBand:
+    """A knurled cylindrical band, suppressed to its nominal cylinder (M5.1).
+
+    Knurling is a high-frequency micro-roughness pressed onto a cylindrical grip:
+    hundreds of tiny facets whose radial deviation from the wall is small but
+    whose normals tilt in a *bimodal* pattern — a diamond knurl's two crossing
+    helix families give the wall-facet normals two symmetric axial-tilt lobes
+    (``±`` the knurl helix angle), a straight knurl a single lobe. It is never
+    rebuilt as true bumps (absurd cost); it is suppressed to its median-radius
+    mid-surface cylinder via ``_boolean_clean_cylinder``, with the pattern kept
+    as metadata (``stats["knurling"]``). ``nominal_radius`` is the median radial
+    distance of the band's wall vertices (the mid-surface between crest and root).
+    """
+
+    axis_point: np.ndarray   # (3,) a point on the axis
+    axis_dir: np.ndarray     # (3,) unit axis direction
+    nominal_radius: float    # median-rho mid-surface radius (mm) — reported nominal
+    axial_min: float
+    axial_max: float
+    pattern: str             # "diamond" | "straight"
+    pitch_estimate: float    # estimated feature pitch (mm), 0.0 if unknown
+    bimodality: float        # normal-tilt bimodality score (0..1)
+    face_indices: list[int]
+    outward: bool = True     # material inside (a grip boss) — fuse to true up
+    crest_radius: float = 0.0  # high-quantile wall radius (the grip's outer face)
+    root_radius: float = 0.0   # low-quantile wall radius (the groove floor)
+
+    @property
+    def suppress_radius(self) -> float:
+        """Radius the boolean suppresses the knurl to. Fusing an external grip
+        must reach the CRESTS to swallow the valleys (a fuse at the mid-surface
+        leaves the crest micro-facets sticking out); cutting an internal knurl
+        must reach the ROOTS. This is what actually de-facets the band."""
+        if self.outward:
+            return self.crest_radius or self.nominal_radius
+        return self.root_radius or self.nominal_radius
+
+    @property
+    def height(self) -> float:
+        return self.axial_max - self.axial_min
+
+    def as_dict(self) -> dict:
+        return {
+            "nominal_radius": float(self.nominal_radius),
+            "diameter": float(2.0 * self.nominal_radius),
+            "axis_dir": [float(x) for x in self.axis_dir],
+            "axis_point": [float(x) for x in self.axis_point],
+            "height": float(self.height),
+            "pattern": self.pattern,
+            "pitch_estimate": float(self.pitch_estimate),
+            "bimodality": round(float(self.bimodality), 3),
+            "facets": len(self.face_indices),
+            "role": "boss" if self.outward else "hole",
+        }
+
+
 def _connected_components(
     pool: list[int], neighbors: list[list[int]]
 ) -> list[list[int]]:
@@ -559,6 +616,666 @@ def detect_cones(
                 cones.append(cone)
                 claimed.update(cone.face_indices)
     return cones
+
+
+# --------------------------------------------------------------------------- #
+# Knurling — high-frequency micro-roughness on a cylindrical band (M5.1). See
+# docs/M5_HELICAL_PATTERNED.md §3. A knurl is NOT rebuilt as bumps (absurd cost);
+# it is suppressed to its median-radius mid-surface cylinder with the pattern
+# kept as metadata. The classifier keys off the wall-facet normals' *bimodal*
+# axial tilt: a diamond knurl's two crossing helix families give two symmetric
+# axial-tilt lobes, discriminating it from a plain wall (one lobe at 0) and,
+# together with the threads detector's helix-fit, from a single-family thread.
+# --------------------------------------------------------------------------- #
+
+
+def _median_edge_for(vertices: np.ndarray, faces: np.ndarray, face_ids) -> float:
+    """Median triangle edge length over ``face_ids`` (a local resolution proxy)."""
+    fa = np.asarray(face_ids, dtype=int)
+    if fa.size == 0:
+        return 0.0
+    tri = vertices[faces[fa]]
+    e = np.concatenate([
+        np.linalg.norm(tri[:, 1] - tri[:, 0], axis=1),
+        np.linalg.norm(tri[:, 2] - tri[:, 1], axis=1),
+        np.linalg.norm(tri[:, 0] - tri[:, 2], axis=1),
+    ])
+    return float(np.median(e)) if e.size else 0.0
+
+
+def _knurl_bimodality(n_ax: np.ndarray) -> float:
+    """Bimodality score (0..1) of the wall-facet normals' axial-tilt component.
+
+    ``n_ax`` is the signed component of each band facet's normal along the axis
+    (0 for a pure cylinder wall). A knurl tilts the facets alternately up and
+    down the helix families, so ``n_ax`` splits into two symmetric lobes at
+    ``±`` the knurl angle — a wide, near-zero-mean, high-variance, *dip-at-zero*
+    distribution. The score rewards (a) spread (std well above a plain wall's
+    triangulation noise), (b) symmetry (|mean| small vs std), and (c) a central
+    dip (few facets near ``n_ax==0`` relative to the lobes). A plain cylinder
+    wall scores ~0; a diamond knurl ~0.6+.
+    """
+    n = n_ax.size
+    if n < 20:
+        return 0.0
+    std = float(n_ax.std())
+    if std < 1e-6:
+        return 0.0
+    mean = float(n_ax.mean())
+    symmetry = max(0.0, 1.0 - abs(mean) / (std + 1e-9))
+    # Central-dip: fraction in the outer lobes (|n_ax| > 0.5 std) vs the centre
+    # (|n_ax| < 0.25 std). A bimodal (dip-at-zero) population has far more mass in
+    # the lobes; a unimodal peak-at-zero has more in the centre.
+    lobe = float(np.mean(np.abs(n_ax) > 0.5 * std))
+    centre = float(np.mean(np.abs(n_ax) < 0.25 * std))
+    dip = max(0.0, min(1.0, lobe - centre))
+    # Spread term saturates once std clears plain-wall noise (~0.05).
+    spread = max(0.0, min(1.0, (std - 0.05) / 0.15))
+    return float(symmetry * dip * spread) ** (1.0 / 3.0) if symmetry * dip * spread > 0 else 0.0
+
+
+def _knurl_pattern_and_pitch(
+    n_ax: np.ndarray, n_tan: np.ndarray, rho: float,
+) -> tuple[str, float]:
+    """Classify the knurl pattern (diamond/straight) and estimate its pitch.
+
+    A *diamond* knurl has two crossing helix families, so both the axial-tilt
+    (``n_ax``) and the tangential-tilt (``n_tan``) of the wall normals are
+    bimodal. A *straight* (axial) knurl's grooves run along the axis, so only
+    ``n_tan`` tilts and ``n_ax`` stays near zero. Pitch is estimated from the
+    dominant tilt magnitude — the mean lobe amplitude approximates
+    sin(flank-half-angle) of a groove whose circumferential period is
+    ``2·pi·rho / teeth`` — but knurl geometry is coarse, so this is a rough
+    metadata number only (never used to reconstruct anything).
+    """
+    ax_std = float(n_ax.std())
+    tan_std = float(n_tan.std())
+    pattern = "diamond" if ax_std > 0.12 and tan_std > 0.12 else "straight"
+    # Rough pitch: the lobe amplitude ~ sin(theta); a typical knurl groove flank
+    # is ~a few tenths of a mm. Report the mean absolute tilt scaled by radius as
+    # a coarse feature-spacing proxy; 0 if the signal is too weak to be useful.
+    amp = float(np.mean(np.abs(n_ax))) if pattern == "diamond" else float(np.mean(np.abs(n_tan)))
+    pitch = round(2.0 * math.pi * rho * amp / max(1.0, 2.0 * math.pi * rho / 0.6), 3) if amp > 0 else 0.0
+    return pattern, max(0.0, pitch)
+
+
+def detect_knurling(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    cylinders: list[Cylinder],
+    claimed: set[int] | None = None,
+    config: ConversionConfig | None = None,
+) -> list[KnurlBand]:
+    """Detect knurled cylindrical bands (design §3, M5.1).
+
+    Seeds candidate axes from the detected cylinders' axes plus the mesh's
+    flat-face-normal / principal directions (a knurled grip may have no clean
+    coaxial cylinder of its own — the bottle cap has zero detected cylinders).
+    For each axis, wall micro-facets (normals ~perpendicular to the axis) are
+    grouped into tight radial bands; a band is a knurl when it has a very high
+    facet density, a small radial spread about its median radius, and a
+    *bimodal* axial-normal tilt (the diamond knurl's two crossing helix
+    families). Best-effort — returns [] on any failure.
+    """
+    config = config or ConversionConfig()
+    if not getattr(config, "detect_knurling", True):
+        return []
+    if len(faces) < config.min_cylinder_facets:
+        return []
+    claimed = set() if claimed is None else set(claimed)
+
+    normals, areas = face_normals_and_areas(vertices, faces)
+    adjacency = build_edge_adjacency(faces)
+    neighbors: list[list[int]] = [[] for _ in range(len(faces))]
+    for incident in adjacency.values():
+        for i in incident:
+            for j in incident:
+                if i != j:
+                    neighbors[i].append(j)
+
+    extent = vertices.max(axis=0) - vertices.min(axis=0)
+    max_radius = config.max_cylinder_radius or float(extent.max())
+
+    # Candidate axes: detected cylinders first (a knurl is usually coaxial with a
+    # smooth land above/below it), then the flat/principal directions.
+    axes: list[np.ndarray] = [np.asarray(c.axis_dir, float) for c in cylinders]
+    axes += _candidate_axes(vertices, normals, areas, config.max_candidate_axes)
+    unique_axes: list[np.ndarray] = []
+    for ax in axes:
+        ax = ax / (np.linalg.norm(ax) or 1.0)
+        if not any(abs(float(ax @ u)) > 0.999 for u in unique_axes):
+            unique_axes.append(ax)
+
+    centroids = vertices[faces].mean(axis=1)
+    bands: list[KnurlBand] = []
+    used: set[int] = set(claimed)
+    for axis in unique_axes:
+        band = _fit_knurl_for_axis(
+            vertices, faces, axis, normals, centroids, neighbors,
+            used, max_radius, config)
+        if band is not None:
+            bands.append(band)
+            used.update(band.face_indices)
+    return bands
+
+
+def _fit_knurl_for_axis(
+    vertices, faces, axis, normals, centroids, neighbors, used, max_radius, config,
+) -> KnurlBand | None:
+    """Find and classify a knurled band about one candidate ``axis``."""
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    # Wall micro-facets: normals ~perpendicular to the axis. A knurl's flanks
+    # tilt off perfectly-perpendicular, so admit a wider cone than a clean wall.
+    ndot = np.abs(normals @ axis)
+    wall = np.array([i for i in range(len(faces))
+                     if i not in used and ndot[i] < 0.45], dtype=int)
+    if wall.size < config.knurl_min_facets:
+        return None
+
+    # Radial distance of each wall facet's centroid from the axis (through the
+    # mesh centroid — a knurl band wraps the full circle, so its own centroid
+    # is a good axis point).
+    ctr = centroids[wall].mean(axis=0)
+    rel = centroids[wall] - ctr
+    ax_h = rel @ axis
+    radial_vec = rel - ax_h[:, None] * axis
+    rho = np.linalg.norm(radial_vec, axis=1)
+    if rho.size == 0:
+        return None
+    med_rho = float(np.median(rho))
+    if med_rho < config.min_cylinder_radius or med_rho > max_radius:
+        return None
+
+    # Radial-excursion gate — the decisive knurl/gear discriminator. A knurl is a
+    # micro-roughness: its crest-to-root excursion is a tiny fraction of the
+    # radius AND under a facet edge length (the knob band is 2% of R, 0.77 edges).
+    # Gear teeth and coarse grip ribs have a LARGE intrinsic radial excursion
+    # (teeth ~9% of R, ~2.3 edges; ribs deeper still) and must NOT be flattened to
+    # a cylinder — they route to the gear/swept path. Measure the p10..p90 radial
+    # span over the wall facets near the median radius (±15%, which excludes the
+    # hub/bore but keeps the whole crest-to-root of a real feature).
+    near = np.abs(rho - med_rho) <= 0.15 * med_rho
+    if near.sum() < config.knurl_min_facets:
+        return None
+    rn = rho[near]
+    depth = float(np.quantile(rn, 0.9) - np.quantile(rn, 0.1))
+    if depth > config.knurl_max_excursion_rel * med_rho:
+        return None
+    local_edge = _median_edge_for(vertices, faces, wall[near])
+    if local_edge > 1e-9 and depth > config.knurl_max_excursion_edges * local_edge:
+        return None
+
+    # The knurl band is that near-median shell.
+    band_faces = wall[near]
+    med_rho = float(np.median(rho[near]))
+    if band_faces.size < config.knurl_min_facets:
+        return None
+
+    # Recompute a clean axis point (project the band centroid onto the axis) and
+    # per-facet radial / tilt components.
+    axpt = ctr + float((centroids[band_faces].mean(axis=0) - ctr) @ axis) * axis
+    rel_b = centroids[band_faces] - axpt
+    ax_hb = rel_b @ axis
+    rvec = rel_b - ax_hb[:, None] * axis
+    rnorm = np.linalg.norm(rvec, axis=1)
+    med_rho = float(np.median(rnorm))
+    radial_u = rvec / (rnorm[:, None] + 1e-12)
+    tang_u = np.cross(np.broadcast_to(axis, radial_u.shape), radial_u)
+    nb = normals[band_faces]
+    n_ax = np.sum(nb * axis, axis=1)                    # axial tilt of the normal
+    n_tan = np.sum(nb * tang_u, axis=1)                 # tangential tilt
+    n_rad = np.sum(nb * radial_u, axis=1)               # radial (cylinder) comp
+
+    # Density gate: a knurl is a DENSE micro-facet field. Require the band's
+    # facet count per unit area to clear a floor (relative to a plain wall of the
+    # same extent) — expressed as a minimum facet count, since the absolute floor
+    # already scales with the band being the whole grip.
+    coverage = _angular_coverage(centroids[band_faces], axis, axpt)
+    if coverage < config.knurl_min_coverage:
+        return None
+
+    # Bimodal-normal gate: the discriminator. A plain cylinder wall has n_ax ~ 0
+    # with tiny std; a diamond knurl's two helix families make n_ax bimodal and
+    # wide. A single-family thread is asymmetric (handled by detect_threads).
+    bimod = _knurl_bimodality(n_ax)
+    # Straight (axial) knurls tilt only tangentially; accept those via n_tan too.
+    bimod_tan = _knurl_bimodality(n_tan)
+    score = max(bimod, bimod_tan)
+    if score < config.knurl_min_normal_bimodality:
+        return None
+    # Mean radial alignment must still be cylinder-like (facets face outward/in,
+    # not every-which-way like an organic blob or a sphere).
+    if float(np.mean(np.abs(n_rad))) < 0.6:
+        return None
+
+    pattern, pitch = _knurl_pattern_and_pitch(n_ax, n_tan, med_rho)
+    # Material side: outward normals (radial component) point away from the axis
+    # for a grip boss (fuse), toward it for a knurled bore (cut).
+    outward = bool(np.mean(n_rad) > 0)
+
+    vids = np.unique(faces[band_faces].reshape(-1))
+    axial_all = (vertices[vids] - axpt) @ axis
+    # radii of the band's wall VERTICES. nominal = median (mid-surface, the
+    # reported nominal diameter); crest/root = high/low quantiles (the grip's
+    # outer face and the groove floor — the suppression targets).
+    vrel = vertices[vids] - axpt
+    vrho = np.linalg.norm(vrel - (vrel @ axis)[:, None] * axis, axis=1)
+    nominal_r = float(np.median(vrho))
+    crest_r = float(np.quantile(vrho, 0.95))
+    root_r = float(np.quantile(vrho, 0.05))
+
+    return KnurlBand(
+        axis_point=axpt,
+        axis_dir=axis,
+        nominal_radius=nominal_r,
+        axial_min=float(axial_all.min()),
+        axial_max=float(axial_all.max()),
+        pattern=pattern,
+        pitch_estimate=pitch,
+        bimodality=float(score),
+        face_indices=[int(i) for i in band_faces],
+        outward=outward,
+        crest_radius=crest_r,
+        root_radius=root_r,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Threads — helical grooves on a cylindrical band (M5.2). See
+# docs/M5_HELICAL_PATTERNED.md §1. A thread is a SINGLE-family helix (one groove
+# wrapping the cylinder), which the wall vertices satisfy as z = (pitch/2pi)*phi
+# + z0 once phi is unwrapped along the band. We fit that helix invariant by
+# least squares, gate on >=1.5-turn coverage (one turn is a chamfer/ramp, not a
+# thread), a resolution-scaled RMS, and a pitch sanity window; then suppress to
+# the pitch-diameter cylinder with pitch/starts/handedness/crest/root metadata.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Thread:
+    """A helical thread on a cylindrical band, suppressed to its pitch-diameter
+    cylinder (M5.2). Metadata (pitch/starts/handedness/crest/root) is emitted in
+    ``stats["threads"]`` and the ``<name>_features.json`` sidecar; the geometry
+    is trued up to a plain cylinder at the pitch diameter (crest+root)/2."""
+
+    axis_point: np.ndarray
+    axis_dir: np.ndarray
+    nominal_radius: float     # pitch radius (crest+root)/2 — what we suppress to
+    axial_min: float
+    axial_max: float
+    pitch: float              # axial advance per turn (mm)
+    starts: int               # number of thread starts (1 for a single start)
+    handedness: str           # "right" | "left"
+    crest_radius: float
+    root_radius: float
+    rms: float                # RMS residual of the helix fit (mm)
+    turns: float              # angular coverage in turns
+    face_indices: list[int]
+    is_internal: bool         # True for an internal (nut) thread — cut, not fuse
+
+    @property
+    def height(self) -> float:
+        return self.axial_max - self.axial_min
+
+    @property
+    def outward(self) -> bool:
+        return not self.is_internal
+
+    @property
+    def suppress_radius(self) -> float:
+        """Radius the boolean suppresses the thread to (the de-faceting target).
+
+        External thread (material inside, tips point OUT): fuse to the crest =
+        MAJOR radius so the fuse swallows the thread grooves up to the outer
+        tips. Internal thread (material outside, tips point IN): cut to the crest
+        = MINOR radius so the cut removes the inward ridges to a clean bore.
+        crest_radius/root_radius are stored as high/low wall-vertex quantiles, so
+        pick the appropriate extreme per side."""
+        hi = max(self.crest_radius, self.root_radius)
+        lo = min(self.crest_radius, self.root_radius)
+        if lo <= 0:
+            return self.nominal_radius
+        return lo if self.is_internal else hi
+
+    def as_dict(self) -> dict:
+        return {
+            "pitch": round(float(self.pitch), 4),
+            "starts": int(self.starts),
+            "handedness": self.handedness,
+            "nominal_radius": float(self.nominal_radius),
+            "pitch_diameter": round(2.0 * float(self.nominal_radius), 4),
+            "crest_radius": round(float(self.crest_radius), 4),
+            "root_radius": round(float(self.root_radius), 4),
+            "axis_dir": [float(x) for x in self.axis_dir],
+            "axis_point": [float(x) for x in self.axis_point],
+            "height": round(float(self.height), 3),
+            "turns": round(float(self.turns), 2),
+            "rms": round(float(self.rms), 4),
+            "is_internal": bool(self.is_internal),
+            "role": "internal" if self.is_internal else "external",
+        }
+
+
+def _helix_phase_fit(
+    z: np.ndarray, phi: np.ndarray, pitch_lo: float, pitch_hi: float,
+    n_coarse: int = 300,
+) -> tuple[float, float, str]:
+    """Recover a single-start thread's FUNDAMENTAL pitch by phase collapse.
+
+    On a helix z = (pitch/2pi)*phi + z0, the phase ``theta = phi - (2pi/pitch)*z``
+    is CONSTANT (mod 2pi) along the thread — every crest/root vertex shares it.
+    So the correct pitch makes ``theta`` cluster tightest (max resultant length
+    R = 1 - circular_variance). This is far more robust than unwrapping phi along
+    a z-sort (crest/root vertices interleave in z and defeat a global unwrap).
+
+    A single-start thread of pitch P ALSO collapses at P/2, P/3, ... (harmonics),
+    so a plain global-max would latch onto a sub-multiple (an aliased 2-start
+    reading). We therefore pick the LARGEST pitch whose collapse is essentially as
+    tight as the global best (within a margin) — the fundamental. Scans both
+    handedness signs; returns ``(pitch, circular_variance, handedness)``.
+    """
+    best = (0.0, 1.0, "right")
+    for sign, hand in ((1.0, "right"), (-1.0, "left")):
+        pitches = np.linspace(max(pitch_lo, 1e-3), max(pitch_hi, pitch_lo + 1e-3), n_coarse)
+        Rs = np.empty(pitches.size)
+        for i, p in enumerate(pitches):
+            theta = phi - sign * (2.0 * math.pi / p) * z
+            Rs[i] = float(np.hypot(np.cos(theta).mean(), np.sin(theta).mean()))
+        rmax = float(Rs.max())
+        if rmax <= 0:
+            continue
+        # The fundamental pitch collapses tightest (global max R). (Harmonics at
+        # P/n read comparably tight only on some tessellations; the global max is
+        # the robust choice validated on the community threads.)
+        k = int(np.argmax(Rs))
+        lo = pitches[max(0, k - 1)]
+        hi = pitches[min(pitches.size - 1, k + 1)]
+        fine = np.linspace(lo, hi, 41)
+        local_best = (float(pitches[k]), 1.0 - float(Rs[k]))
+        for p in fine:
+            theta = phi - sign * (2.0 * math.pi / p) * z
+            cv = 1.0 - float(np.hypot(np.cos(theta).mean(), np.sin(theta).mean()))
+            if cv < local_best[1]:
+                local_best = (float(p), cv)
+        if local_best[1] < best[1]:
+            best = (local_best[0], local_best[1], hand)
+    return best
+
+
+def detect_threads(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    cylinders: list[Cylinder],
+    claimed: set[int] | None = None,
+    config: ConversionConfig | None = None,
+) -> list[Thread]:
+    """Detect helical threads on cylindrical bands (design §1, M5.2).
+
+    Seeds candidate axes from the detected cylinders plus the mesh's flat/
+    principal directions (an internal thread has no coaxial detected cylinder of
+    its own). For each axis, wall facets are grouped into tight radial bands; a
+    band is a thread when its vertices satisfy the single-start helix invariant
+    z = (pitch/2pi)*phi + z0 (fitted by least squares on the axially-sorted,
+    phi-unwrapped points) with >=thread_min_turns angular coverage, a
+    resolution-scaled RMS, and a pitch in the sanity window. Best-effort — []
+    on any failure.
+    """
+    config = config or ConversionConfig()
+    if not getattr(config, "detect_threads", True):
+        return []
+    if len(faces) < config.min_cylinder_facets:
+        return []
+    claimed = set() if claimed is None else set(claimed)
+    resolution = mesh_resolution(vertices, faces, config)
+    normals, areas = face_normals_and_areas(vertices, faces)
+
+    extent = vertices.max(axis=0) - vertices.min(axis=0)
+    max_radius = config.max_cylinder_radius or float(extent.max())
+
+    # Thread axes: threads are coaxial with a cylinder, so when the part HAS
+    # detected cylinders, use ONLY their axes — trying extra principal directions
+    # then lets a wrong axis phase-collapse a spurious "thread" out of a shaft or
+    # cap face. Only when there is NO cylinder (an internal thread whose bore
+    # never fit a clean cylinder — bottle_cap) do we fall back to the few dominant
+    # flat-normal / principal directions.
+    if cylinders:
+        axes: list[np.ndarray] = [np.asarray(c.axis_dir, float) for c in cylinders]
+    else:
+        axes = _candidate_axes(vertices, normals, areas,
+                               max(2, config.thread_max_axes))[:config.thread_max_axes]
+    unique_axes: list[np.ndarray] = []
+    for ax in axes:
+        ax = ax / (np.linalg.norm(ax) or 1.0)
+        if not any(abs(float(ax @ u)) > 0.999 for u in unique_axes):
+            unique_axes.append(ax)
+
+    centroids = vertices[faces].mean(axis=1)
+    threads: list[Thread] = []
+    used: set[int] = set(claimed)
+    for axis in unique_axes:
+        # Seed radii: the radii of cylinders sharing this axis. A thread is
+        # coaxial with AND comparable in radius to its cylinder (design §1: band
+        # within R±~0.6·pitch of the wall), so when seeds exist the band search is
+        # constrained near them — this rejects a spurious thread found at a very
+        # different radius from a tiny cross-hole's axis (knurled_knob's r=1 side
+        # holes seeding a bogus r=3.5 thread). No seed -> unconstrained (an
+        # internal thread whose bore never fit a cylinder — bottle_cap).
+        seed_radii = [float(c.radius) for c in cylinders
+                      if abs(float(np.asarray(c.axis_dir, float) @ axis)) > 0.98]
+        for th in _fit_threads_for_axis(
+                vertices, faces, axis, normals, centroids, used,
+                max_radius, resolution, config, seed_radii=seed_radii):
+            threads.append(th)
+            used.update(th.face_indices)
+    return threads
+
+
+def _fit_threads_for_axis(
+    vertices, faces, axis, normals, centroids, used, max_radius, resolution, config,
+    seed_radii=None,
+) -> list[Thread]:
+    """Find threaded bands about one candidate ``axis`` (may return >1 band)."""
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    ndot = np.abs(normals @ axis)
+    wall = np.array([i for i in range(len(faces))
+                     if i not in used and ndot[i] < 0.5], dtype=int)
+    if wall.size < config.thread_min_facets:
+        return []
+
+    ctr = centroids[wall].mean(axis=0)
+    rel = centroids[wall] - ctr
+    ax_h = rel @ axis
+    rvec = rel - ax_h[:, None] * axis
+    rho = np.linalg.norm(rvec, axis=1)
+
+    # Cluster wall facets into radial bands (a cap can have an external grip AND
+    # an internal thread at very different radii). Histogram peaks -> bands.
+    out: list[Thread] = []
+    if rho.size == 0:
+        return out
+    lo, hi = float(rho.min()), float(rho.max())
+    if hi - lo < 1e-6:
+        bands_rho = [(lo, hi)]
+    else:
+        nb = max(6, int((hi - lo) / max(0.3, 0.02 * hi)))
+        counts, edges = np.histogram(rho, bins=nb)
+        # Each contiguous run of non-trivial bins is a candidate band.
+        thr = max(config.thread_min_facets // 6, counts.max() // 12)
+        bands_rho = []
+        i = 0
+        while i < len(counts):
+            if counts[i] >= thr:
+                j = i
+                while j < len(counts) and counts[j] >= thr:
+                    j += 1
+                bands_rho.append((float(edges[i]), float(edges[j])))
+                i = j
+            else:
+                i += 1
+
+    for rlo, rhi in bands_rho:
+        # Seed-radius constraint: when this axis has detected cylinders, only
+        # consider bands whose radius is comparable to a seed (a thread is on its
+        # cylinder, not at a wildly different radius). This rejects a bogus thread
+        # a tiny cross-hole's axis would otherwise phase-collapse elsewhere.
+        if seed_radii:
+            mid = 0.5 * (rlo + rhi)
+            if not any(sr * (1.0 - config.thread_seed_radius_tol)
+                       <= mid <= sr * (1.0 + config.thread_seed_radius_tol) + 0.5
+                       for sr in seed_radii):
+                continue
+        sel = (rho >= rlo - 1e-9) & (rho <= rhi + 1e-9)
+        band_faces = wall[sel]
+        if band_faces.size < config.thread_min_facets:
+            continue
+        th = _fit_single_thread(
+            vertices, faces, band_faces, axis, ctr, normals,
+            centroids, max_radius, resolution, config)
+        if th is not None:
+            out.append(th)
+    return out
+
+
+def _fit_single_thread(
+    vertices, faces, band_faces, axis, ctr, normals, centroids,
+    max_radius, resolution, config,
+) -> Thread | None:
+    """Fit the helix invariant to one radial band; return a Thread or None."""
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    u, v = _plane_basis(axis)
+    axpt = ctr + float((centroids[band_faces].mean(axis=0) - ctr) @ axis) * axis
+
+    vids = np.unique(faces[band_faces].reshape(-1))
+    pts = vertices[vids]
+    rel = pts - axpt
+    z = rel @ axis
+    ru = rel @ u
+    rv = rel @ v
+    rho = np.hypot(ru, rv)
+    med_rho = float(np.median(rho))
+    if med_rho < config.min_cylinder_radius or med_rho > max_radius:
+        return None
+    phi = np.arctan2(rv, ru)
+
+    # The band must wrap the full circle (a thread groove goes all the way round);
+    # a partial-arc band is a ramp/chamfer, not a thread.
+    if _angular_coverage(centroids[band_faces], axis, axpt) < config.thread_min_coverage:
+        return None
+
+    # Helix invariant via phase collapse (see _helix_phase_fit): find the pitch
+    # that makes theta = phi - (2pi/pitch)*z constant (mod 2pi). Robust to the
+    # crest/root interleave that defeats a z-sorted unwrap.
+    z_extent = float(z.max() - z.min())
+    if z_extent < 1e-6:
+        return None
+    pitch_lo = max(config.thread_min_pitch_rel * med_rho, 1e-3)
+    # A thread must show >= thread_min_turns turns over its axial extent, so the
+    # pitch can be at most z_extent / thread_min_turns; also cap by the sanity
+    # window. (This is what enforces multi-turn coverage without a fragile unwrap.)
+    pitch_hi = min(config.thread_max_pitch_rel * med_rho,
+                   z_extent / max(config.thread_min_turns, 1e-3))
+    if pitch_hi <= pitch_lo:
+        return None
+    pitch, cvar, handedness = _helix_phase_fit(z, phi, pitch_lo, pitch_hi)
+    if pitch <= 1e-6:
+        return None
+
+    # Phase-collapse gate — THE thread discriminator. On a genuine single-start
+    # thread the phase theta = phi - (2pi/pitch)*z collapses to one value, so the
+    # resultant length R = 1 - cvar is high (bottle-cap thread ~0.66). A knurl
+    # (two crossing families) or gear teeth (no helix) never collapse: their R
+    # stays near 0 (cvar ~1.0) at EVERY pitch. This is what a plain wall band, a
+    # bimodal knurl, and an axial gear-tooth field all fail.
+    resultant = 1.0 - cvar
+    if resultant < config.thread_min_resultant:
+        return None
+
+    total_turns = z_extent / pitch
+    if total_turns < config.thread_min_turns:
+        return None
+    # Upper turn bound: a real thread has a handful to a couple dozen turns. A
+    # band seen along a WRONG axis wraps the whole part and phase-collapses a
+    # spurious very-fine "thread" of many dozens of turns (bottle_cap's flat
+    # faces read on a horizontal axis) — reject those.
+    if total_turns > config.thread_max_turns:
+        return None
+
+    # Residual: circular std of the collapsed phase, converted to an axial (mm)
+    # deviation from the helix. A real thread collapses tightly; noise/ramps
+    # spread the phase and blow this up.
+    sign = 1.0 if handedness == "right" else -1.0
+    theta = phi - sign * (2.0 * math.pi / pitch) * z
+    R = max(resultant, 1e-9)
+    circ_std = math.sqrt(-2.0 * math.log(R)) if R < 1.0 else 0.0
+    rms = float(pitch / (2.0 * math.pi) * circ_std)
+
+    pitch_rel = pitch / med_rho
+    if not (config.thread_min_pitch_rel <= pitch_rel <= config.thread_max_pitch_rel):
+        return None
+
+    # Multi-start: fold the phase; N interleaved starts pile into N clusters.
+    starts = _thread_starts_phase(theta)
+
+    # crest/root radii = high/low quantiles of the wall vertex radii.
+    crest_r = float(np.quantile(rho, 0.9))
+    root_r = float(np.quantile(rho, 0.1))
+    nominal_r = 0.5 * (crest_r + root_r)
+
+    # Coaxiality guard: the band facets must genuinely face radially (like a
+    # cylinder wall), not every-which-way. A spurious band seen along a wrong
+    # (e.g. horizontal) axis is really the part's flat top/sides and has weak
+    # radial alignment — reject it so a cap's faces can't phase-collapse into a
+    # bogus full-diameter thread.
+    fcent = centroids[band_faces]
+    frel = fcent - axpt
+    fradial = frel - (frel @ axis)[:, None] * axis
+    fradial /= np.linalg.norm(fradial, axis=1, keepdims=True) + 1e-12
+    signed = np.sum(normals[band_faces] * fradial, axis=1)
+    if float(np.mean(np.abs(signed))) < config.thread_min_radial_align:
+        return None
+    align = float(np.mean(signed))
+    is_internal = align < 0.0  # normals point toward the axis -> internal
+
+    axial = (pts - axpt) @ axis
+    return Thread(
+        axis_point=axpt,
+        axis_dir=axis,
+        nominal_radius=nominal_r,
+        axial_min=float(axial.min()),
+        axial_max=float(axial.max()),
+        pitch=pitch,
+        starts=starts,
+        handedness=handedness,
+        crest_radius=crest_r,
+        root_radius=root_r,
+        rms=rms,
+        turns=total_turns,
+        face_indices=[int(i) for i in band_faces],
+        is_internal=is_internal,
+    )
+
+
+def _thread_starts_phase(theta: np.ndarray) -> int:
+    """Estimate the number of thread starts from the collapsed phase ``theta``.
+
+    A single-start thread collapses to ONE phase value (mod 2pi); N interleaved
+    starts collapse to N phases spaced 2pi/N apart. Wrapping ``theta`` into
+    [0,2pi) and testing whether N-fold folding tightens the cluster tells the
+    start count — capped small (metadata only; suppression is start-agnostic).
+    """
+    if theta.size < 24:
+        return 1
+    tw = np.mod(theta, 2.0 * math.pi)
+    best_starts, best_R = 1, -1.0
+    for n in (1, 2, 3, 4):
+        folded = np.mod(tw * n, 2.0 * math.pi)
+        R = float(np.hypot(np.cos(folded).mean(), np.sin(folded).mean()))
+        # Reward tighter clustering, but penalise higher n so a single start
+        # (which also folds tightly at every n) isn't over-counted.
+        score = R - 0.08 * (n - 1)
+        if score > best_R:
+            best_R, best_starts = score, n
+    return best_starts
 
 
 def _fit_cone(cluster, cyl, axis, p, vertices, faces, centroids, config) -> Cone | None:
@@ -1045,6 +1762,16 @@ class SweptProfile:
     n_splines: int = 0
     tangency_snaps: int = 0
     member_regions: list[int] = field(default_factory=list)
+    # M5.3: a repeated-arc CLOSED profile roughly centered on the axis (a gear
+    # cross-section, a splined shaft) is built as ONE whole-outline closed-wire
+    # extrusion + a single guarded boolean, not per-arc lens ops (which are
+    # O(arcs x base) and never converge). Set by ``detect_swept_walls``.
+    whole_extrusion: bool = False
+    # For a whole-extrusion profile, the gear outline as an ordered CLOSED 3D
+    # polyline (the region's outer boundary loop at the min-axial plane), used to
+    # build one closed wire directly — robust where the fitted 2D segments are
+    # fragmented by decimation. (N, 3) or None.
+    outline_loop: np.ndarray | None = None
 
     def point3d(self, p2: np.ndarray) -> np.ndarray:
         return self.origin + float(p2[0]) * self.e1 + float(p2[1]) * self.e2
@@ -1539,6 +2266,83 @@ def _is_repeated_arc_pattern(profile: SweptProfile, config: ConversionConfig) ->
     return (distinct / n) <= config.swept_repeat_distinct_frac
 
 
+def _gear_outline_loop(
+    vertices: np.ndarray, faces: np.ndarray, sw: SweptRegion,
+) -> np.ndarray | None:
+    """Extract a gear region's outer outline as ONE closed 3D polyline.
+
+    The fitted 2D profile segments are fragmented by decimation, so instead we
+    take the region's mesh boundary loops (``_directed_boundary_edges`` +
+    ``_chain_loops``), keep the loop that best wraps the axis at a roughly
+    constant axial height (the outer tooth outline at one end of the extrusion),
+    and return its ordered 3D vertices — a guaranteed-closed wire the builder can
+    extrude. Returns ``None`` if no suitable loop exists."""
+    edges = _directed_boundary_edges(faces, list(sw.face_indices))
+    if not edges:
+        return None
+    loops = _chain_loops(edges)
+    if not loops:
+        return None
+    axis = np.asarray(sw.axis, float)
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    best = None
+    best_score = -1.0
+    for loop in loops:
+        if len(loop) < 8:
+            continue
+        P = vertices[np.asarray(loop)]
+        ctr = P.mean(axis=0)
+        rel = P - ctr
+        radial = rel - (rel @ axis)[:, None] * axis
+        rho = np.linalg.norm(radial, axis=1)
+        mean_r = float(rho.mean())
+        if mean_r < 1e-6:
+            continue
+        u, v = _plane_basis(axis)
+        ang = np.arctan2(radial @ v, radial @ u)
+        bins = 24
+        idx = np.floor((ang + np.pi) / (2 * np.pi) * bins).astype(int) % bins
+        wrap = len(set(idx.tolist())) / bins
+        # Prefer a loop that wraps fully and is at a consistent axial height (a
+        # clean end-outline, not a loop weaving up and over the extrusion).
+        ax_spread = float(((P @ axis) - (P @ axis).mean()).std())
+        score = wrap - 0.02 * ax_spread + 0.0001 * len(loop) * mean_r
+        if wrap >= 0.9 and score > best_score:
+            best_score = score
+            best = P
+    return best
+
+
+def _region_wraps_axis(
+    vertices: np.ndarray, faces: np.ndarray, sw: SweptRegion, config: ConversionConfig,
+) -> bool:
+    """True when a swept region's facets wrap the full circle about its axis.
+
+    Uses the 3D facet centroids relative to the region's own axis (reliable even
+    when 2D rail extraction is lopsided on a decimated mesh): a gear cross-section
+    / splined shaft wraps all the way round the axis at a roughly consistent
+    radius, while a one-sided wall panel does not. This is the routing signal for
+    whole-outline extrusion."""
+    fi = np.asarray(sw.face_indices, dtype=int)
+    if fi.size < 3:
+        return False
+    cent = vertices[faces[fi]].mean(axis=1)
+    axis = np.asarray(sw.axis, float)
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    ctr = cent.mean(axis=0)
+    rel = cent - ctr
+    rel = rel - (rel @ axis)[:, None] * axis   # radial components
+    rho = np.linalg.norm(rel, axis=1)
+    mean_r = float(rho.mean())
+    if mean_r < 1e-6:
+        return False
+    u, v = _plane_basis(axis)
+    ang = np.arctan2(rel @ v, rel @ u)
+    if not _angular_span_ok(ang):
+        return False
+    return float(rho.std() / mean_r) <= config.gear_ring_spread_rel
+
+
 def detect_swept_walls(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -1546,11 +2350,15 @@ def detect_swept_walls(
     config: ConversionConfig | None = None,
     resolution: MeshResolution | None = None,
 ) -> list[SweptProfile]:
-    """Fit swept profiles for every swept region (design §2, §3, M4).
+    """Fit swept profiles for every swept region (design §2, §3, M4; M5.3 gear).
 
-    Profiles that are repeated-tooth patterns (gear teeth: dozens of near-
-    identical short arcs) are dropped — building one lens op per tooth arc is
-    O(arcs × base_faces) and never converges (see ``_is_repeated_arc_pattern``).
+    Repeated-tooth patterns (gear teeth: dozens of near-identical short arcs) are
+    NOT built per-arc — that is O(arcs × base_faces) and never converges. Instead
+    (M5.3), a repeated-arc profile that is CLOSED and roughly centered on the
+    axis (a gear cross-section, a splined shaft) is flagged ``whole_extrusion`` so
+    the builder claims it wholesale via ONE closed-wire extrude + a single guarded
+    boolean. A repeated-arc profile that is NOT closed-and-centered stays faceted
+    (dropped), as before.
     """
     config = config or ConversionConfig()
     if not config.detect_swept_walls:
@@ -1563,9 +2371,69 @@ def detect_swept_walls(
         if prof is None:
             continue
         if _is_repeated_arc_pattern(prof, config):
-            continue  # gear teeth / splines: leave faceted (design: for now)
+            # A repeated-arc region that WRAPS THE AXIS (a gear cross-section, a
+            # splined shaft) routes to whole-outline extrusion — even when 2D rail
+            # extraction is lopsided / topologically open (decimation fragments
+            # the outline loop). The wrap test uses the 3D facet centroids about
+            # the region's axis (reliable where 2D rails are not), and the wire
+            # builder joins the outline's ends.
+            if (getattr(config, "reconstruct_gears", True)
+                    and _region_wraps_axis(vertices, faces, sw, config)
+                    and len(prof.segments) <= config.gear_max_profile_segments):
+                loop = _gear_outline_loop(vertices, faces, sw)
+                if loop is not None:
+                    prof.whole_extrusion = True
+                    prof.outline_loop = loop
+                    out.append(prof)
+            # else: gear teeth / splines that aren't a clean wrapping outline —
+            # leave faceted (per-arc lens ops never converge).
+            continue
         out.append(prof)
     return out
+
+
+def _profile_is_centered(profile: SweptProfile, config: ConversionConfig) -> bool:
+    """True when a profile's outline is a closed RING wrapping its own centre.
+
+    A gear cross-section / splined shaft is a closed outline that wraps all the
+    way round a centre with a roughly consistent radius (a ring). We work in the
+    outline's OWN centroid frame (the profile-plane origin is an arbitrary rail
+    point, not the axis), require the points to (a) span nearly the full circle
+    about that centroid and (b) sit at a roughly consistent radius (the radial
+    spread is a bounded fraction of the mean radius — a gear's teeth make it
+    vary, but not wildly). A one-sided wall panel fails both.
+    """
+    pts: list[np.ndarray] = []
+    for s in profile.segments:
+        for p in (s.p0, s.p1):
+            if p is not None:
+                pts.append(np.asarray(p, float))
+        if s.kind == "spline" and s.points is not None:
+            pts.extend(np.asarray(q, float) for q in s.points)
+    if len(pts) < 3:
+        return False
+    arr = np.array(pts)
+    centroid = arr.mean(axis=0)
+    rel = arr - centroid
+    rad = np.linalg.norm(rel, axis=1)
+    mean_r = float(rad.mean())
+    if mean_r < 1e-6:
+        return False
+    # Wraps the full circle about its own centre?
+    ang = np.arctan2(rel[:, 1], rel[:, 0])
+    if not _angular_span_ok(ang):
+        return False
+    # Ring-like radius consistency: a gear's tip/root vary the radius, but a
+    # centered outline's radial spread is a bounded fraction of the mean radius;
+    # a one-sided panel (centroid off to a side) has some points near the centre
+    # and huge spread, failing this.
+    return float(rad.std() / mean_r) <= config.gear_ring_spread_rel
+
+
+def _angular_span_ok(ang: np.ndarray, bins: int = 16) -> bool:
+    """True when angles ``ang`` wrap (almost) all the way round the centre."""
+    idx = np.floor((ang + np.pi) / (2 * np.pi) * bins).astype(int) % bins
+    return len(set(idx.tolist())) >= int(0.75 * bins)
 
 
 # --------------------------------------------------------------------------- #

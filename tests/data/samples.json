@@ -250,5 +250,78 @@
     },
     "file": "freeform_bump.stl",
     "triangles": 1730
+  },
+  {
+    "kind": "threaded_rod",
+    "dims_mm": [
+      14.0,
+      14.0,
+      20.0
+    ],
+    "cylinders": [],
+    "threads": [
+      {
+        "pitch": 2.0,
+        "core_radius": 6.0,
+        "depth": 1.0,
+        "starts": 1,
+        "handedness": "right",
+        "is_internal": false
+      }
+    ],
+    "file": "threaded_rod.stl",
+    "triangles": 9927
+  },
+  {
+    "kind": "knurled_band",
+    "dims_mm": [
+      20.0,
+      20.0,
+      24.0
+    ],
+    "cylinders": [],
+    "knurling": [
+      {
+        "nominal_radius": 10.0,
+        "pattern": "diamond",
+        "band": [
+          8.0,
+          16.0
+        ],
+        "outward": true
+      }
+    ],
+    "file": "knurled_band.stl",
+    "triangles": 9870
+  },
+  {
+    "kind": "spur_gear",
+    "dims_mm": [
+      20.0,
+      20.0,
+      6.0
+    ],
+    "cylinders": [
+      {
+        "radius": 3.0,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "through": true
+      }
+    ],
+    "gears": [
+      {
+        "teeth": 12,
+        "r_root": 8.0,
+        "r_tip": 10.0,
+        "extent": 6.0,
+        "bore": 3.0
+      }
+    ],
+    "file": "spur_gear.stl",
+    "triangles": 744
   }
 ]

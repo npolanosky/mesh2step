@@ -25,6 +25,34 @@ def _suffixed(path: Path, suffix: str) -> Path:
     return path.with_name(path.stem + suffix + path.suffix)
 
 
+def _write_features_sidecar(output_path: Path, stats: dict, progress) -> None:
+    """Write the ``<name>_features.json`` metadata sidecar (M5 design §metadata).
+
+    Carries the helical/patterned feature metadata — threads (pitch/starts/hand/
+    crest/root), knurling (pattern/diameter/pitch), gears (segments/extent) — next
+    to the STEP so downstream tools have the parametric intent even though the
+    geometry ships as suppressed cylinders / whole extrusions. Best-effort: a
+    write failure never breaks the conversion. Only written when there is at least
+    one such feature."""
+    import json
+
+    features = {
+        "threads": stats.get("threads") or [],
+        "knurling": stats.get("knurling") or [],
+        "gears": stats.get("gears") or [],
+    }
+    if not any(features.values()):
+        return
+    sidecar = output_path.with_name(output_path.stem + "_features.json")
+    try:
+        sidecar.write_text(json.dumps(features, indent=2))
+        stats["features_sidecar"] = str(sidecar)
+        n = sum(len(v) for v in features.values())
+        progress(f"Wrote {sidecar.name} ({n} helical/patterned feature(s))")
+    except OSError as exc:
+        progress(f"Feature sidecar not written ({exc})")
+
+
 def convert(
     input_path: str | Path,
     output_path: str | Path | None = None,
@@ -594,6 +622,7 @@ def convert(
         progress(f"Exporting {clean_path.name} (artifact-free, open)")
         builder.export_step(clean_shape, clean_path)
         stats["dual_output"] = {"watertight": str(wt_path), "clean": str(clean_path)}
+        _write_features_sidecar(output_path, stats, progress)
         progress("Done")
         return ConversionResult(output_path=wt_path, method=method, stats=stats,
                                 outputs=[wt_path, clean_path])
@@ -601,6 +630,7 @@ def convert(
     if boolean_exported and output_path.exists():
         # The winning boolean rung was already written to output_path and
         # re-validated during the back-off ladder — no need to re-export.
+        _write_features_sidecar(output_path, stats, progress)
         progress("Done")
         return ConversionResult(output_path=output_path, method=method, stats=stats,
                                 outputs=[output_path])
@@ -615,6 +645,7 @@ def convert(
             stats.setdefault("warnings_extra", []).append(
                 f"Exported STEP re-reads invalid ({reval.get('reason')}).")
             _finalize_quality_after_export(stats, reval)
+    _write_features_sidecar(output_path, stats, progress)
     progress("Done")
     return ConversionResult(output_path=output_path, method=method, stats=stats,
                             outputs=[output_path])

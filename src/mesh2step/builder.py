@@ -18,14 +18,18 @@ from .config import ConversionConfig
 from .fitting import (
     Cylinder,
     FreeformSheet,
+    KnurlBand,
     Sphere,
     SweptProfile,
+    Thread,
     _connected_components,
     detect_cones,
     detect_cylinders,
     detect_fillets_straight,
+    detect_knurling,
     detect_spheres,
     detect_swept_walls,
+    detect_threads,
     fit_freeform_sheets,
     sphere_consensus_regions,
 )
@@ -575,6 +579,31 @@ def _annotate_profile(vertices, faces_sub, profile: SweptProfile, normals, areas
                            and float(ar[in_zone].sum()) >= 0.8 * expected)
 
 
+def _detect_gears(vertices, faces, config: ConversionConfig, progress):
+    """Detect gear / whole-outline extrusion profiles on the FULL mesh (M5.3).
+
+    Runs swept detection on the whole (un-claimed) mesh so the gear's outer tooth
+    ring is found as ONE region — the ladder's claimed-subset swept pass fragments
+    it (removing the coaxial hub cylinders/cones breaks the outline's smooth
+    chain). Returns only ``whole_extrusion``-flagged profiles (a repeated-arc
+    region wrapping the axis). Best-effort; [] on any failure."""
+    if not (config.detect_swept_walls and getattr(config, "reconstruct_gears", True)):
+        return []
+    try:
+        resolution = mesh_resolution(vertices, faces, config)
+        regions = segment_planar(vertices, faces, config)
+        sweeps = segment_swept_walls(vertices, faces, set(), regions, config)
+        profiles = detect_swept_walls(vertices, faces, sweeps, config, resolution)
+    except Exception as exc:  # noqa: BLE001 - gear detection is best-effort
+        progress(f"Gear detection skipped ({exc})")
+        return []
+    gears = [p for p in profiles if getattr(p, "whole_extrusion", False)]
+    if gears:
+        progress(f"Found {len(gears)} gear/whole-outline profile(s) "
+                 f"({', '.join(str(len(p.segments)) + ' segs' for p in gears)})")
+    return gears
+
+
 def _fit_swepts(vertices, faces_sub, regions, config: ConversionConfig, progress):
     """Detect + fit + annotate swept walls on an (unclaimed) face subset.
 
@@ -705,6 +734,181 @@ def _boolean_clean_swept(solid, profile: SweptProfile, seg, Part):
         return _guarded_cut(solid, tool, max_removed_frac=0.6)
     tool = _swept_arc_lens_tool(profile, seg, Part, pad=pad)
     return _guarded_cut(solid, tool, max_removed_frac=0.5)
+
+
+# --------------------------------------------------------------------------- #
+# Gear / whole-outline extrusion (M5.3). A repeated-arc CLOSED profile centered
+# on the axis (a gear cross-section, a splined shaft) is built as ONE closed
+# Part.Wire from the whole outline -> Face -> extrude -> ONE guarded fuse. O(base)
+# once, not O(arcs × base). The central bore is cut afterwards (ladder
+# discipline). Same trusted primitive chain as the swept-wall lens ops.
+# --------------------------------------------------------------------------- #
+
+
+def _gear_profile_wire(profile: SweptProfile, Part, config: ConversionConfig):
+    """Build the closed gear outline as one flat ``Part.Wire`` from its outline
+    loop (design §2, M5.3).
+
+    Uses ``profile.outline_loop`` — the region's outer mesh boundary as an ordered
+    closed 3D polyline — flattened onto the min-axial plane (each loop vertex
+    projected to a common axial height so the profile is planar) and built as one
+    closed polygon wire. This is robust where the fitted 2D segments are
+    fragmented by decimation: a mesh boundary loop is closed by construction.
+    Returns the wire or ``None``."""
+    loop = getattr(profile, "outline_loop", None)
+    if loop is None or len(loop) < 8:
+        return None
+    axis = np.asarray(profile.axis, float)
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    loop = np.asarray(loop, float)
+    # Flatten onto a common axial plane (the min-axial height) so the outline is
+    # planar — the teeth outline weaves slightly in axial height on the mesh.
+    z0 = float((loop @ axis).min())
+    flat = loop - ((loop @ axis) - z0)[:, None] * axis
+    # Drop consecutive near-duplicate points that break the wire builders, and
+    # thin the loop: a decimated tooth boundary has ~1600 weaving vertices, which
+    # (a) a B-spline over-fits into a SELF-INTERSECTING curve and (b) make the
+    # boolean of the extruded polygon against the base expensive. Keep points
+    # spaced by a minimum chord — enough to preserve the tooth shape while
+    # bounding the vertex count (and thus the boolean cost).
+    span = float(np.linalg.norm(flat.max(axis=0) - flat.min(axis=0)))
+    min_chord = max(0.15, 0.01 * span)
+    pts = [flat[0]]
+    for p in flat[1:]:
+        if float(np.linalg.norm(p - pts[-1])) > min_chord:
+            pts.append(p)
+    if len(pts) < 8:
+        return None
+    verts = [_vec(p) for p in pts]
+    closed_verts = verts + [verts[0]] if (verts[0] - verts[-1]).Length > 1e-6 else verts
+
+    def _tool_is_sane(w):
+        """A wire is usable only if its extruded tool is a single clean solid —
+        a self-intersecting outline extrudes to a degenerate solid that collapses
+        the fuse."""
+        try:
+            face = Part.Face(w)
+            if not face.isValid() or face.Area <= 1e-6:
+                return False
+            axis = np.asarray(profile.axis, float)
+            axis = axis / (np.linalg.norm(axis) or 1.0)
+            tool = face.extrude(_vec(axis * (profile.axial_max - profile.axial_min)))
+            sols = getattr(tool, "Solids", [])
+            return len(sols) == 1 and sols[0].isValid() and tool.Volume > 1e-6
+        except Exception:  # noqa: BLE001
+            return False
+
+    # Prefer a smooth closed B-spline through the THINNED outline (few enough
+    # points not to self-intersect) — its lateral faces are non-planar, so the
+    # gear teeth stop reading as residual tessellation. Fall back to the closed
+    # polygon (always watertight) if the spline's extruded tool isn't a clean
+    # solid. Either way the fuse recomputes the analytic intersection.
+    if getattr(config, "gear_flanks_as_spline", True) and len(verts) >= 8:
+        try:
+            bs = Part.BSplineCurve()
+            bs.interpolate(Points=verts, PeriodicFlag=True)
+            w = Part.Wire(bs.toShape())
+            if w.isValid() and w.isClosed() and _tool_is_sane(w):
+                return w
+        except Exception:  # noqa: BLE001 - fall back to polygon
+            pass
+    try:
+        wire = Part.makePolygon(closed_verts)
+    except Exception:  # noqa: BLE001
+        return None
+    if not wire.isValid() or not wire.isClosed() or not _tool_is_sane(wire):
+        return None
+    return wire
+
+
+def _boolean_clean_gear(solid, profile: SweptProfile, Part, config: ConversionConfig):
+    """Build the whole gear outline as one extruded solid and fuse it (design §2).
+
+    Closed wire from the full cross-section -> Face -> extrude along the sweep
+    axis over the profile's axial extent -> ONE guarded fuse. Wire/face isValid
+    prechecks and the guarded fuse (with the bbox/collapse nets in _try_boolean_
+    step) revert wholesale on any doubt. The central bore is a separately-detected
+    cylinder cut AFTER this fuse (ladder discipline), so it is not filled here."""
+    wire = _gear_profile_wire(profile, Part, config)
+    if wire is None:
+        raise ValueError("gear outline wire not closed/valid")
+    face = Part.Face(wire)
+    if not face.isValid() or face.Area <= 0.0:
+        raise ValueError("gear outline face invalid")
+    extent = profile.axial_max - profile.axial_min
+    if extent <= 1e-6:
+        raise ValueError("gear extrusion extent degenerate")
+    tool = face.extrude(_vec(np.asarray(profile.axis, float) * extent))
+    if not getattr(tool, "Solids", []):
+        raise ValueError("gear extrusion is not a solid")
+    # The gear outline is the part's own cross-section, so fusing it mostly
+    # overlaps existing material and only trues up the faceted tooth flanks; a
+    # generous added-volume ceiling admits the sliver between the inscribed facet
+    # polygon and the true outline without letting a mis-fit outline bulge out.
+    return _guarded_fuse(solid, tool, max_added_frac=0.5)
+
+
+def _apply_gear_extrusions(solid, profiles, Part, progress, *, bbox_guard, config):
+    """Fuse each whole-outline (gear) profile via one guarded boolean.
+
+    Returns ``(solid, attempted, built)``. Each op reverts on invalidity /
+    bbox growth / collapse (per-feature revert discipline) AND on RTAF regression
+    (a gear fuse that doesn't reduce residual tessellation — e.g. a polygon
+    outline no smoother than the mesh teeth — is rolled back so the op can never
+    make the part worse). A profile whose segment count exceeds the ceiling is
+    skipped (left faceted)."""
+    todo = [p for p in profiles if getattr(p, "whole_extrusion", False)]
+    if not todo:
+        return solid, 0, 0
+    # Cost budget: each whole-outline fuse is a boolean against the base solid,
+    # cost ~O(base_faces); attempt the FEW largest-extent outlines only, capped so
+    # a many-region gear can't grind past the time budget (a fuse that doesn't
+    # improve RTAF reverts anyway).
+    todo = sorted(todo, key=lambda p: -(p.axial_max - p.axial_min))[:config.gear_max_ops]
+    built = 0
+    try:
+        rtaf_before = compute_rtaf(solid, config).get("rtaf")
+    except Exception:  # noqa: BLE001
+        rtaf_before = None
+    for prof in todo:
+        if len(prof.segments) > config.gear_max_profile_segments:
+            progress(f"  gear outline skipped: {len(prof.segments)} segments "
+                     f"> ceiling {config.gear_max_profile_segments}")
+            continue
+        # Cheap pre-check: only a SMOOTH (B-spline) outline can lower RTAF — a
+        # polygon outline is itself faceted, so its (expensive) fuse would revert
+        # on the RTAF gate anyway. Build the wire once; if it isn't a single
+        # smooth edge, skip the fuse (saves an O(base_faces) boolean per gear).
+        wire = _gear_profile_wire(prof, Part, config)
+        if wire is None:
+            continue
+        smooth = (len(wire.Edges) <= 2
+                  and all("BSpline" in e.Curve.TypeId or "Circle" in e.Curve.TypeId
+                          for e in wire.Edges))
+        if not smooth:
+            progress("  gear outline skipped: only a faceted (polygon) wire builds "
+                     "— a fuse would not lower RTAF")
+            continue
+        candidate, ok = _try_boolean_step(
+            solid, lambda s, p=prof: _boolean_clean_gear(s, p, Part, config),
+            max_bbox_growth=bbox_guard)
+        if not ok:
+            continue
+        if rtaf_before is not None:
+            try:
+                rtaf_after = compute_rtaf(candidate, config).get("rtaf")
+            except Exception:  # noqa: BLE001
+                rtaf_after = None
+            if rtaf_after is not None and rtaf_after > rtaf_before + 1e-3:
+                progress(f"  gear reverted: RTAF {rtaf_before:.3f} -> "
+                         f"{rtaf_after:.3f} (no improvement)")
+                continue
+            if rtaf_after is not None:
+                rtaf_before = rtaf_after
+        solid = candidate
+        built += 1
+    progress(f"  gear whole-outline extrusions built {built}/{len(todo)}")
+    return solid, len(todo), built
 
 
 def _freeform_sheet_surface(sheet, Part):
@@ -1306,6 +1510,80 @@ def _detect_fillets(vertices, faces, claimed: set, config: ConversionConfig, pro
         progress(f"Found {len(fillets)} straight-edge fillet(s) "
                  f"({tan} tangency-snapped) from {n_band} band(s)")
     return fillets
+
+
+def _detect_knurling(vertices, faces, cylinders, claimed: set,
+                     config: ConversionConfig, progress):
+    """Detect knurled bands (design §3, M5.1). Best-effort; never raises."""
+    if not getattr(config, "detect_knurling", True):
+        return []
+    try:
+        knurls = detect_knurling(vertices, faces, cylinders, claimed, config)
+    except Exception as exc:  # noqa: BLE001 - knurl detection is best-effort
+        progress(f"Knurl detection skipped ({exc})")
+        return []
+    if knurls:
+        progress(f"Found {len(knurls)} knurled band(s) "
+                 f"({', '.join(k.pattern for k in knurls)})")
+    return knurls
+
+
+def _detect_threads(vertices, faces, cylinders, claimed: set,
+                    config: ConversionConfig, progress):
+    """Detect threaded bands (design §1, M5.2). Best-effort; never raises."""
+    if not getattr(config, "detect_threads", True):
+        return []
+    try:
+        threads = detect_threads(vertices, faces, cylinders, claimed, config)
+    except Exception as exc:  # noqa: BLE001 - thread detection is best-effort
+        progress(f"Thread detection skipped ({exc})")
+        return []
+    if threads:
+        kinds = ", ".join(("internal" if t.is_internal else "external")
+                          for t in threads)
+        progress(f"Found {len(threads)} thread(s) ({kinds}); "
+                 f"pitch {', '.join(f'{t.pitch:.2f}' for t in threads)} mm")
+    return threads
+
+
+def _boolean_clean_thread(solid, thread: Thread, Part, **_):
+    """Suppress a threaded band to its pitch-diameter cylinder (design §1).
+
+    External thread (a bolt/cap-neck, material inside): FUSE a cylinder at the
+    pitch radius over the band's extent to true up the crest micro-facets.
+    Internal thread (a nut/cap bore, material outside): CUT a cylinder at the
+    pitch radius to trim the crest ridges back to a clean bore wall. Same proven
+    primitive chain as _boolean_clean_cylinder; metadata carries pitch/starts."""
+    cyl = Cylinder(
+        axis_point=np.asarray(thread.axis_point, float),
+        axis_dir=np.asarray(thread.axis_dir, float),
+        radius=float(thread.suppress_radius),
+        axial_min=float(thread.axial_min),
+        axial_max=float(thread.axial_max),
+        rms=0.0, face_indices=list(thread.face_indices),
+        outward=bool(thread.outward),
+    )
+    return _boolean_clean_cylinder(solid, cyl, Part)
+
+
+def _boolean_clean_knurl(solid, knurl: KnurlBand, Part, **_):
+    """Suppress a knurled band to its median-radius mid-surface cylinder.
+
+    Reuses the proven cylinder cut/fuse: a grip knurl is a boss (material inside)
+    so we FUSE a cylinder of the band's nominal (mid-surface) radius over its
+    exact axial extent to true up the crest micro-facets into one clean wall; a
+    knurled bore is a hole so we CUT. Same primitive chain as _boolean_clean_
+    cylinder — the metadata (pattern/diameter) is what distinguishes it."""
+    cyl = Cylinder(
+        axis_point=np.asarray(knurl.axis_point, float),
+        axis_dir=np.asarray(knurl.axis_dir, float),
+        radius=float(knurl.suppress_radius),
+        axial_min=float(knurl.axial_min),
+        axial_max=float(knurl.axial_max),
+        rms=0.0, face_indices=list(knurl.face_indices),
+        outward=bool(knurl.outward),
+    )
+    return _boolean_clean_cylinder(solid, cyl, Part)
 
 
 def _dedupe_spheres(spheres):
@@ -2009,12 +2287,32 @@ def build_boolean_clean_solid(
     cones = detect_cones(vertices, faces, cylinders, config)
     progress(f"Found {len(cylinders)} cylinders, {len(cones)} cones")
 
-    # Straight-edge fillets, after cylinders/cones (detector ladder, design §5).
+    # Detector ladder (design §ladder placement): cylinders -> cones -> threads
+    # -> knurling -> fillets -> ... . Threads and knurling claim their bands early
+    # so they never mis-fit as swept walls or domes; both suppress to a cylinder
+    # (metadata differs). Threads first (a single-family helix), then knurling
+    # (bimodal crossing families) on whatever a thread didn't claim.
     claimed: set[int] = set()
     for c in cylinders:
         claimed.update(c.face_indices)
     for c in cones:
         claimed.update(c.face_indices)
+
+    threads = _detect_threads(vertices, faces, cylinders, claimed, config, progress)
+    for t in threads:
+        claimed.update(t.face_indices)
+
+    knurls = _detect_knurling(vertices, faces, cylinders, claimed, config, progress)
+    for k in knurls:
+        claimed.update(k.face_indices)
+
+    # Gear / whole-outline profiles (M5.3): detected on the FULL mesh (the
+    # claimed-subset swept pass fragments the tooth ring). Claim their facets so
+    # the swept pass leaves them to the single whole-outline fuse.
+    gear_profiles = _detect_gears(vertices, faces, config, progress)
+    for g in gear_profiles:
+        claimed.update(g.face_indices)
+
     fillets = _detect_fillets(vertices, faces, claimed, config, progress)
     for f in fillets:
         claimed.update(f.face_indices)
@@ -2150,6 +2448,28 @@ def build_boolean_clean_solid(
             max_bbox_growth=bbox_guard)
         cone_ok += ok
 
+    # Threads (M5.2) then knurls (M5.1): suppress each band to its nominal
+    # cylinder (pitch diameter for threads, mid-surface for knurls). Boss-> fuse,
+    # bore/internal-> cut, each reverting on invalidity. Metadata is captured
+    # separately in stats; here we only true up the geometry.
+    thread_ok = 0
+    for th in threads:
+        solid, ok = _try_boolean_step(
+            solid, lambda s, t=th: _boolean_clean_thread(s, t, Part),
+            max_bbox_growth=bbox_guard)
+        thread_ok += ok
+    if threads:
+        progress(f"  threads suppressed {thread_ok}/{len(threads)}")
+
+    knurl_ok = 0
+    for kn in knurls:
+        solid, ok = _try_boolean_step(
+            solid, lambda s, k=kn: _boolean_clean_knurl(s, k, Part),
+            max_bbox_growth=bbox_guard)
+        knurl_ok += ok
+    if knurls:
+        progress(f"  knurls suppressed {knurl_ok}/{len(knurls)}")
+
     # Fillets last: a concave fillet cuts, a convex one fuses its rounded-corner
     # sector, each reverting on invalidity so a bad fillet never breaks the solid.
     fillet_ok = 0
@@ -2169,8 +2489,33 @@ def build_boolean_clean_solid(
     # artifact-free part into a dual-output one.
     detected_r = sorted({round(c.radius, 3) for c in cylinders}
                         | {round(f.radius, 3) for f in fillets}
+                        | {round(t.nominal_radius, 3) for t in threads}
+                        | {round(t.suppress_radius, 3) for t in threads}
+                        | {round(k.nominal_radius, 3) for k in knurls}
+                        | {round(k.suppress_radius, 3) for k in knurls}
                         | {round(seg.radius, 3) for p in swept_profiles
                            for seg in p.segments if seg.kind == "arc"})
+    # Gear whole-outline extrusions (M5.3): a repeated-arc region wrapping the
+    # axis (detected up-front on the full mesh) is fused as ONE extruded solid,
+    # BEFORE the per-arc lens ops. The fuse fills any central bore (the outline is
+    # a solid disk with teeth), so the bore/hole cylinders are RE-CUT afterwards
+    # (design: bore cut after gear fuse, ladder discipline). Guarded throughout.
+    gear_ops, gear_ok = 0, 0
+    if gear_profiles:
+        solid, gear_ops, gear_ok = _apply_gear_extrusions(
+            solid, gear_profiles, Part, progress, bbox_guard=bbox_guard, config=config)
+        if gear_ok:
+            # Re-cut the internal (hole) cylinders the gear fuse filled.
+            for cyl in cylinders:
+                if cyl.outward:
+                    continue
+                r_cut = _design_radius(vertices, faces, cyl.axis_dir, cyl.axis_point,
+                                       cyl.face_indices, cyl.radius)
+                solid, _ok = _try_boolean_step(
+                    solid, lambda s, c=cyl, rc=r_cut: _boolean_clean_cylinder(
+                        s, c, Part, radius=rc),
+                    max_bbox_growth=bbox_guard)
+
     pre_swept = solid.copy()
     pre_rogue = set(_rogue_radii(solid, detected_r))
     solid, swept_ops, swept_ok = _apply_swept_lens_ops(
@@ -2218,9 +2563,10 @@ def build_boolean_clean_solid(
             solid = simplified if _is_valid_solid(simplified) else backup
             progress(f"  freeform sheets built {freeform_ok}/{freeform_ops}")
 
-    total = (len(cylinders) + len(cones) + len(fillets) + len(spheres)
-             + swept_ops + freeform_ops)
-    cleaned = cyl_ok + cone_ok + fillet_ok + sphere_ok + swept_ok + freeform_ok
+    total = (len(cylinders) + len(cones) + len(threads) + len(knurls)
+             + len(fillets) + len(spheres) + swept_ops + gear_ops + freeform_ops)
+    cleaned = (cyl_ok + cone_ok + thread_ok + knurl_ok + fillet_ok
+               + sphere_ok + swept_ok + gear_ok + freeform_ok)
     progress(f"Boolean clean-up: {cleaned}/{total} features replaced with analytic geometry "
              f"({total - cleaned} left faceted)")
 
@@ -2242,6 +2588,12 @@ def build_boolean_clean_solid(
         "cylinder_faces": cyl_ok,
         "cones_detected": len(cones),
         "cone_faces": cone_ok,
+        "threads_detected": len(threads),
+        "threads_built": thread_ok,
+        "threads": [t.as_dict() for t in threads],
+        "knurling_detected": len(knurls),
+        "knurling_built": knurl_ok,
+        "knurling": [k.as_dict() for k in knurls],
         "fillets_detected": len(fillets),
         "fillet_faces": fillet_ok,
         "fillet_radius_source": _radius_source_breakdown(fillets),
@@ -2254,6 +2606,12 @@ def build_boolean_clean_solid(
         "swept_walls_detected": len(swept_profiles),
         "swept_walls_built": swept_ok,
         "swept_arc_ops": swept_ops,
+        "gears_detected": len(gear_profiles),
+        "gears_built": gear_ok,
+        "gears": [{"segments": len(p.segments), "arcs": p.n_arcs,
+                   "lines": p.n_lines, "splines": p.n_splines,
+                   "extent": round(p.axial_max - p.axial_min, 3),
+                   "closed": p.closed} for p in gear_profiles],
         "swept_tangency_snaps": sum(p.tangency_snaps for p in swept_profiles),
         "swept_slivers_removed": slivers_removed,
         "swept_detail": [p.as_dict() for p in swept_profiles],

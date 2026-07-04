@@ -18,8 +18,16 @@ DATA = Path(__file__).parent / "data"
 SAMPLES = json.loads((DATA / "samples.json").read_text()) if (DATA / "samples.json").exists() else []
 
 
-@pytest.mark.skipif(not SAMPLES, reason="samples not generated")
-@pytest.mark.parametrize("truth", SAMPLES, ids=lambda t: t["file"])
+# Helical/patterned samples (M5) have curved thread/knurl walls that legitimately
+# fit best-fit cylinders NOT listed in their ground-truth ``cylinders`` (their
+# feature detection is exercised in test_helical.py), so the plain radius-match
+# test excludes them.
+_HELICAL_KINDS = {"threaded_rod", "knurled_band", "spur_gear"}
+_CYL_SAMPLES = [t for t in SAMPLES if t.get("kind") not in _HELICAL_KINDS]
+
+
+@pytest.mark.skipif(not _CYL_SAMPLES, reason="samples not generated")
+@pytest.mark.parametrize("truth", _CYL_SAMPLES, ids=lambda t: t["file"])
 def test_detected_radii_match_ground_truth(truth):
     vertices, faces = load_stl(DATA / truth["file"])
     cylinders = detect_cylinders(vertices, faces, ConversionConfig())

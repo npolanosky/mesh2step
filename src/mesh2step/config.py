@@ -321,6 +321,119 @@ class ConversionConfig:
     harmonize_rel_tol: float = 0.03   # radii within 3% are treated as the same
     harmonize_round: float = 0.05     # snap the shared radius to this grid (mm)
 
+    # --- Threads (M5.2). See docs/M5_HELICAL_PATTERNED.md §1. A thread is a
+    # single-family helix on a cylindrical band, whose wall vertices satisfy
+    # z = (pitch/2pi)*phi + z0. We fit that invariant, gate on coverage/RMS/pitch,
+    # and suppress to the pitch-diameter cylinder (metadata: pitch/starts/hand/
+    # crest/root in stats["threads"] + the <name>_features.json sidecar). True
+    # helical B-reps are deferred (build_true_threads stays off — M6 stretch).
+
+    # Detect and suppress threaded bands. Behind this flag so it can be disabled.
+    detect_threads: bool = True
+
+    # Rebuild threads as true helical B-reps (Part.makeHelix + MakePipe). OFF:
+    # a helical sweep booleaned against a faceted base is OCC's worst self-
+    # intersection case (design §governing decision) — deferred M6 stretch.
+    build_true_threads: bool = False
+
+    # Minimum wall facets a thread band must contain to attempt a helix fit.
+    thread_min_facets: int = 60
+
+    # Angular coverage gate (turns): the primary false-positive guard. One turn
+    # is a chamfer/ramp; a real thread wraps well past 1.5 turns. Turns are
+    # measured as axial_extent / fitted_pitch (robust — no fragile phi unwrap).
+    thread_min_turns: float = 1.5
+
+    # Upper turn bound: a real thread has a handful to a couple dozen turns. A
+    # band read along a WRONG axis wraps the whole part and phase-collapses a
+    # spurious very-fine "thread" of many dozens of turns — reject those.
+    thread_max_turns: float = 20.0
+
+    # The band must wrap the full circle about the axis (a thread groove goes all
+    # the way round); a partial-arc band is a ramp/chamfer, not a thread.
+    thread_min_coverage: float = 0.75
+
+    # How many dominant flat-normal / principal directions to try as thread axes
+    # (beyond the detected cylinders' own axes). Kept small: trying every
+    # candidate axis lets a wrong (e.g. horizontal) direction phase-collapse a
+    # spurious full-diameter "thread" out of a cap's flat faces.
+    thread_max_axes: int = 3
+
+    # The band facets must genuinely face radially (like a cylinder wall); a band
+    # seen along a wrong axis is really the part's flat top/sides with weak radial
+    # alignment. Require the mean |normal·radial| to clear this floor.
+    thread_min_radial_align: float = 0.55
+
+    # When a thread's axis coincides with a detected cylinder, the thread band's
+    # radius must be within this relative tolerance of a seed cylinder's radius (a
+    # thread is ON its cylinder). Rejects a spurious thread found at a very
+    # different radius from a tiny cross-hole's axis (knurled_knob's r=1 side holes
+    # seeding a bogus r=3.5 thread). Only applied when seeds exist for the axis.
+    thread_seed_radius_tol: float = 0.6
+
+    # Pitch sanity window, as a fraction of the band radius. A thread's pitch is
+    # a small-to-moderate fraction of its diameter; outside this the helix fit is
+    # spurious (a shallow ramp reads as a giant pitch, noise as a tiny one).
+    thread_min_pitch_rel: float = 0.03
+    thread_max_pitch_rel: float = 1.5
+
+    # Phase-collapse gate (THE thread discriminator). On a single-start thread the
+    # phase theta = phi - (2pi/pitch)*z collapses to one value, so its resultant
+    # length R = 1 - circular_variance is high (bottle-cap thread ~0.66). A knurl
+    # (two crossing helix families) or gear teeth (no helix) never collapse at any
+    # pitch (R stays near 0). Require R at the fitted pitch to clear this floor.
+    # 0.35 sits well below a real thread's R and far above a knurl/gear's.
+    thread_min_resultant: float = 0.35
+
+    # Accept the helix fit when its RMS residual (mm) is within this multiple of
+    # the resolution-scaled surface tolerance (a secondary sanity check; the
+    # phase-collapse resultant gate above is the primary false-positive net).
+    thread_rms_mult: float = 6.0
+
+    # --- Knurling (M5.1). See docs/M5_HELICAL_PATTERNED.md §3. A knurl is a
+    # high-frequency micro-roughness on a cylindrical grip: hundreds of tiny
+    # facets whose radial deviation from the wall is small but whose normals tilt
+    # in a *bimodal* pattern (a diamond knurl's two crossing helix families give
+    # two symmetric axial-tilt lobes). It is never rebuilt as bumps (absurd cost);
+    # it is suppressed to its median-radius mid-surface cylinder via
+    # _boolean_clean_cylinder, with the pattern kept as metadata (stats["knurling"]).
+
+    # Detect and suppress knurled bands. Behind this flag so it can be disabled.
+    detect_knurling: bool = True
+
+    # Minimum facets a knurled band must contain. A knurl is a DENSE micro-facet
+    # field wrapping a grip; a real one runs into the thousands, so this floor is
+    # well above any incidental cluster of tilted wall facets.
+    knurl_min_facets: int = 200
+
+    # A wall facet joins the knurl band only if its radial distance is within this
+    # tolerance of the band's median radius (max of abs mm and rel fraction). The
+    # crest/root excursion of a knurl is small vs the radius; this isolates the
+    # knurl from the hub/bore and any coaxial smooth land.
+    knurl_band_tol_abs: float = 0.3
+    knurl_band_tol_rel: float = 0.06
+
+    # Radial-excursion ceilings (the decisive knurl/gear discriminator). A knurl
+    # is a micro-roughness: its crest-to-root depth (p10..p90 radial span of the
+    # wall facets near the median radius) is a small fraction of the radius AND
+    # under a facet edge length. Gear teeth and coarse grip ribs have a LARGE
+    # intrinsic radial excursion (teeth ~9% of R and ~2.3 edges; ribs deeper) and
+    # must NOT be flattened to a cylinder — they route to the gear/swept path.
+    # Measured on the corpus: knob knurl 2.0% of R / 0.77 edges; gear teeth 9.0% /
+    # 2.3 edges; bottle grip 22% / 25 edges. Both ceilings must hold.
+    knurl_max_excursion_rel: float = 0.04
+    knurl_max_excursion_edges: float = 1.5
+
+    # Minimum fraction of the full circle the band must span (a knurl wraps the
+    # whole grip); rejects a partial tilted-facet sliver.
+    knurl_min_coverage: float = 0.75
+
+    # Bimodality gate (the discriminator). The wall-facet normals' axial-tilt
+    # component must score at least this on the bimodal-symmetric-dip metric
+    # (_knurl_bimodality): a plain cylinder wall scores ~0, a diamond knurl ~0.6+.
+    # Set high enough that a smooth wall or a gentle sweep never trips it.
+    knurl_min_normal_bimodality: float = 0.35
+
     # --- Curved-feature reconstruction (M1: resolution-scaled tolerances,
     # tangency prior, straight-edge fillets/chamfers). See docs/CURVED_FEATURES.md.
 
@@ -428,6 +541,41 @@ class ConversionConfig:
     # loose relative tolerance would let one giant circle "fit" a whole
     # line+arc+line profile). Otherwise the run goes to a line/B-spline.
     swept_arc_tol_rel: float = 0.001
+
+    # --- Gears / whole-outline extrusion (M5.3). See docs/M5_HELICAL_PATTERNED.md
+    # §2. A gear IS an extrusion; M4 recognizes the shape but drops it because
+    # per-arc lens ops are O(arcs × base) and never converge. Instead we claim a
+    # repeated-arc CLOSED profile roughly centered on the axis WHOLESALE: assemble
+    # the full 2D cross-section (lines + arcs + spline spans) into ONE closed
+    # Part.Wire -> Face -> extrude -> ONE guarded boolean. O(base) once. The
+    # central bore is cut after the gear fuse (ladder discipline).
+
+    # Route repeated-arc closed centered profiles to whole-outline extrusion.
+    reconstruct_gears: bool = True
+
+    # A profile is a "ring" (a gear cross-section / splined shaft) when its
+    # outline wraps the full circle about its OWN centroid and its points sit at a
+    # roughly consistent radius — the radial spread (std/mean about the centroid)
+    # is at most this. A gear's tip/root teeth vary the radius modestly (~0.15);
+    # a one-sided wall panel has huge spread and fails. Origin-frame independent
+    # (the profile-plane origin is an arbitrary rail point, not the axis).
+    gear_ring_spread_rel: float = 0.35
+
+    # Sanity ceiling on the number of profile segments a whole-outline extrusion
+    # will assemble into a wire. A noisy outline with thousands of micro-segments
+    # is rejected (left faceted) rather than handed to a pathological wire build.
+    gear_max_profile_segments: int = 2000
+
+    # Force the gear outline's flank spans to build as B-splines rather than
+    # short arcs: jagged tessellated involute flanks make many tiny arcs whose
+    # exact tangency is fragile; a spline through the span's points is robust.
+    gear_flanks_as_spline: bool = True
+
+    # Max whole-outline fuse attempts per part (largest-extent outlines first).
+    # Each fuse is an O(base_faces) boolean; a decimated gear can fragment its
+    # tooth ring into several axial regions, so cap the attempts to bound the time
+    # budget (a fuse that doesn't lower RTAF reverts anyway).
+    gear_max_ops: int = 2
 
     # Repeated-tooth guard (M4 gear regression). An involute gear / splined shaft
     # fits as one swept region whose profile is dozens of near-identical short
