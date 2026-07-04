@@ -92,6 +92,22 @@ main { flex: 1; overflow: hidden; }
   box-shadow: var(--shadow);
 }
 .card h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
+
+/* Options card: a <details> that behaves as a plain always-open card on
+   desktop (summary inert, no marker) and as a tappable accordion on mobile. */
+.options-card summary { list-style: none; display: flex; align-items: center; justify-content: space-between; }
+.options-card summary::-webkit-details-marker { display: none; }
+.options-card summary h2 { margin: 0; }
+.options-card[open] summary { margin-bottom: 12px; }
+@media (min-width: 901px) {
+  .options-card summary { pointer-events: none; }
+}
+@media (max-width: 900px) {
+  .options-card summary { cursor: pointer; padding: 2px 0; }
+  .options-card summary::after { content: "▸"; color: var(--muted); font-size: 13px; }
+  .options-card[open] summary::after { content: "▾"; }
+}
+
 .row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .hint { color: var(--muted); font-size: 12px; }
 .muted { color: var(--muted); }
@@ -215,7 +231,7 @@ select {
   background: #f0f2f5; border: 1px solid var(--border); border-radius: var(--radius);
   overflow: hidden; box-shadow: var(--shadow);
 }
-.viewer canvas { display: block; width: 100%; height: 100%; }
+.viewer canvas { display: block; width: 100%; height: 100%; touch-action: none; }
 .viewer-empty {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--muted); font-size: 14px; pointer-events: none;
@@ -274,7 +290,74 @@ td.wrap { white-space: normal; max-width: 320px; }
 .btn-mini.open { border-color: #bfdbfe; background: #eff6ff; color: #1d4ed8; }
 .btn-mini.open:hover { background: #dbeafe; }
 
+/* ---- mobile sticky run bar (status + cancel always reachable) ---- */
+.mobile-runbar { display: none; }
+.runbar-track { position: absolute; top: 0; left: 0; right: 0; height: 3px; background: #e5e7eb; }
+.runbar-bar { height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+.runbar-status { flex: 1; min-width: 0; font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.runbar-elapsed { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); }
+
+/* =====================================================================
+   MOBILE (≤900px): single vertical workflow —
+   upload → options (accordion) → convert → progress → viewer → log.
+   The desktop two-column grid above is untouched beyond this point.
+   ===================================================================== */
 @media (max-width: 900px) {
-  .convert-grid { grid-template-columns: 1fr; overflow-y: auto; }
-  .viewer-panel { height: 420px; }
+  /* Page scrolls as one document; the top bar stays pinned. */
+  html, body { height: auto; min-height: 100%; }
+  body { display: block; }
+  main { overflow: visible; }
+  .page { height: auto; }
+  .page.active { display: block; height: auto; }
+
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    height: auto; padding: 8px 12px; gap: 8px 12px; flex-wrap: wrap;
+  }
+  .tagline { display: none; }
+  .navtab { padding: 10px 14px; }
+  .meta { gap: 6px; }
+
+  /* Vertical workflow: flatten the controls panel (display: contents) so its
+     cards interleave with the viewer panel in one flex column, ordered
+     upload → options → convert → progress → viewer → log. */
+  .convert-grid { display: flex; flex-direction: column; height: auto; padding: 12px; gap: 12px; }
+  .controls { display: contents; }
+  #input-card { order: 1; margin-bottom: 0; }
+  #options-card { order: 2; margin-bottom: 0; }
+  #convert-btn { order: 3; margin-bottom: 0; }
+  #progress-card { order: 4; margin-bottom: 0; }
+  .viewer-panel { order: 5; }
+  .log-card { order: 6; margin-bottom: 0; }
+
+  /* Viewer: full width, height keyed to viewport width (roughly square-ish
+     but capped), canvas already fills its container. */
+  .viewer { height: min(70vw, 420px); flex: none; }
+  .viewer-toolbar { gap: 8px; }
+
+  /* Touch-friendly targets (≥40px hit areas). */
+  .seg-btn { padding: 11px 13px; font-size: 12.5px; }
+  .btn-mini { padding: 10px 14px; font-size: 13px; }
+  .btn-cancel { padding: 9px 16px; font-size: 13px; }
+  .btn-secondary { padding: 10px 16px; }
+  .file-row { padding: 9px 10px; }
+  .file-row-rm { font-size: 16px; padding: 4px 8px; }
+  select { padding: 9px 10px; font-size: 14px; }
+  label.check { margin: 11px 0; }
+
+  /* History/corpus: page-level vertical scroll; tables scroll sideways inside
+     their own wrapper (never the page). */
+  .wide { height: auto; padding: 12px; overflow: visible; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { padding: 10px; }
+
+  /* Sticky bottom run bar (shown by app.js while a job runs). */
+  .mobile-runbar {
+    display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 60;
+    align-items: center; gap: 10px; padding: 10px 14px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom));
+    background: #fff; border-top: 1px solid var(--border);
+    box-shadow: 0 -2px 10px rgba(15, 23, 42, .08);
+  }
+  body.runbar-on main { padding-bottom: 64px; }
 }

@@ -91,6 +91,34 @@
   // Poll every 3s so the count stays live even for jobs started in another tab.
   setInterval(refreshActive, 3000);
 
+  // ---- responsive: options accordion + mobile run bar -------------------- //
+  // Below the breakpoint the options card collapses into an accordion
+  // (collapsed by default); on desktop it's forced open and inert (CSS makes
+  // the summary unclickable there).
+  const mqMobile = window.matchMedia("(max-width: 900px)");
+  if (mqMobile.matches) $("options-card").open = false;
+  // Desktop must always show the options (the summary is inert there). Sync on
+  // both the media-query change AND plain resize — some environments (emulated
+  // viewports, zoom changes) deliver one but not the other.
+  function syncOptionsCard() {
+    if (!mqMobile.matches) $("options-card").open = true;
+  }
+  mqMobile.addEventListener("change", syncOptionsCard);
+  window.addEventListener("resize", syncOptionsCard);
+
+  // The mobile run bar mirrors status/progress/elapsed and hosts a Cancel
+  // button, fixed at the bottom so it's reachable without scrolling mid-run.
+  // Visibility follows the convert-page Cancel button ("job in flight");
+  // CSS hides the bar entirely on desktop.
+  function setRunbar(on) {
+    $("mobile-runbar").hidden = !on;
+    document.body.classList.toggle("runbar-on", on);
+    if (on) $("runbar-cancel").disabled = false;
+  }
+  $("runbar-cancel").addEventListener("click", () => {
+    cancelJob(currentJob, $("runbar-cancel")).then(() => setStatus("Cancelling…", null));
+  });
+
   // ---- file selection --------------------------------------------------- //
   // The native OS file dialog can only be opened from a genuine user gesture.
   // Brave/macOS reopened the picker because the old dropzone-wide click handler
@@ -297,6 +325,7 @@
     const b = $("cancel-btn");
     b.hidden = !on;
     b.disabled = false;
+    setRunbar(on);  // the mobile run bar tracks "job in flight"
   }
   function cancelJob(id, btn) {
     if (!id) return Promise.resolve();
@@ -349,7 +378,11 @@
 
   function setStatus(text, pct) {
     $("status-line").textContent = text;
-    if (pct != null) $("progress-bar").style.width = pct + "%";
+    $("runbar-status").textContent = text;   // mobile run-bar mirror
+    if (pct != null) {
+      $("progress-bar").style.width = pct + "%";
+      $("runbar-bar").style.width = pct + "%";
+    }
   }
   function appendLog(line, cls) {
     const el = $("log");
@@ -371,12 +404,15 @@
     // or a history Open mid-run shows the true process time.
     timer = setInterval(() => {
       if (jobDone) return;
+      let txt;
       if (jobStarted != null) {
         const nowSrv = Date.now() / 1000 - clockSkew;
-        $("elapsed").textContent = Math.max(0, nowSrv - jobStarted).toFixed(1) + "s";
+        txt = Math.max(0, nowSrv - jobStarted).toFixed(1) + "s";
       } else {
-        $("elapsed").textContent = "queued";
+        txt = "queued";
       }
+      $("elapsed").textContent = txt;
+      $("runbar-elapsed").textContent = txt;  // mobile run-bar mirror
     }, 100);
     if (evtSource) evtSource.close();
     showCancel(true);

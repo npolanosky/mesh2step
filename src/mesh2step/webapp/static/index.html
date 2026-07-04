@@ -30,7 +30,7 @@
       <div class="convert-grid">
         <!-- Left: controls -->
         <div class="panel controls">
-          <div class="card">
+          <div class="card" id="input-card">
             <h2>1 · Input mesh</h2>
             <div id="dropzone" class="dropzone">
               <div class="dz-icon">⤓</div>
@@ -41,8 +41,10 @@
             <div id="file-list" class="file-list" hidden></div>
           </div>
 
-          <div class="card">
-            <h2>2 · Units &amp; options</h2>
+          <!-- On desktop this renders as a normal always-open card; below the
+               mobile breakpoint app.js collapses it into an accordion. -->
+          <details class="card options-card" id="options-card" open>
+            <summary><h2>2 · Units &amp; options</h2></summary>
             <div class="row">
               <label for="units">Source units</label>
               <select id="units">
@@ -63,7 +65,7 @@
               Faceted only (skip reconstruction)</label>
             <label class="check"><input type="checkbox" id="opt-savefail">
               Save failing models for regression testing</label>
-          </div>
+          </details>
 
           <button id="convert-btn" class="btn-primary" disabled>Convert → STEP</button>
 
@@ -136,6 +138,15 @@
       </div>
     </section>
   </main>
+
+  <!-- Mobile-only sticky run bar: keeps status + Cancel reachable without
+       scrolling while a conversion runs (hidden on desktop via CSS). -->
+  <div id="mobile-runbar" class="mobile-runbar" hidden>
+    <div class="runbar-track"><div id="runbar-bar" class="runbar-bar"></div></div>
+    <span id="runbar-status" class="runbar-status">Working…</span>
+    <span id="runbar-elapsed" class="runbar-elapsed">0.0s</span>
+    <button id="runbar-cancel" class="btn-cancel">Cancel</button>
+  </div>
 
   <script src="/static/vendor/three.min.js"></script>
   <script src="/static/vendor/OrbitControls.js"></script>
