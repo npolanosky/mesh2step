@@ -17,6 +17,7 @@ from mesh2step.config import ConversionConfig
 from mesh2step.mesh_io import (
     bodies_bbox_overlap,
     bodies_share_coincident_vertices,
+    filter_junk_bodies,
     split_components,
     weld_vertices,
 )
@@ -50,6 +51,71 @@ def _two_body_mesh(gap: float):
     verts = np.vstack([vA, vB])
     faces = np.vstack([fA, fB + len(vA)])
     return split_components(verts, faces)
+
+
+# --- junk-body filter (P0): a tiny sliver must not make a single-body part
+#     read as multi-body / abort the sew ------------------------------------------
+
+def _sliver():
+    """An 8-facet degenerate sliver body (a stray shell / modelling artefact).
+
+    A thin flake near the origin: 8 triangles over a tiny footprint, well below
+    both the facet-count and the area-fraction thresholds beside a real cube.
+    """
+    pts = np.array([[0, 0, 100.0], [0.02, 0, 100.0], [0.01, 0.02, 100.0],
+                    [0.01, 0.01, 100.002]], dtype=np.float64)
+    tris = []
+    faces = [(0, 1, 2), (0, 1, 3), (1, 2, 3), (0, 2, 3)]
+    for a, b, c in faces:
+        tris.append([pts[a], pts[b], pts[c]])
+        tris.append([pts[a], pts[c], pts[b]])  # both windings -> 8 facets
+    return weld_vertices(np.asarray(tris, dtype=np.float64))
+
+
+def test_filter_junk_drops_tiny_sliver_body():
+    # Mirrors wc_sharpie_holder_v2: a real body + an 8-facet flake (both few
+    # facets AND negligible area -> junk). At the defaults the flake is dropped,
+    # so the part reads single-body and never hits the sew crash.
+    vC, fC = _cube(0.0, s=100.0)  # big cube: 12 facets, dominant area
+    vS, fS = _sliver()            # 8 facets, sub-mm² area
+    verts = np.vstack([vC, vS])
+    faces = np.vstack([fC, fS + len(vC)])
+    comps = split_components(verts, faces)
+    assert len(comps) == 2  # a real body + a flake
+    kept, dropped = filter_junk_bodies(comps)  # defaults: 32 facets / 2% area
+    assert dropped == 1
+    assert len(kept) == 1
+    assert len(kept[0][1]) == 12  # the cube's 12 facets survive
+
+
+def test_filter_junk_keeps_two_real_bodies():
+    # Two full cubes of equal size: each is 50% of the area, well above the 2%
+    # floor, so neither is junk even though 12 < 32 facets (BOTH must be tiny).
+    comps = _two_body_mesh(gap=5.0)
+    kept, dropped = filter_junk_bodies(comps)
+    assert dropped == 0
+    assert len(kept) == 2
+
+
+def test_filter_junk_never_empties():
+    # Two slivers only: everything looks like junk -> keep the original split so a
+    # caller never ends up with nothing to convert.
+    vS1, fS1 = _sliver()
+    vS2, fS2 = _sliver()
+    vS2 = vS2 + [50.0, 0, 0]
+    verts = np.vstack([vS1, vS2])
+    faces = np.vstack([fS1, fS2 + len(vS1)])
+    comps = split_components(verts, faces)
+    kept, dropped = filter_junk_bodies(comps)
+    assert dropped == 0
+    assert len(kept) == len(comps)
+
+
+def test_filter_junk_single_body_untouched():
+    comps = [_cube(0.0)]
+    kept, dropped = filter_junk_bodies(comps)
+    assert dropped == 0
+    assert len(kept) == 1
 
 
 # --- config field + validation ------------------------------------------------

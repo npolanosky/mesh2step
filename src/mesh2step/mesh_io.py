@@ -156,6 +156,55 @@ def split_components(
     return comps
 
 
+def filter_junk_bodies(
+    components: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    min_facets: int = 32,
+    min_area_frac: float = 0.02,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], int]:
+    """Drop degenerate junk components from a split before multi-body dispatch.
+
+    A welded-and-split STL can leave tiny non-bodies alongside the real part: an
+    8-facet flake (a stray shell, a modelling artefact) that is not a printable
+    solid. Left in, such junk (a) flips the "auto" combine/separate heuristic to
+    "separate" on what is really a single-body part (a real body + a flake reads
+    as two bodies), and (b) hard-aborts the worker later — an uncaught C++
+    CADKernelError when the sew step is handed the 2 degenerate facets the flake
+    collapses to after repair.
+
+    A component is junk only when it is BOTH below ``min_facets`` facets AND below
+    ``min_area_frac`` of the total mesh area. Requiring both keeps a small-but-real
+    body (a print-in-place hinge pin) — which is small in facet count OR area but
+    not a negligible speck in both. The corpus gap is wide (real secondary bodies:
+    892+ facets / 33%+ area; junk: <=12 facets / <=1.2% area), so the defaults sit
+    comfortably between. Returns ``(kept_components, n_dropped)``; if *every*
+    component is junk (a pathological all-degenerate mesh) the input is returned
+    unchanged so a caller never ends up with nothing to convert.
+    """
+    if len(components) <= 1:
+        return components, 0
+
+    def _area(verts: np.ndarray, faces: np.ndarray) -> float:
+        if len(faces) == 0:
+            return 0.0
+        tri = verts[faces]
+        cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        return float(0.5 * np.linalg.norm(cross, axis=1).sum())
+
+    areas = [_area(v, f) for v, f in components]
+    total_area = sum(areas)
+    kept: list[tuple[np.ndarray, np.ndarray]] = []
+    for (verts, faces), area in zip(components, areas):
+        few_facets = len(faces) < min_facets
+        tiny_area = total_area > 0 and area < min_area_frac * total_area
+        if not (few_facets and tiny_area):
+            kept.append((verts, faces))
+    dropped = len(components) - len(kept)
+    if not kept:  # everything looked like junk — keep the original split
+        return components, 0
+    return kept, dropped
+
+
 def bodies_share_coincident_vertices(
     components: list[tuple[np.ndarray, np.ndarray]], tol: float = 1e-3
 ) -> bool:

@@ -86,10 +86,23 @@ def convert(
         from .mesh_io import (
             bodies_bbox_overlap,
             bodies_share_coincident_vertices,
+            filter_junk_bodies,
             split_components,
         )
 
         components = split_components(raw_v, raw_f)
+        # Drop degenerate junk components (tiny slivers, stray shells) before the
+        # dispatch: they flip "auto" to "separate" on a real single-body part and
+        # can hard-abort the sew later. If everything but junk remains, the file
+        # is single-body and takes the ordinary path below.
+        if len(components) > 1 and config.min_body_facets > 0:
+            components, dropped = filter_junk_bodies(
+                components, min_facets=config.min_body_facets,
+                min_area_frac=config.min_body_area_frac)
+            if dropped:
+                progress(f"Ignored {dropped} junk body/bodies "
+                         f"(< {config.min_body_facets} facets or negligible area); "
+                         f"{len(components)} real body/bodies remain")
         if len(components) > 1:
             mode = config.multibody_mode
             if mode == "auto":
@@ -289,6 +302,32 @@ def convert(
         # retry at twice the target and finally with the undecimated mesh —
         # slower cuts beat losing the watertight result altogether.
         rungs = [t for t in (target, 2 * target) if len(bfaces) > t * 1.2] + [None]
+        # Planarity-damage back-off (task §1): on a coarse organic scan, quadric
+        # decimation warps genuinely-flat regions past the coplanar gate, so the
+        # 12k base ships "everything faceted" even though it is watertight. Measure
+        # the RAW mesh's area-weighted planar coverage once here; after each rung's
+        # decimation we compare the rung's coverage to it, and a rung that dropped
+        # the flat coverage below the ratio threshold is treated as FAILED (backed
+        # off to a gentler rung) exactly like the export-revalidation criterion.
+        # Only meaningful when there is an actual decimation rung to gate (a rung
+        # list of just [None] means the mesh is already small enough — nothing to
+        # damage, so skip the ~2 s raw-coverage segmentation entirely).
+        raw_planar_coverage = None
+        if (config.planarity_damage_check
+                and config.planarity_damage_min_ratio is not None
+                and any(t is not None for t in rungs)):
+            try:
+                from .segmentation import planar_coverage
+
+                info = planar_coverage(
+                    bverts, bfaces, config, config.planarity_min_region_facets)
+                raw_planar_coverage = info["coverage"]
+                stats["planarity_raw_coverage"] = round(raw_planar_coverage, 4)
+                progress(f"Planar coverage (raw base): {raw_planar_coverage:.2f} "
+                         f"of area in {info['n_big_regions']} large flats")
+            except Exception as exc:  # noqa: BLE001 - metric must not break convert
+                progress(f"Planar-coverage metric skipped ({exc})")
+                raw_planar_coverage = None
         # Cost ceiling: the fully-closed tier lifts boolean_max_base_faces to let
         # the cuts run on dense meshes, but only up to this many faces. Above it
         # (decimation unavailable, or a base still huge after decimation) an
@@ -319,6 +358,64 @@ def convert(
                     if tgt is None:
                         break
                     continue
+                # Planarity-damage gate: if this decimation rung warped the flats
+                # (coverage ratio below the threshold) AND a gentler rung remains,
+                # skip the (expensive) boolean build and back off — the check is a
+                # cheap segmentation, far cheaper than a doomed boolean run whose
+                # output would ship faceted. The last rung (undecimated / None)
+                # never trips it: it is the gentlest available, so we always try it.
+                if (raw_planar_coverage is not None and raw_planar_coverage > 0
+                        and tgt is not None and i < len(rungs) - 1):
+                    try:
+                        from .segmentation import planar_coverage
+
+                        cov = planar_coverage(
+                            dv, df, config, config.planarity_min_region_facets
+                        )["coverage"]
+                    except Exception:  # noqa: BLE001 - never block on the metric
+                        cov = None
+                    if cov is not None:
+                        ratio = cov / raw_planar_coverage
+                        rung_label = f"~{tgt:,}"
+                        # Only back off to a rung that can still BUILD a boolean-clean
+                        # solid. Every gentler rung ahead that is above the boolean
+                        # cost ceiling gets skipped to a plain faceted solid — worse
+                        # than THIS rung's watertight boolean-clean output even with
+                        # its warped flats. So if no reachable gentler rung stays
+                        # under the ceiling, keep this one (a faceted-flat boolean
+                        # solid beats a fully-faceted one).
+                        gentler_buildable = True
+                        if ceiling is not None:
+                            gentler_buildable = any(
+                                (len(bfaces) if nxt is None else min(nxt, len(bfaces)))
+                                <= ceiling
+                                for nxt in rungs[i + 1:])
+                        if ratio < config.planarity_damage_min_ratio and gentler_buildable:
+                            progress(
+                                f"  rung {rung_label}: decimation warped flats "
+                                f"(planar coverage {cov:.2f} vs raw "
+                                f"{raw_planar_coverage:.2f}, ratio {ratio:.2f} < "
+                                f"{config.planarity_damage_min_ratio}); backing off "
+                                f"to a gentler rung to preserve flats")
+                            stats.setdefault(
+                                "planarity_damaged_rungs", []).append(
+                                {"rung": rung_label, "base_faces": int(len(df)),
+                                 "coverage": round(cov, 4),
+                                 "ratio": round(ratio, 4)})
+                            continue
+                        if (ratio < config.planarity_damage_min_ratio
+                                and not gentler_buildable):
+                            progress(
+                                f"  rung {rung_label}: flats warped (ratio {ratio:.2f}) "
+                                f"but every gentler rung exceeds the boolean cost "
+                                f"ceiling ({ceiling:,}) and would ship fully faceted; "
+                                f"keeping this rung's boolean-clean solid")
+                            stats["planarity_kept_damaged_rung"] = {
+                                "rung": rung_label, "ratio": round(ratio, 4),
+                                "reason": "gentler rungs exceed boolean ceiling"}
+                        stats["planarity_winning_rung"] = rung_label
+                        stats["planarity_winning_coverage"] = round(cov, 4)
+                        stats["planarity_winning_ratio"] = round(ratio, 4)
                 try:
                     cand_shape, cand_built = builder.build_boolean_clean_solid(
                         dv, df, bcfg, on_progress=progress
@@ -799,6 +896,22 @@ def _assess_quality(shape, input_dims, method: str, stats: dict,
         warnings.append(
             "Even the undecimated boolean base re-reads invalid from the "
             "exported STEP; shipped it as the best watertight result available.")
+
+    # Planarity-damage back-off: surface rungs whose decimation warped the flats
+    # (shattering large planar faces into micro-regions) and were backed off to a
+    # gentler rung that preserved the flats.
+    damaged = stats.get("planarity_damaged_rungs")
+    if damaged:
+        rung_names = ", ".join(r.get("rung", "?") for r in damaged)
+        won = stats.get("planarity_winning_rung")
+        if won:
+            warnings.append(
+                f"Decimation warped flats at rung(s) {rung_names}; backed off to "
+                f"rung {won} to keep large planar faces (avoids a faceted result).")
+        else:
+            warnings.append(
+                f"Decimation warped flats at rung(s) {rung_names}; used the "
+                f"undecimated base to preserve flats.")
     final_reval = stats.get("export_revalidation")
     if isinstance(final_reval, dict) and final_reval.get("valid") is False:
         warnings.append(

@@ -95,6 +95,23 @@ class ConversionConfig:
     # mesh is unaffected — it takes the ordinary path byte-for-byte.
     multi_body: bool = True
 
+    # Junk-body filtering before multi-body dispatch. A welded-and-split STL can
+    # leave tiny degenerate non-bodies beside the real part (an 8-facet sliver, a
+    # stray shell). Left in, such junk (a) flips the "auto" combine/separate
+    # heuristic to "separate" on a part that is really single-body, and (b)
+    # hard-aborts the worker later (uncaught C++ CADKernelError when the sew is
+    # handed the 2 degenerate facets it collapses to). A component is dropped only
+    # when it is BOTH below ``min_body_facets`` facets AND below ``min_body_area_frac``
+    # of the total mesh area — both must be tiny, so a small-but-real body (a
+    # print-in-place hinge pin) is never dropped for being small in one axis alone.
+    # The corpus gap is wide: real secondary bodies run 892+ facets / 33%+ area
+    # (snap_fit is the smallest); junk is <=12 facets / <=1.2% area (sharpie's
+    # 8-facet flake, labstack_keystone's two 12-facet flakes). 32 facets / 2% sits
+    # in that gap with large margin. If EVERY component is junk the split is kept
+    # unchanged (never end up with nothing to convert). min_body_facets=0 disables.
+    min_body_facets: int = 32
+    min_body_area_frac: float = 0.02
+
     # How a multi-body mesh (>= 2 disjoint connected components) is handled.
     # Only consulted when ``multi_body`` is True and the mesh actually splits:
     #
@@ -259,6 +276,44 @@ class ConversionConfig:
     # that count. Set to None to disable. The fully-closed path enables a
     # default target automatically when needed.
     decimate_target_faces: int | None = None
+
+    # Planarity-damage back-off (task §1). Planar-preserving decimation collapses
+    # over-tessellated flats cheaply, but on a COARSE organic scan the quadric
+    # collapse warps the flats past the 1.0° coplanar gate — the measured Patton
+    # case: raw flats step 0.8° (segment into large regions) but the 12k-face
+    # decimation warps them to 1.7-1.9°, shattering ~2800 large flats into <40 and
+    # dropping the area in large flats from 48% to 32% (coverage ratio 0.67). The
+    # user sees "everything faceted" and RTAF stays ~0.70. Loosening the planar
+    # gate to re-absorb the warped noise regresses the curved detectors (config
+    # above), and post-hoc merging the warped geometry can't produce valid faces.
+    # The un-attacked lever is to NOT ship geometry decimation destroyed: after
+    # each decimation rung, compare area-weighted planar coverage (fraction of
+    # surface area in planar regions >= planarity_min_region_facets, via
+    # segmentation.planar_coverage) against the RAW mesh's; if the ratio falls
+    # below planarity_damage_min_ratio, the rung is treated as FAILED and the
+    # boolean back-off ladder steps to the next gentler rung (2x target, then
+    # undecimated) — exactly like the export-revalidation criterion. On the Patton
+    # files this backs 12k off to 24k (ratio 0.84/0.74) where the flats survive as
+    # large merged faces. A gentler rung means a larger boolean base (each cut is
+    # O(base faces)), so the cost ceiling still bounds the tradeoff. Prismatic
+    # parts whose flats survive decimation cleanly (ratio ~1.0) never trip it and
+    # keep the fast 12k base byte-for-byte.
+    planarity_damage_check: bool = True
+    # Coverage ratio (decimated/raw) below which a rung is treated as flat-damaged
+    # and backed off. Calibrated from the measured pipeline ratios: the Patton 12k
+    # rung is 0.64-0.67 (must reject — the "everything faceted" rung) and its 24k
+    # rung is 0.74-0.84 (must accept — flats survive as large faces there); every
+    # prismatic corpus part is >= 0.87 at 12k (gear 0.87, drive_bay 1.0) so they
+    # never trip it and keep the fast 12k base. 0.70 sits in that window: it backs
+    # 12k off to 24k on the damaged organic scans while landing on a rung that
+    # still builds a boolean-clean solid — crucially NOT cascading all the way to
+    # the undecimated base (which, above the boolean ceiling, would ship a plain
+    # faceted solid — worse). None disables the gate (same as check off).
+    planarity_damage_min_ratio: float | None = 0.70
+    # A planar region must have at least this many facets to count as a "real"
+    # flat in the coverage metric (below it is mesh-noise; a warped flat shatters
+    # into exactly these sub-threshold micro-regions, which is what we detect).
+    planarity_min_region_facets: int = 8
 
     # Snap near-equal detected radii to a shared rounded value, so triangulation
     # noise doesn't yield 6.04/6.05/6.06 for what is really one 6.05 hole.

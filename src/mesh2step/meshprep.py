@@ -281,15 +281,65 @@ def load_and_prepare(
                 report["actions"].append(op)
             except Exception:  # noqa: BLE001 - repairs are best-effort
                 pass
-        try:
-            m.fixDegenerations(1e-6)
-            report["actions"].append("fixDegenerations")
-        except Exception:  # noqa: BLE001
-            pass
+        # fixDegenerations LIVELOCKS (uninterruptible C++ loop — signals never
+        # fire; observed 88 min and counting) on meshes with a cluster of
+        # tiny-edge / tiny-area degenerate facets (wc_sharpie_holder_v2 body: 104
+        # edges < 1e-3 mm, 19 facets < 1e-6 mm²). A cheap numpy census up front
+        # decides whether to run it: below the thresholds it is safe and fast;
+        # at/above them it would hang for no downstream benefit (skipping was
+        # proven to give identical results on the affected mesh), so we skip it
+        # and record the reason. The other repair ops already ran (milliseconds).
+        cur_v, cur_f = _to_numpy(m)
+        census = _degeneracy_census(cur_v, cur_f)
+        report["degeneracy_census"] = census
+        if census["should_skip_fixdegen"]:
+            report["actions"].append("fixDegenerations:SKIPPED (degeneracy census)")
+        else:
+            try:
+                m.fixDegenerations(1e-6)
+                report["actions"].append("fixDegenerations")
+            except Exception:  # noqa: BLE001
+                pass
 
     report["after_facets"] = int(m.CountFacets)
     verts, faces = _to_numpy(m)
     return verts, faces, report
+
+
+# Degeneracy thresholds for the fixDegenerations livelock guard. fixDegenerations
+# hangs when many facets have sub-tolerance edges/areas to collapse; a handful is
+# harmless. The affected mesh had 104 tiny edges and 19 tiny-area facets, so a cap
+# of a few tens trips there while leaving clean meshes (0–1 such facets) untouched.
+_FIXDEGEN_TINY_EDGE = 1e-3       # mm; edge shorter than this is "tiny"
+_FIXDEGEN_TINY_AREA = 1e-6       # mm²; facet area below this is "degenerate"
+_FIXDEGEN_MAX_TINY_EDGES = 16    # skip fixDegenerations at/above this many tiny edges
+_FIXDEGEN_MAX_TINY_FACETS = 4    # or this many tiny-area facets
+
+
+def _degeneracy_census(verts: np.ndarray, faces: np.ndarray) -> dict:
+    """Cheap numpy census of degenerate features, gating the fixDegenerations run.
+
+    Counts facets with a sub-``_FIXDEGEN_TINY_AREA`` area and edges shorter than
+    ``_FIXDEGEN_TINY_EDGE``. ``should_skip_fixdegen`` is True when either count
+    reaches its cap — the signature of the mesh that livelocks FreeCAD's
+    ``fixDegenerations``. Pure numpy, O(facets)."""
+    if len(faces) == 0:
+        return {"tiny_edges": 0, "tiny_area_facets": 0,
+                "should_skip_fixdegen": False}
+    tri = verts[faces]
+    e0 = np.linalg.norm(tri[:, 1] - tri[:, 0], axis=1)
+    e1 = np.linalg.norm(tri[:, 2] - tri[:, 1], axis=1)
+    e2 = np.linalg.norm(tri[:, 0] - tri[:, 2], axis=1)
+    tiny_edges = int(np.count_nonzero(
+        (e0 < _FIXDEGEN_TINY_EDGE) | (e1 < _FIXDEGEN_TINY_EDGE)
+        | (e2 < _FIXDEGEN_TINY_EDGE)))
+    areas = 0.5 * np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    tiny_area = int(np.count_nonzero(areas < _FIXDEGEN_TINY_AREA))
+    skip = (tiny_edges >= _FIXDEGEN_MAX_TINY_EDGES
+            or tiny_area >= _FIXDEGEN_MAX_TINY_FACETS)
+    return {"tiny_edges": tiny_edges, "tiny_area_facets": tiny_area,
+            "should_skip_fixdegen": skip}
 
 
 # Decimation runs pymeshlab in a SEPARATE subprocess (see meshprep_runner):

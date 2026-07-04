@@ -236,6 +236,51 @@ def segment_planar(
     return regions
 
 
+def planar_coverage(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    config: ConversionConfig | None = None,
+    min_region_facets: int = 8,
+) -> dict:
+    """Area-weighted planar coverage: fraction of surface area in *large* flats.
+
+    Segments the mesh with :func:`segment_planar` and reports how much of the
+    total surface AREA lands in planar regions of at least ``min_region_facets``
+    facets (a "real" flat, not a mesh-noise micro-region). This is the cheap
+    planarity-damage metric: a mesh whose flats are genuinely planar has most of
+    its flat area in a handful of large regions; decimation that warps those
+    flats past the coplanar gate shatters them into thousands of sub-``min``
+    micro-regions, dropping this coverage sharply even though the total face
+    count only fell. Comparing ``coverage`` before/after decimation (a ratio)
+    detects exactly the damage that makes a coarse organic scan ship "everything
+    faceted" — without needing a reconstruction or a boolean run.
+
+    Returns ``{coverage, big_area, total_area, n_regions, n_big_regions}``.
+    Area-weighted (not facet-count-weighted) so one large warped flat counts for
+    its true share, and pure numpy — same ~2 s cost as one ``segment_planar`` on
+    a 200k-face mesh.
+    """
+    _, areas = face_normals_and_areas(vertices, faces)
+    total = float(areas.sum())
+    if total <= 0.0:
+        return {"coverage": 0.0, "big_area": 0.0, "total_area": 0.0,
+                "n_regions": 0, "n_big_regions": 0}
+    regions = segment_planar(vertices, faces, config)
+    big_area = 0.0
+    n_big = 0
+    for r in regions:
+        if len(r.face_indices) >= min_region_facets:
+            big_area += float(areas[r.face_indices].sum())
+            n_big += 1
+    return {
+        "coverage": big_area / total,
+        "big_area": big_area,
+        "total_area": total,
+        "n_regions": len(regions),
+        "n_big_regions": n_big,
+    }
+
+
 @dataclass
 class SmoothRegion:
     """A smoothly-curved band/cap/blend built from a chain of thin planar

@@ -10,6 +10,7 @@ import numpy as np
 
 from mesh2step.config import ConversionConfig
 from mesh2step.pipeline import _bbox_delta
+from mesh2step.segmentation import planar_coverage
 
 
 class _FakeBBox:
@@ -57,6 +58,50 @@ def test_bbox_reject_delta_default_is_sane():
     cfg = ConversionConfig()
     assert cfg.bbox_reject_delta is not None
     assert 0.16 < cfg.bbox_reject_delta < 0.9
+
+
+# --- Planarity-damage back-off gate (task §1): the ratio-vs-threshold decision -
+
+def _grid(n, jitter, seed=0):
+    rng = np.random.default_rng(seed)
+    xs = np.linspace(0, 60.0, n + 1)
+    gx, gy = np.meshgrid(xs, xs)
+    gz = np.zeros_like(gx)
+    if jitter > 0:
+        gz[1:-1, 1:-1] = rng.uniform(-jitter, jitter, size=gz[1:-1, 1:-1].shape)
+    verts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1).astype(float)
+    faces = []
+    for r in range(n):
+        for c in range(n):
+            a, b, d, e = (r * (n + 1) + c, r * (n + 1) + c + 1,
+                          (r + 1) * (n + 1) + c, (r + 1) * (n + 1) + c + 1)
+            faces += [[a, b, e], [a, e, d]]
+    return verts, np.asarray(faces, dtype=np.int64)
+
+
+def test_planarity_damage_default_threshold_is_sane():
+    cfg = ConversionConfig()
+    assert cfg.planarity_damage_check is True
+    # Above the Patton 12k damaged ratio (~0.64-0.67, rejected) and below both the
+    # Patton 24k rung (~0.74-0.84) and every prismatic part's 12k ratio (>=0.87),
+    # which must be kept — so the gate rejects only the flat-destroying rung.
+    assert cfg.planarity_damage_min_ratio is not None
+    assert 0.67 < cfg.planarity_damage_min_ratio < 0.74
+
+
+def test_planarity_ratio_classifies_damaged_vs_clean():
+    # Reproduce the pipeline's rung decision on synthetic geometry: a clean rung
+    # (ratio ~1) passes the gate; a warped rung (ratio well below) is rejected.
+    cfg = ConversionConfig()
+    mrf = cfg.planarity_min_region_facets
+    raw = planar_coverage(*_grid(14, 0.0), config=cfg, min_region_facets=mrf)["coverage"]
+    clean = planar_coverage(*_grid(14, 0.0), config=cfg,
+                            min_region_facets=mrf)["coverage"]
+    warped = planar_coverage(*_grid(14, 0.6, seed=1), config=cfg,
+                             min_region_facets=mrf)["coverage"]
+    assert raw > 0
+    assert (clean / raw) >= cfg.planarity_damage_min_ratio      # clean rung kept
+    assert (warped / raw) < cfg.planarity_damage_min_ratio      # damaged rung backed off
 
 
 # --- P1-2: resolve_self_intersections logs a distinct reason on each failure --
