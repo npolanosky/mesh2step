@@ -144,6 +144,37 @@ def _face_neighbors(
     return neighbors
 
 
+def planar_merge_tols(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    config: ConversionConfig,
+) -> tuple[float, float]:
+    """Effective (cos_tol, dist_tol) for planar merging, resolution-scaled.
+
+    Mirrors the curved detectors' ``_local_tol``: the absolute ``angle_tol_deg`` /
+    ``dist_tol`` are floors, and the effective tolerance grows with the mesh's own
+    tessellation noise (median smooth-dihedral step and median edge length) so a
+    coarse or decimated export of a genuinely flat face merges into one region
+    instead of shattering — while a fine, clean mesh is unaffected. Both are
+    clamped by conservative caps so a genuinely curved wall's arc rows are never
+    swallowed into one flat (which would starve the swept-wall / freeform / sphere
+    detectors). Returns the strict absolute tolerances when the rel factors are 0
+    (legacy behaviour). Cheap pure-numpy call; safe to compute per segmentation.
+    """
+    angle_deg = float(config.angle_tol_deg)
+    dist_tol = float(config.dist_tol)
+    if config.planar_angle_tol_rel > 0.0 or config.planar_dist_tol_rel > 0.0:
+        res = mesh_resolution(vertices, faces, config)
+        if config.planar_angle_tol_rel > 0.0 and res.median_dihedral_deg > 0.0:
+            scaled = config.planar_angle_tol_rel * res.median_dihedral_deg
+            angle_deg = min(config.planar_angle_tol_cap_deg, max(angle_deg, scaled))
+        if config.planar_dist_tol_rel > 0.0 and res.median_edge > 0.0:
+            scaled = config.planar_dist_tol_rel * res.median_edge
+            dist_tol = min(config.planar_dist_tol_cap, max(dist_tol, scaled))
+    cos_tol = float(np.cos(np.radians(angle_deg)))
+    return cos_tol, dist_tol
+
+
 def segment_planar(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -154,7 +185,9 @@ def segment_planar(
     A facet joins a region when (a) its normal is within ``angle_tol`` of the
     seed plane normal and (b) all its vertices lie within ``dist_tol`` of the
     seed plane. Seeds are taken largest-area first so dominant faces anchor
-    their plane before noise can.
+    their plane before noise can. Both tolerances are resolution-scaled (see
+    :func:`planar_merge_tols`) so coarse/decimated exports of flat faces merge
+    into single regions rather than shipping as a faceted-looking fan.
     """
     config = config or ConversionConfig()
     normals, areas = face_normals_and_areas(vertices, faces)
@@ -164,8 +197,7 @@ def segment_planar(
     n_faces = len(faces)
     visited = np.zeros(n_faces, dtype=bool)
     order = np.argsort(-areas)  # largest first
-    cos_tol = config.angle_tol_cos
-    dist_tol = config.dist_tol
+    cos_tol, dist_tol = planar_merge_tols(vertices, faces, config)
 
     regions: list[Region] = []
     for seed in order:

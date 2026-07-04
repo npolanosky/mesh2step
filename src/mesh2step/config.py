@@ -42,6 +42,36 @@ class ConversionConfig:
     # Max point-to-plane distance for a facet to join a planar region.
     dist_tol: float = 1e-2
 
+    # Resolution-scaled planar-merge tolerances (mirror curve_fit_tol_rel). The
+    # absolute angle_tol_deg / dist_tol above are floors; when the rel factors are
+    # non-zero the effective planar-merge tolerance grows with the mesh's own
+    # tessellation noise (median smooth-dihedral step, median edge length):
+    #
+    #   effective angle = clamp(angle_tol_deg .. planar_angle_tol_cap_deg,
+    #                           planar_angle_tol_rel * median_smooth_dihedral)
+    #   effective dist  = clamp(dist_tol .. planar_dist_tol_cap,
+    #                           planar_dist_tol_rel * median_edge)
+    #
+    # BOTH default OFF (rel = 0 -> legacy pure-absolute behaviour). Investigation
+    # on the reported coarse scans showed loosening segmentation is the WRONG lever
+    # for merging their flats: (a) the 1.0° angle boundary is ALSO the flat/curved
+    # discriminator the swept-wall and dome-consensus detectors key off, so any
+    # angle loosening big enough to absorb the scans' ~1.7° flat-normal noise also
+    # merges the fine curved detectors' arc rows and drops those analytic features;
+    # and (b) even pure distance loosening perturbs the freeform/swept detector
+    # inputs enough to trigger a pathologically slow boolean on some meshes while
+    # merging almost no real flat area. On the reported coarse organic scans the
+    # "flats" are additionally warped by decimation (raw median facet step 0.8°,
+    # post-decimation 1.7°), so they are not truly planar and cannot be merged
+    # into valid planar faces at all — the output is the correct watertight
+    # representation of a genuinely faceted mesh. The rel fields are kept as an
+    # explicit opt-in for callers with a mesh known to be prismatic-flat and free
+    # of curved analytic features (where a modest loosening is safe).
+    planar_angle_tol_rel: float = 0.0       # x median smooth-dihedral step (off)
+    planar_angle_tol_cap_deg: float = 1.5   # hard ceiling on the effective angle
+    planar_dist_tol_rel: float = 0.0        # x median edge length (off)
+    planar_dist_tol_cap: float = 0.1        # hard ceiling on the effective dist (mm)
+
     # Tolerance for dropping collinear vertices from a boundary loop. A vertex
     # is removed when its perpendicular distance to the chord of its neighbours
     # is below this value.
@@ -549,6 +579,21 @@ class ConversionConfig:
     # the organic-wall false positive (a vase ring-stack fitting a bogus
     # part-size sphere) is dropped by the radius-vs-part-size cap above, not here.
     min_sphere_coverage: float = 0.03
+
+    # Per-part sphere boolean-op cost budget (mirrors ``swept_op_budget``). Each
+    # analytic-sphere cut/fuse is a boolean against the base solid, cost
+    # ~O(base_faces); with a deep BOP self-intersection re-check on the result a
+    # single op can take tens of seconds on a DENSE base (a mostly-organic body —
+    # a scanned tank hull — that decimation could not shrink, or a config that
+    # skipped decimation, leaves a ~200k-face base where each op grinds and the
+    # M3 pass can appear hung, e.g. "spheres cleaned 7/8" stalling for minutes).
+    # When ``spheres × base_faces`` exceeds this budget the sphere ops are skipped
+    # WHOLESALE (those caps stay faceted) rather than hanging — a graceful
+    # per-feature degradation that never costs the watertight solid or the other
+    # analytic features. Set well ABOVE the corpus's real domed parts (domed_plate
+    # ~9 spheres × ~12k base = 108k) so it never vetoes a legitimate reconstruction
+    # while still catching a runaway (9 × 200k = 1.8M). None disables the budget.
+    sphere_op_budget: int | None = 1_500_000
 
     # --- Dome routing via cross-region sphere consensus (task §3). A tessellated
     # dome segments into many thin planar strips; no single strip reads as a

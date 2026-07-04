@@ -302,6 +302,43 @@ def _arc_mid_point2(seg) -> np.ndarray:
     return np.array([c[0] + r * math.cos(am), c[1] + r * math.sin(am)])
 
 
+def _apply_sphere_ball_ops(solid, spheres, Part, progress, *, bbox_guard,
+                           config: ConversionConfig | None = None) -> tuple:
+    """Apply the analytic-sphere cut/fuse ops with a cost budget + per-op revert.
+
+    Shared by both tiers. Each op is a boolean against ``solid`` (cost
+    ~O(base_faces)); on a DENSE base a single op — plus its deep BOP re-check —
+    can grind for tens of seconds, so the whole M3 pass can appear to hang
+    ("spheres cleaned 7/8" stalling). When ``spheres × base_faces`` exceeds
+    ``config.sphere_op_budget`` the batch is SKIPPED wholesale (caps stay
+    faceted) — a graceful per-feature degradation that never costs the watertight
+    solid or the other analytic features. Otherwise every op goes through
+    ``_try_boolean_step`` so a bad/slow-to-fail sphere reverts JUST itself and the
+    rest of the reconstruction is kept analytic. Returns ``(solid, built)``.
+    """
+    if not spheres:
+        return solid, 0
+    budget = config.sphere_op_budget if config is not None else None
+    if budget is not None:
+        try:
+            base_faces = len(solid.Faces)
+        except Exception:  # noqa: BLE001
+            base_faces = 0
+        cost = len(spheres) * base_faces
+        if base_faces and cost > budget:
+            progress(f"  sphere ops skipped: cost {len(spheres)} spheres × "
+                     f"{base_faces} faces = {cost:,} exceeds budget {budget:,} "
+                     f"(domes/blends left faceted)")
+            return solid, 0
+    built = 0
+    for sph in spheres:
+        solid, ok = _try_boolean_step(
+            solid, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part),
+            max_bbox_growth=bbox_guard)
+        built += ok
+    return solid, built
+
+
 def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
                           max_ops: int = 200, config: ConversionConfig | None = None) -> tuple:
     """Apply one boolean lens op per fitted swept-arc segment to a valid solid.
@@ -1019,11 +1056,8 @@ def build_reconstructed_solid(
     sphere_ok = 0
     if is_solid and spheres:
         bbox_guard = config.boolean_max_bbox_growth
-        for sph in spheres:
-            shape, ok = _try_boolean_step(
-                shape, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part),
-                max_bbox_growth=bbox_guard)
-            sphere_ok += ok
+        shape, sphere_ok = _apply_sphere_ball_ops(
+            shape, spheres, Part, progress, bbox_guard=bbox_guard, config=config)
         if sphere_ok:
             progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
             solids = getattr(shape, "Solids", [])
@@ -2009,11 +2043,8 @@ def build_boolean_clean_solid(
     # the solid.
     sphere_ok = 0
     if spheres and _is_valid_solid(solid):
-        for sph in spheres:
-            solid, ok = _try_boolean_step(
-                solid, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part),
-                max_bbox_growth=bbox_guard)
-            sphere_ok += ok
+        solid, sphere_ok = _apply_sphere_ball_ops(
+            solid, spheres, Part, progress, bbox_guard=bbox_guard, config=config)
         progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
 
     # Freeform B-spline sheets (Candidate B): last, on a valid solid, each
