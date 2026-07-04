@@ -902,6 +902,149 @@ def _finalize_freeform_region(
     )
 
 
+@dataclass
+class OrganicRegion:
+    """A large residual smooth region rebuilt as a Catmull-Clark patch network.
+
+    Unlike :class:`FreeformRegion`, an organic region is NOT required to be an
+    injective height field: it is any connected set of residual smooth (curved)
+    facets big enough to matter, gated only by a *moderate* foldover so it can
+    still be integrated by an extrude+cut boolean (a region that wraps most of the
+    way around the body is deferred). ``axis`` is the region's area-weighted mean
+    normal — the extrude direction the builder pushes the patch shell along to make
+    the boolean tool. ``foldover`` is the fraction of facet area facing away from
+    ``axis`` (0 = a clean cap; approaching the gate = a strongly-curved shell).
+    """
+
+    face_indices: list[int]
+    axis: np.ndarray
+    area: float
+    foldover: float
+
+    @property
+    def size(self) -> int:
+        return len(self.face_indices)
+
+
+def segment_organic_regions(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    claimed: set[int],
+    config: ConversionConfig | None = None,
+) -> list["OrganicRegion"]:
+    """Group residual smooth facets into large organic regions (Candidate A,
+    region-level).
+
+    Grows connected components of UNCLAIMED facets across smooth-step edges
+    (neighbours whose normal angle is a smooth curve step, not a sharp feature
+    edge), WITHOUT the height-field / double-curvature gates that
+    :func:`segment_freeform_sheets` applies — those gates are exactly what defers
+    a strongly-curved cast region to this pass. Keeps only regions that are (a)
+    large enough (``organic_region_min_facets`` / ``organic_region_min_area``) and
+    (b) not too wrapped (foldover below ``organic_region_max_foldover``, so the
+    region's patch shell can be extruded into a valid boolean tool). Pure numpy;
+    the builder rebuilds each region and integrates it by a guarded boolean.
+
+    Sorted largest-area first (the biggest residual is the biggest RTAF win).
+    """
+    config = config or ConversionConfig()
+    n_faces = len(faces)
+    if n_faces == 0:
+        return []
+    normals, areas = face_normals_and_areas(vertices, faces)
+    adjacency = build_edge_adjacency(faces)
+    nbr: list[list[int]] = [[] for _ in range(n_faces)]
+    for incident in adjacency.values():
+        if len(incident) == 2:
+            nbr[incident[0]].append(incident[1])
+            nbr[incident[1]].append(incident[0])
+
+    cos_flat = config.angle_tol_cos
+    cos_sharp = float(np.cos(np.radians(config.curve_max_deg)))
+
+    def is_curved_seed(i: int) -> bool:
+        ni = normals[i]
+        for y in nbr[i]:
+            if y in claimed:
+                continue
+            d = float(np.clip(abs(ni @ normals[y]), 0.0, 1.0))
+            if cos_sharp < d < cos_flat:
+                return True
+        return False
+
+    unclaimed = [i for i in range(n_faces) if i not in claimed]
+    seeds = sorted((i for i in unclaimed if is_curved_seed(i)),
+                   key=lambda i: -float(areas[i]))
+    seen: set[int] = set()
+    out: list[OrganicRegion] = []
+    # A neighbour joins only while its normal stays on the seed side's +axis half
+    # (n·axis >= -side_tol). This keeps a region SINGLE-SIDED: a thin cast wall's
+    # top and bottom smooth surfaces meet around a curved rim (no sharp edge to
+    # stop the flood), and a two-sided region is not reconstructable as one patch
+    # shell (the shell splits the difference and misses both faces). The axis is
+    # seeded from the seed normal and refreshed once to the region's mean, then the
+    # region is re-grown, so it settles on the true surface facing.
+    side_tol = 0.35
+
+    def grow(seed: int, axis0: np.ndarray) -> list[int]:
+        comp = [seed]
+        local = {seed}
+        stack = [seed]
+        while stack:
+            x = stack.pop()
+            for y in nbr[x]:
+                if y in seen or y in local or y in claimed:
+                    continue
+                d = float(np.clip(abs(normals[x] @ normals[y]), 0.0, 1.0))
+                if d <= cos_sharp:                    # sharp feature edge -> boundary
+                    continue
+                if float(normals[y] @ axis0) < -side_tol:   # opposite side -> boundary
+                    continue
+                local.add(y)
+                comp.append(y)
+                stack.append(y)
+        return comp
+
+    for seed in seeds:
+        if seed in seen:
+            continue
+        axis = normals[seed].astype(float).copy()
+        comp = grow(seed, axis)
+        # Refresh the axis to the region's area-weighted mean normal and re-grow
+        # once (a tilted seed facet otherwise clips one edge of the field).
+        fa0 = np.array(comp, dtype=int)
+        mn0 = (normals[fa0] * areas[fa0][:, None]).sum(axis=0)
+        nmn = float(np.linalg.norm(mn0))
+        if nmn > 1e-6:
+            new_axis = mn0 / nmn
+            if float(new_axis @ axis) < 0.9995:
+                axis = new_axis
+                comp = grow(seed, axis)
+        for c in comp:
+            seen.add(c)
+        if len(comp) < config.organic_region_min_facets:
+            continue
+        fa = np.array(comp, dtype=int)
+        ar = areas[fa]
+        tot = float(ar.sum())
+        if tot < config.organic_region_min_area:
+            continue
+        mn = (normals[fa] * ar[:, None]).sum(axis=0)
+        na = float(np.linalg.norm(mn))
+        if na < 1e-6:
+            continue
+        axis = mn / na
+        dots = normals[fa] @ axis
+        fold = float(ar[dots < -0.05].sum()) / tot if tot > 0 else 1.0
+        if fold > config.organic_region_max_foldover:
+            continue
+        out.append(OrganicRegion(
+            face_indices=sorted(int(i) for i in comp),
+            axis=axis, area=tot, foldover=fold))
+    out.sort(key=lambda r: -r.area)
+    return out
+
+
 def split_freeform_region(
     vertices: np.ndarray,
     faces: np.ndarray,

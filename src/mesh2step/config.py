@@ -775,6 +775,84 @@ class ConversionConfig:
     # usually keeps it well under). None disables the guard.
     organic_multipatch_max_faces: int | None = 200000
 
+    # --- Region-level Candidate A (organic patch regions). See
+    # docs/ORGANIC_CONVERSION_RESEARCH.md (Candidate A, region-level). The
+    # whole-body organic tier only fires on a body that is ORGANIC in its entirety
+    # (a sculpted cat). Real engineering parts mix analytic features with ONE (or a
+    # few) large residual organic region(s) — the port_cover cast top, a curved
+    # cast pad — that neither the analytic tiers, nor the freeform height-field
+    # sheet (Candidate B, which requires an injective projection), nor whole-body
+    # remeshing (the whole part isn't a closed organic body) can claim, so the
+    # region ships faceted (high RTAF). This pass rebuilds each such region as a
+    # Catmull-Clark patch network (quad-remesh the OPEN region -> fit the cage's
+    # limit surface to the region facets -> exact bicubic Stam patches) and
+    # integrates it with the analytic base by the SAME guarded extrude+cut boolean
+    # the freeform sheet uses (organic patch shell -> extrude along the region axis
+    # into a tool -> cut, so the shell's smooth patches become the new surface).
+    # Runs AFTER the freeform sheet pass in the boolean-clean tier, on whatever
+    # residual it left. STRICT rollback: each region is adopted only when its
+    # boolean validates, stays bbox-stable, and LOWERS the RTAF; otherwise the
+    # region keeps its faceted output (never regress).
+
+    # Attempt the region-level organic patch pass. Behind this flag so it can be
+    # disabled. Requires the optional pynanoinstantmeshes remesher + OCC bindings;
+    # declines gracefully (regions stay faceted) when either is unavailable.
+    organic_region_patches: bool = True
+
+    # A residual smooth region must have at least this many facets (and this
+    # surface area, mm^2) to be worth rebuilding — smaller residuals stay faceted
+    # (negligible RTAF, and a tiny cage remeshes poorly).
+    organic_region_min_facets: int = 300
+    organic_region_min_area: float = 200.0
+
+    # Reject a region whose foldover (facet-area fraction facing away from its mean
+    # normal) exceeds this. A region must project INJECTIVELY along its mean normal
+    # for its single fitted B-spline surface (and the extruded boolean tool) to be
+    # non-self-intersecting — a wrapping region folds the (u,v) projection, giving a
+    # degenerate surface and a pathological cut. So this stays tight (near the
+    # freeform gate). The pass's value over freeform on these injective regions is
+    # the Catmull-Clark limit SAMPLER: it denoises the mesh into a smooth dense grid,
+    # so a region whose raw-mesh B-spline fit freeform rejects on deviation can still
+    # be reconstructed here from the clean limit surface.
+    organic_region_max_foldover: float = 0.08
+
+    # Target quad count for a region's control cage (edge-length target; the
+    # realised count differs). Scaled up modestly for larger regions in the builder.
+    organic_region_target_quads: int = 400
+
+    # Catmull-Clark subdivisions of the region cage before the limit-fit. One step
+    # densifies the limit-point sample enough for a clean single-surface fit.
+    organic_region_subdiv: int = 1
+
+    # (u,v) grid resolution for resampling the region's Catmull-Clark limit points
+    # into ONE B-spline surface. The limit cloud is smooth + dense, so a moderate
+    # grid captures it; the fit is rejected if the pole count saturates (a signal it
+    # interpolated noise instead of approximating).
+    organic_region_grid: int = 30
+
+    # Projection iterations for the region cage shrink-wrap fit (applied to the
+    # already-subdivided dense cage — see organic_region.build_region_patch_faces).
+    # 0 disables (the limit surface then shrinks inside the region); ~6 lands the
+    # dense limit surface on the mesh to sub-mm on the target corpus.
+    organic_region_fit_iters: int = 6
+
+    # Accepted deviation of the region's fitted surface to its real facets. The
+    # tolerance is max(abs, rel*local_edge, diag_frac*region_diagonal): the
+    # edge-scaled term recovers correct fits on a coarse STL (chord sagitta scales
+    # with edge length), and the diagonal-fraction term (like the whole-body
+    # organic tier's 2%-of-diag gate) admits a resolution-honest fit on a large
+    # cast region. Above it the region's boolean is not attempted (the surface
+    # misses the mesh -> would distort the part).
+    organic_region_dev_tol_abs: float = 0.6
+    organic_region_dev_tol_rel: float = 2.0
+    organic_region_dev_tol_diag_frac: float = 0.02
+
+    # Cap on the number of region booleans attempted per part (each is O(base
+    # faces)); and skip the pass when the base solid exceeds this many faces (the
+    # boolean of a dense patch tool against a dense base is slow).
+    organic_region_max_ops: int = 6
+    organic_region_max_base_faces: int | None = 40000
+
     # --- Spheres: domes and corner blends (M3). See docs/CURVED_FEATURES.md §3,
     # §4. A dome (grille cap, rounded boss top) or the spherical blend where three
     # fillets meet is a spherical cap: its facet normals fan out in all directions

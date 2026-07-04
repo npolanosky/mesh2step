@@ -39,6 +39,7 @@ from .segmentation import (
     face_normals_and_areas,
     mesh_resolution,
     sample_freeform_grid,
+    segment_organic_regions,
     segment_planar,
     segment_smooth_bands,
     segment_swept_walls,
@@ -1173,6 +1174,124 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress,
     return solid, attempted, built
 
 
+def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progress):
+    """Rebuild residual organic regions as Catmull-Clark patch shells and integrate
+    each by a guarded extrude+cut boolean (Candidate A, region-level).
+
+    Runs on whatever the analytic + freeform passes left faceted: segments the
+    unclaimed smooth facets into large organic regions (no height-field gate — that
+    is what freeform already declined) and, for each, builds a bicubic patch shell
+    and cuts it in. Adopts a region only when the boolean validates, stays
+    bbox-stable, and LOWERS the RTAF (never trades a faceted region for something
+    worse). Returns ``(solid, detected, built, details)``.
+
+    Bounded by ``organic_region_max_ops`` boolean attempts and an
+    ``organic_region_max_base_faces`` base-size ceiling (the boolean of a dense
+    patch tool against a dense base is slow). Requires the optional remesher + OCC
+    bindings; declines gracefully when unavailable (regions stay faceted)."""
+    from .quadremesh import available as _remesh_available
+
+    details: list[dict] = []
+    if not config.organic_region_patches:
+        return solid, 0, 0, details
+    if not _remesh_available():
+        progress("  organic regions: remesher unavailable — regions stay faceted")
+        return solid, 0, 0, details
+    try:
+        base_faces = len(solid.Faces)
+    except Exception:  # noqa: BLE001
+        base_faces = 0
+    limit = config.organic_region_max_base_faces
+    if limit is not None and base_faces > limit:
+        progress(f"  organic regions skipped: base {base_faces} faces > "
+                 f"ceiling {limit} (left faceted)")
+        return solid, 0, 0, details
+
+    regions = segment_organic_regions(vertices, faces, claimed, config)
+    if not regions:
+        return solid, 0, 0, details
+    progress(f"  organic regions: {len(regions)} residual region(s) "
+             f"({sum(r.size for r in regions)} facets; sizes "
+             f"{[r.size for r in regions[:6]]})")
+
+    from . import organic_region as oreg
+
+    try:
+        rtaf_before = compute_rtaf(solid, config).get("rtaf")
+    except Exception:  # noqa: BLE001
+        rtaf_before = None
+    resolution = None
+    try:
+        resolution = mesh_resolution(vertices, faces, config)
+    except Exception:  # noqa: BLE001
+        resolution = None
+    bbox_guard = config.boolean_max_bbox_growth
+    detected = len(regions)
+    built = 0
+    ops = 0
+    for region in regions:
+        if ops >= config.organic_region_max_ops:
+            break
+        surf, detail = oreg.build_region_surface(
+            vertices, faces, region, config, Part, on_progress=progress)
+        if surf is None:
+            progress(f"  organic region declined ({detail.get('reason')}, "
+                     f"{region.size} facets)")
+            details.append(detail)
+            continue
+        # Deviation gate: a surface that misses the real facets would distort the
+        # part — do not pay the boolean. Tolerance is the max of an absolute floor,
+        # an edge-scaled term (coarse-STL chord sagitta), and a fraction of the
+        # region's diagonal (a resolution-honest ceiling on a large cast region,
+        # mirroring the whole-body organic tier's 2%-of-diag gate).
+        edge = (resolution.edge_for(region.face_indices)
+                if resolution is not None else 1.0)
+        rdiag = detail.get("diag_mm", 0.0) or 0.0
+        dev_tol = max(config.organic_region_dev_tol_abs,
+                      config.organic_region_dev_tol_rel * edge,
+                      config.organic_region_dev_tol_diag_frac * rdiag)
+        detail["dev_tol_mm"] = round(dev_tol, 4)
+        dev = detail.get("deviation_mm")
+        if dev is not None and dev > dev_tol:
+            progress(f"  organic region rejected: deviation {dev:.2f} mm > tol "
+                     f"{dev_tol:.2f} ({region.size} facets)")
+            details.append(detail)
+            continue
+        ops += 1
+        candidate, ok = _try_boolean_step(
+            solid,
+            lambda s, sf=surf, rg=region:
+                oreg.boolean_clean_region(s, sf, rg, Part),
+            max_bbox_growth=bbox_guard)
+        if not ok:
+            progress(f"  organic region reverted: boolean invalid/bbox "
+                     f"({region.size} facets)")
+            details.append(detail)
+            continue
+        rtaf_after = None
+        if rtaf_before is not None:
+            try:
+                rtaf_after = compute_rtaf(candidate, config).get("rtaf")
+            except Exception:  # noqa: BLE001
+                rtaf_after = None
+            if rtaf_after is not None and rtaf_after >= rtaf_before - 1e-4:
+                progress(f"  organic region reverted: RTAF {rtaf_before:.3f} -> "
+                         f"{rtaf_after:.3f} (no improvement)")
+                details.append(detail)
+                continue
+        solid = candidate
+        if rtaf_after is not None:
+            rtaf_before = rtaf_after
+        built += 1
+        detail["adopted"] = True
+        detail["rtaf_after"] = rtaf_after
+        details.append(detail)
+        progress(f"  organic region built ({region.size} facets, "
+                 f"{detail.get('poles')} B-spline poles, dev "
+                 f"{detail.get('deviation_mm')} mm, RTAF -> {rtaf_after})")
+    return solid, detected, built, details
+
+
 def build_reconstructed_solid(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -1245,6 +1364,9 @@ def build_reconstructed_solid(
     # ops and freeform ops both run post-close, guarded and RTAF-gated, so a
     # region claimed by both simply keeps whichever op improves it and reverts
     # the other; no explicit hand-off is needed in this tier.
+    # Snapshot the reliable analytic claim before the freeform/swept passes — the
+    # region-level organic pass keys off it (see the boolean tier for the rationale).
+    hard_claimed = set(claimed)
     freeform_sheets = []
     if config.fit_freeform_sheets:
         try:
@@ -1414,6 +1536,26 @@ def build_reconstructed_solid(
             solids = getattr(shape, "Solids", [])
             is_solid = bool(solids) and solids[0].isValid()
 
+    # Region-level Candidate A (see the boolean tier): rebuild the residual organic
+    # region(s) the analytic + freeform passes left faceted as smooth B-spline
+    # surfaces, integrated by the same guarded extrude+cut boolean. RTAF/bbox-gated,
+    # strict rollback. Runs on the closed reconstructed solid.
+    organic_regions_detected = 0
+    organic_regions_built = 0
+    organic_region_detail: list = []
+    if config.organic_region_patches and is_solid:
+        (shape, organic_regions_detected, organic_regions_built,
+         organic_region_detail) = _apply_organic_regions(
+            shape, vertices, faces, hard_claimed, config, Part, progress)
+        if organic_regions_built:
+            backup = shape.copy()
+            simplified = _safe_remove_splitter(shape, Part)
+            shape = simplified if _is_valid_solid(simplified) else backup
+            progress(f"  organic regions built {organic_regions_built}/"
+                     f"{organic_regions_detected}")
+            solids = getattr(shape, "Solids", [])
+            is_solid = bool(solids) and solids[0].isValid()
+
     # Export round-trip re-validation with back-off (P0-3): if the truing ops
     # produced a solid that re-reads invalid from an exported STEP, revert to the
     # pre-op sewn solid (if it round-trips clean). This is the sew-tier analogue
@@ -1421,7 +1563,8 @@ def build_reconstructed_solid(
     # isValid() in memory but writes an invalid STEP (self-intersecting wires from
     # a ball fuse) must not ship. Only runs when ops actually modified the solid.
     export_revalidated = None
-    ops_applied = bool(swept_built or sphere_ok or freeform_ok)
+    ops_applied = bool(swept_built or sphere_ok or freeform_ok
+                       or organic_regions_built)
     if (is_solid and ops_applied and pre_ops_shape is not None
             and config.revalidate_export):
         if not _reread_valid(shape, Part, progress):
@@ -1470,6 +1613,9 @@ def build_reconstructed_solid(
         "freeform_sheets_detected": len(freeform_sheets),
         "freeform_sheets_built": freeform_ok,
         "freeform_detail": [s.as_dict() for s in freeform_sheets],
+        "organic_regions_detected": organic_regions_detected,
+        "organic_regions_built": organic_regions_built,
+        "organic_region_detail": organic_region_detail,
         "skipped_facets": skipped,
         "is_solid": is_solid,
     }
@@ -2326,6 +2472,16 @@ def build_boolean_clean_solid(
     for s in spheres:
         claimed.update(s.face_indices)
 
+    # Snapshot the *reliable* analytic claim (cylinders, cones, threads, knurls,
+    # gears, fillets, domes) BEFORE the swept + freeform passes. Those two passes
+    # DETECT-but-often-REVERT on a strongly-curved cast surface (the residual RTAF
+    # chain is exactly what they couldn't build), so their detected facets stay
+    # faceted yet sit in ``claimed``. The region-level organic pass keys off this
+    # reduced set so it can still claim the residual swept/freeform left faceted;
+    # its RTAF gate then protects any swept/freeform work that DID build (a region
+    # that doesn't lower the residual reverts).
+    hard_claimed = set(claimed)
+
     # Freeform B-spline sheets (Candidate B): genuinely doubly-curved
     # height-field regions. Detected BEFORE swept walls (which would otherwise
     # mis-claim a doubly-curved shell's rows as constant-cross-section strips —
@@ -2563,10 +2719,31 @@ def build_boolean_clean_solid(
             solid = simplified if _is_valid_solid(simplified) else backup
             progress(f"  freeform sheets built {freeform_ok}/{freeform_ops}")
 
+    # Region-level Candidate A: rebuild the large residual organic region(s) the
+    # analytic + freeform passes left faceted (a cast top that wraps too much to be
+    # an injective height field) as Catmull-Clark patch shells, integrated by the
+    # same guarded extrude+cut boolean. Runs last, on the true residual; each region
+    # is RTAF/bbox-gated so a region that doesn't validly de-facet reverts.
+    organic_regions_detected = 0
+    organic_regions_built = 0
+    organic_region_detail: list = []
+    if config.organic_region_patches and _is_valid_solid(solid):
+        (solid, organic_regions_detected, organic_regions_built,
+         organic_region_detail) = _apply_organic_regions(
+            solid, vertices, faces, hard_claimed, config, Part, progress)
+        if organic_regions_built:
+            backup = solid.copy()
+            simplified = _safe_remove_splitter(solid, Part)
+            solid = simplified if _is_valid_solid(simplified) else backup
+            progress(f"  organic regions built {organic_regions_built}/"
+                     f"{organic_regions_detected}")
+
     total = (len(cylinders) + len(cones) + len(threads) + len(knurls)
-             + len(fillets) + len(spheres) + swept_ops + gear_ops + freeform_ops)
+             + len(fillets) + len(spheres) + swept_ops + gear_ops + freeform_ops
+             + organic_regions_detected)
     cleaned = (cyl_ok + cone_ok + thread_ok + knurl_ok + fillet_ok
-               + sphere_ok + swept_ok + gear_ok + freeform_ok)
+               + sphere_ok + swept_ok + gear_ok + freeform_ok
+               + organic_regions_built)
     progress(f"Boolean clean-up: {cleaned}/{total} features replaced with analytic geometry "
              f"({total - cleaned} left faceted)")
 
@@ -2618,6 +2795,9 @@ def build_boolean_clean_solid(
         "freeform_sheets_detected": len(freeform_sheets),
         "freeform_sheets_built": freeform_ok,
         "freeform_detail": [s.as_dict() for s in freeform_sheets],
+        "organic_regions_detected": organic_regions_detected,
+        "organic_regions_built": organic_regions_built,
+        "organic_region_detail": organic_region_detail,
         "boolean_cleaned": cleaned,
         "boolean_failed": total - cleaned,
         "artifact_free": artifact_free,
