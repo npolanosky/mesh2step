@@ -395,7 +395,10 @@ def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
     (walls stay faceted) rather than grinding for minutes — the repeated-arc
     guard already drops gear-tooth profiles, this catches any residual blow-up.
 
-    Returns ``(solid, ops_attempted, ops_succeeded)``.
+    Returns ``(solid, arc_ops_attempted, arc_ops_succeeded, walls_built)`` —
+    ``walls_built`` is the number of distinct swept-wall PROFILES that had at
+    least one arc lens op succeed, so it is commensurable with the detected wall
+    count (one wall can span several arc ops; the arc-success count is not).
     """
     try:
         bb0 = solid.BoundBox
@@ -438,7 +441,7 @@ def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
             todo.append((prof, seg))
     todo = todo[:max_ops]
     if not todo:
-        return solid, 0, 0
+        return solid, 0, 0, 0
 
     # Cost budget: distinct_arcs × base_faces. Skip the whole batch when it would
     # grind (a gear's hundreds of tooth arcs on a dense base). The repeated-arc
@@ -455,16 +458,19 @@ def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
             progress(f"  swept lens ops skipped: cost {len(todo)} arcs × "
                      f"{base_faces} faces = {cost:,} exceeds budget {budget:,} "
                      f"(walls left faceted)")
-            return solid, len(todo), 0
+            return solid, len(todo), 0, 0
 
     def run(start_solid, deep):
         s = start_solid
         n_ok = 0
+        walls_ok: set[int] = set()   # distinct profiles with >= 1 arc built
         for prof, seg in todo:
             s, ok = _try_boolean_step(
                 s, lambda cur, p=prof, g=seg: guarded(cur, p, g, deep))
             n_ok += ok
-        return s, n_ok
+            if ok:
+                walls_ok.add(id(prof))
+        return s, n_ok, walls_ok
 
     # Fast pass with cheap per-op guards, then ONE deep BOP self-intersection
     # check of the final result: OCC booleans occasionally produce a shape that
@@ -483,15 +489,18 @@ def _apply_swept_lens_ops(solid, profiles: list[SweptProfile], Part, progress,
         base_clean = True
     except Exception:  # noqa: BLE001
         base_clean = False
-    result, ok_count = run(solid, deep=False)
+    result, ok_count, walls_ok = run(solid, deep=False)
     if ok_count and base_clean:
         try:
             _check_no_self_intersection(result)
         except Exception:  # noqa: BLE001 - retry, filtering the offending op(s)
             progress("  swept result failed deep check; retrying with per-op checks")
-            result, ok_count = run(baseline, deep=True)
+            result, ok_count, walls_ok = run(baseline, deep=True)
     progress(f"  swept-wall arcs cleaned {ok_count}/{len(todo)}")
-    return result, len(todo), ok_count
+    # Return distinct WALLS built (not arc ops) as the success count, so the
+    # reported ``swept_walls_built`` is commensurable with ``swept_walls_detected``
+    # (a wall can span several arc lens ops; counting arcs made built > detected).
+    return result, len(todo), ok_count, len(walls_ok)
 
 
 def _check_no_self_intersection(shape) -> None:
@@ -945,6 +954,26 @@ def _freeform_sheet_surface(sheet, Part):
     return surf
 
 
+def _sheet_is_buildable(sheet, config, Part) -> bool:
+    """True if a freeform sheet's UNDIVIDED B-spline fit lands within tolerance on
+    the real facets — i.e. it will actually build (not merely claim). Used to gate
+    the swept-pool pre-emption: a well-covered but high-deviation sheet must not
+    steal swept facets it can't de-facet. Mirrors the build-time deviation gate in
+    ``_apply_freeform_sheets`` (dev <= dev_tol * 1.5). Cheap: one B-spline
+    approximate + a downsampled deviation, no boolean. Best-effort — any failure
+    is treated as NOT buildable (don't claim), the conservative choice."""
+    try:
+        surf = _freeform_sheet_surface(sheet, Part)
+        if surf is None:
+            return False
+        dev = _freeform_sheet_deviation(
+            surf, sheet.grid, covered=getattr(sheet, "covered", None),
+            sample_pts=getattr(sheet, "sample_pts", None))
+        return dev is not None and dev <= sheet.dev_tol * 1.5
+    except Exception:  # noqa: BLE001 - conservative: don't claim on any error
+        return False
+
+
 def _freeform_sheet_deviation(surf, grid, stride: int = 2, covered=None,
                               sample_pts=None) -> float:
     """Max distance from the region's real surface to the fitted B-spline sheet.
@@ -994,7 +1023,7 @@ def _freeform_sheet_deviation(surf, grid, stride: int = 2, covered=None,
     return worst
 
 
-def _boolean_clean_freeform(solid, sheet, surf, Part):
+def _boolean_clean_freeform(solid, sheet, surf, Part, config=None):
     """Replace a faceted doubly-curved region with the analytic B-spline sheet
     via a guarded boolean, following the M4 cut/fuse pattern.
 
@@ -1020,7 +1049,20 @@ def _boolean_clean_freeform(solid, sheet, surf, Part):
     tool = face.extrude(FreeCAD.Vector(*(axis * diag)))
     if not getattr(tool, "Solids", []):
         raise ValueError("freeform tool is not a solid")
-    result = solid.cut(tool)
+    # Reject a self-intersecting / collapsed extrude tool BEFORE the (expensive)
+    # cut. A sheet that curves too far under the extrude axis folds the prism onto
+    # itself; the resulting tool is invalid or near-degenerate and its boolean
+    # against a dense base grinds OCC for minutes (the usb_holder freeform P0
+    # hang). A quick validity + prism-volume sanity check (the prism volume should
+    # be ~ swept-face-area x diag; a self-intersecting collapse reads far smaller)
+    # catches it cheaply so ``_try_boolean_step`` reverts instead of hanging.
+    # Mirrors the identical guard in organic_region.boolean_clean_region.
+    if not tool.isValid():
+        raise ValueError("freeform tool self-intersects (invalid extrude)")
+    expected_vol = float(face.Area) * float(diag)
+    if expected_vol > 0 and tool.Volume < 0.25 * expected_vol:
+        raise ValueError("freeform tool collapsed (wrapping extrude)")
+    result = _maybe_isolated_cut(solid, tool, Part, config)   # timeout-guarded (P0)
     solids = getattr(result, "Solids", [])
     if len(solids) != 1 or not solids[0].isValid():
         raise ValueError("freeform cut did not yield one valid solid")
@@ -1150,7 +1192,8 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress,
         boolean_ops += 1
         attempted += 1
         candidate, ok = _try_boolean_step(
-            solid, lambda s, sh=sheet, sf=surf: _boolean_clean_freeform(s, sh, sf, Part),
+            solid,
+            lambda s, sh=sheet, sf=surf: _boolean_clean_freeform(s, sh, sf, Part, config),
             max_bbox_growth=bbox_guard)
         if not ok:
             continue
@@ -1230,6 +1273,14 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
     built = 0
     state = {"solid": solid, "rtaf": rtaf_before, "ops": 0}
 
+    import time as _time
+    pass_start = _time.monotonic()
+    pass_budget = config.organic_pass_time_budget
+
+    def _over_budget() -> bool:
+        return (pass_budget is not None
+                and _time.monotonic() - pass_start > pass_budget)
+
     def try_one(rg, label):
         """Build + dev-gate + boolean + RTAF-gate ONE region/chart against the
         current state. Returns ``(adopted, detail)``; mutates ``state`` on adopt.
@@ -1259,7 +1310,7 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
         state["ops"] += 1
         candidate, ok = _try_boolean_step(
             state["solid"],
-            lambda s, sf=surf, r=rg: oreg.boolean_clean_region(s, sf, r, Part),
+            lambda s, sf=surf, r=rg: oreg.boolean_clean_region(s, sf, r, Part, config),
             max_bbox_growth=bbox_guard)
         if not ok:
             detail["reason"] = "boolean invalid/bbox"
@@ -1294,6 +1345,10 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
     for region in regions:
         if state["ops"] >= config.organic_region_max_ops:
             break
+        if _over_budget():
+            progress(f"  organic regions: time budget {pass_budget:g}s exceeded; "
+                     "stopping (keeping current solid)")
+            break
         adopted, detail = try_one(region, "region")
         if adopted:
             built += 1
@@ -1324,6 +1379,10 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
         chart_detail: list[dict] = []
         for ci, chart in enumerate(charts):
             if state["ops"] >= config.organic_region_max_ops:
+                break
+            if _over_budget():
+                progress(f"  organic regions: time budget {pass_budget:g}s "
+                         "exceeded mid-charts; stopping")
                 break
             cadopted, cdetail = try_one(chart, f"chart {ci + 1}/{len(charts)}")
             cdetail["chart_index"] = ci
@@ -1549,9 +1608,10 @@ def build_reconstructed_solid(
     # lens op keys off, so doing spheres first can make the swept ops miss (seen
     # on the tweezer: 8 swept walls -> 0). Each op reverts on invalidity.
     swept_ops = 0
+    swept_arcs_ok = 0
     swept_built = 0
     if is_solid and swept_profiles:
-        shape, swept_ops, swept_built = _apply_swept_lens_ops(
+        shape, swept_ops, swept_arcs_ok, swept_built = _apply_swept_lens_ops(
             shape, swept_profiles, Part, progress, config=config)
         if swept_built:
             # Simplify a snapshot: the OCC call can corrupt its input in place.
@@ -2416,6 +2476,84 @@ def _bbox_collapsed(before, after) -> bool:
     return b0 > 1e-6 and a0 < _BBOX_COLLAPSE_FRAC * b0
 
 
+def isolated_cut(base, tool, Part, timeout: float):
+    """Run ``base.cut(tool)`` in a separate process under a hard ``timeout``.
+
+    An OCC boolean cut of a B-spline tool against a faceted base can grind for
+    minutes (uninterruptible ``PerformFF``); isolation is the only way to bound
+    it. Serialises both shapes to BREP, runs ``boolean_runner`` (FreeCAD-first so
+    ``import Part`` is safe), and reads the result back. Returns the result shape,
+    or raises ``TimeoutError`` on timeout / ``RuntimeError`` on child failure so
+    the caller's guard reverts. Best-effort: any serialisation error falls back to
+    an in-process cut (never worse than before)."""
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="m2s_bool_") as tmp:
+        bp = os.path.join(tmp, "base.brep")
+        tp = os.path.join(tmp, "tool.brep")
+        op = os.path.join(tmp, "out.brep")
+        try:
+            base.exportBrep(bp)
+            tool.exportBrep(tp)
+        except Exception:  # noqa: BLE001 - can't serialise -> in-process fallback
+            return base.cut(tool)
+        pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # The child imports FreeCAD + Part; it needs FreeCAD's lib dir on its path.
+        # The parent has it loaded already, so derive it from the live Part module
+        # (its .so lives in FreeCAD's lib dir) and inject it — the parent may have
+        # added it via sys.path (not PYTHONPATH), so the child can't inherit it.
+        fc_lib = None
+        try:
+            fc_lib = os.path.dirname(os.path.abspath(Part.__file__))
+        except Exception:  # noqa: BLE001
+            fc_lib = None
+        env = dict(os.environ)
+        parts = [p for p in (pkg_root, fc_lib, env.get("PYTHONPATH", "")) if p]
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "mesh2step.boolean_runner", bp, tp, op],
+                capture_output=True, text=True, timeout=float(timeout), env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"organic boolean cut exceeded {timeout:g}s (killed)") from exc
+        if proc.returncode != 0 or not os.path.exists(op):
+            raise RuntimeError(
+                f"organic boolean cut subprocess failed: "
+                f"{(proc.stderr or '').strip()[:300]}")
+        result = Part.Shape()
+        result.importBrep(op)
+    return result
+
+
+def _maybe_isolated_cut(base, tool, Part, config):
+    """``base.cut(tool)`` — isolated under a timeout only when it is worth it.
+
+    An organic-tier B-spline-tool cut can grind for minutes on a DENSE base
+    (uninterruptible OCC), so on a large base we run it in a subprocess under
+    ``organic_boolean_timeout`` (a breach raises and the caller reverts). On a
+    SMALL base the cut is always sub-second and isolating it would cost more (a
+    FreeCAD cold-import per op) than it could ever save, so we run it in-process.
+    The threshold is ``organic_boolean_isolate_min_base_faces``. When no timeout
+    is configured, always in-process (the old behaviour)."""
+    to = getattr(config, "organic_boolean_timeout", None) if config is not None else None
+    if to is None:
+        return base.cut(tool)
+    min_faces = getattr(config, "organic_boolean_isolate_min_base_faces", None)
+    if min_faces is not None:
+        try:
+            nb = len(base.Faces)
+        except Exception:  # noqa: BLE001
+            nb = 0
+        if nb < min_faces:
+            return base.cut(tool)          # small base -> always fast in-process
+    return isolated_cut(base, tool, Part, to)
+
+
 def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None):
     """Apply one boolean cleanup step; revert if it breaks solid validity.
 
@@ -2542,6 +2680,33 @@ def build_boolean_clean_solid(
     # the double-curvature gate keeps single-curvature walls out, so this never
     # steals a legitimate sweep). Facets claimed here are removed from the swept
     # pool. Integrated by a guarded boolean below.
+    # Detect swept profiles FIRST (on the analytic-unclaimed facets) so the
+    # freeform claim below can see which facets arc-bearing swept walls would
+    # de-facet. The profiles' facets are CLAIMED after the freeform decision (a
+    # sheet that legitimately pre-empts still removes them from the swept build).
+    swept_profiles: list[SweptProfile] = []
+    swept_arc_faces: set[int] = set()   # original indices under arc-bearing walls
+    swept_all_faces: set[int] = set()   # original indices under ANY swept wall
+    swept_keep_sw: list[int] = []       # compact->original map from detection
+    if config.detect_swept_walls:
+        swept_keep_sw = [i for i in range(len(faces)) if i not in claimed]
+        faces_sw = faces[swept_keep_sw]
+        try:
+            regions_sw = segment_planar(vertices, faces_sw, config)
+        except Exception:  # noqa: BLE001 - detection is best-effort
+            regions_sw = []
+        if regions_sw:
+            swept_profiles = _fit_swepts(vertices, faces_sw, regions_sw, config, progress)
+            for prof in swept_profiles:
+                orig = [swept_keep_sw[i] for i in prof.face_indices]
+                swept_all_faces.update(orig)
+                # A wall with >=1 arc segment will actually de-facet its facets;
+                # a 0-arc profile (a flat strip / a mis-fit on a bump) builds
+                # nothing, so it must NOT veto a freeform claim.
+                if any(seg.kind == "arc" and seg.outward is not None
+                       for seg in prof.segments):
+                    swept_arc_faces.update(orig)
+
     freeform_sheets = []
     if config.fit_freeform_sheets:
         try:
@@ -2559,10 +2724,35 @@ def build_boolean_clean_solid(
         # wins and the other reverts (task §1: never trade a working swept wall
         # for a doomed sheet). This is what stops an aggressive region split from
         # collapsing swept coverage (port_cover: 44 swept walls -> 0).
+        # Pre-emption (claiming a sheet's facets before swept detection) is OFF by
+        # default: on prismatic parts the double-curvature detector mis-fires on
+        # swept walls, and a claim that then fails to build starves the swept walls
+        # that would have de-faceted the region (insert_cable/countersink/bin
+        # regression). With pre-emption off, swept gets first crack on ALL facets
+        # and the sheets are still attempted afterwards (RTAF-gated), so a genuine
+        # doubly-curved region the sweep can't fit still builds while a false
+        # positive reverts. When ON, an extra buildability gate keeps a
+        # confident-but-undeliverable sheet from claiming (task).
         claim_thr = config.freeform_claim_max_missing
+        arc_frac_cap = config.freeform_claim_max_swept_arc_frac
         claimed_sheets = 0
-        for sh in freeform_sheets:
-            if sh.missing <= claim_thr:
+        if config.freeform_claim_swept_pool:
+            for sh in freeform_sheets:
+                if sh.missing > claim_thr:
+                    continue
+                if (config.freeform_claim_requires_buildable
+                        and not _sheet_is_buildable(sh, config, Part)):
+                    continue
+                # Swept-arc veto: don't claim a sheet whose facets arc-bearing
+                # swept walls already cover (they de-facet more reliably; claiming
+                # would starve their build — the P1 regressions). A genuine bump
+                # has ~0 arc coverage and still claims.
+                if arc_frac_cap is not None and swept_arc_faces:
+                    fi = sh.face_indices
+                    if fi:
+                        cov = sum(1 for i in fi if i in swept_arc_faces) / len(fi)
+                        if cov > arc_frac_cap:
+                            continue
                 claimed.update(sh.face_indices)
                 claimed_sheets += 1
         if freeform_sheets:
@@ -2570,23 +2760,12 @@ def build_boolean_clean_solid(
                      f"({sum(len(s.face_indices) for s in freeform_sheets)} facets; "
                      f"{claimed_sheets} confident, claimed from swept pool)")
 
-    # Swept/extruded curved walls (M4), after fillets in the detector ladder.
-    # Fitted on the facets no other detector claimed; each arc segment becomes a
-    # boolean lens op (cut/fuse) against the faceted base below.
-    swept_profiles: list[SweptProfile] = []
-    if config.detect_swept_walls:
-        keep_sw = [i for i in range(len(faces)) if i not in claimed]
-        faces_sw = faces[keep_sw]
-        try:
-            regions_sw = segment_planar(vertices, faces_sw, config)
-        except Exception:  # noqa: BLE001 - detection is best-effort
-            regions_sw = []
-        if regions_sw:
-            swept_profiles = _fit_swepts(vertices, faces_sw, regions_sw, config, progress)
-            # Claim the swept walls' facets (mapped back to original indices) so
-            # the blend pass below leaves swept-wall corners to the sweep.
-            for prof in swept_profiles:
-                claimed.update(keep_sw[i] for i in prof.face_indices)
+    # Claim the swept walls' facets (mapped back to original indices) so the blend
+    # pass below leaves swept-wall corners to the sweep. (Swept profiles were
+    # detected above, before the freeform claim, so the claim could see arc
+    # coverage; a sheet that legitimately pre-empted has already claimed its facets,
+    # and re-adding these is idempotent.)
+    claimed.update(swept_all_faces)
 
     # Spheres — BLEND pass (M3): compact corner blends / end-cap domes on the
     # facets no cylinder/cone/fillet/dome/sweep claimed.
@@ -2728,8 +2907,12 @@ def build_boolean_clean_solid(
 
     pre_swept = solid.copy()
     pre_rogue = set(_rogue_radii(solid, detected_r))
-    solid, swept_ops, swept_ok = _apply_swept_lens_ops(
+    solid, swept_ops, swept_arcs_ok, swept_walls_ok = _apply_swept_lens_ops(
         solid, swept_profiles, Part, progress, config=config)
+    # ``swept_arcs_ok`` counts arc lens ops (for the features-cleaned tally, which
+    # is arc-op granular); ``swept_walls_ok`` counts distinct walls (for the
+    # reported ``swept_walls_built``, commensurable with ``swept_walls_detected``).
+    swept_ok = swept_arcs_ok
 
     # removeSplitter is an optimization; on shells dense with fresh boolean
     # seams it can occasionally produce an invalid solid — AND the underlying
@@ -2743,6 +2926,7 @@ def build_boolean_clean_solid(
     if swept_ok and set(_rogue_radii(solid, detected_r)) - pre_rogue:
         progress("  swept ops introduced artifact radii; rolling back swept ops")
         swept_ok = 0
+        swept_walls_ok = 0
         backup = pre_swept.copy()
         simplified = _safe_remove_splitter(pre_swept, Part)
         solid = simplified if _is_valid_solid(simplified) else backup
@@ -2835,8 +3019,9 @@ def build_boolean_clean_solid(
         "cones": [c.as_dict() for c in cones],
         "fillets": [f.as_dict() for f in fillets],
         "swept_walls_detected": len(swept_profiles),
-        "swept_walls_built": swept_ok,
+        "swept_walls_built": swept_walls_ok,
         "swept_arc_ops": swept_ops,
+        "swept_arcs_built": swept_ok,
         "gears_detected": len(gear_profiles),
         "gears_built": gear_ok,
         "gears": [{"segments": len(p.segments), "arcs": p.n_arcs,

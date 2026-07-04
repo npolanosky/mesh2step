@@ -1038,6 +1038,21 @@ def segment_organic_regions(
         fold = float(ar[dots < -0.05].sum()) / tot if tot > 0 else 1.0
         if fold > config.organic_region_max_foldover:
             continue
+        # Flatness gate: reject a near-flat panel (a big planar face the sew/planar
+        # path owns, not an organic patch). Extruding its huge flat B-spline into a
+        # boolean tool grinds OCC for minutes (fan_panel P0 hang). Measure the
+        # region's peak-to-peak height about its mean plane vs its in-plane diagonal.
+        curve_frac = config.organic_region_min_curve_frac
+        if curve_frac is not None:
+            cent = vertices[faces[fa]].mean(axis=1)          # facet centroids
+            rel = cent - cent.mean(axis=0)
+            h = rel @ axis                                    # signed height off plane
+            ptp = float(h.max() - h.min()) if len(h) else 0.0
+            e1, e2 = _axis_basis(axis)
+            u, w = rel @ e1, rel @ e2
+            span = float(np.hypot(u.max() - u.min(), w.max() - w.min())) or 1.0
+            if ptp < curve_frac * span:
+                continue
         out.append(OrganicRegion(
             face_indices=sorted(int(i) for i in comp),
             axis=axis, area=tot, foldover=fold))

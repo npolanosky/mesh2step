@@ -16,10 +16,75 @@ shell (never regress).
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import subprocess
 import sys
+import tempfile
 
 import numpy as np
+
+
+class RemeshTimeout(RuntimeError):
+    """Raised when the isolated quad-remesh subprocess is killed by its timeout or
+    memory ceiling (a hang / runaway). Callers treat it like any remesh failure
+    and decline the organic pass (never regress)."""
+
+
+def _isolated_remesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_quads: int,
+    *,
+    deterministic: bool,
+    smooth_iter: int,
+    timeout: float,
+    max_memory_mb: int | None,
+):
+    """Run the native remesh in a separate process with a hard wall-clock timeout
+    and an address-space memory ceiling (see quadremesh_runner). Returns
+    ``(qv, quads)``; raises :class:`RemeshTimeout` on timeout / OS kill and
+    ``RuntimeError`` on any other subprocess failure. A wall-clock check in Python
+    cannot interrupt a C-extension call, so isolation is the only robust guard
+    against the remesher hanging or running memory away on an adversarial mesh."""
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([p for p in (pkg_root, existing) if p])
+    with tempfile.TemporaryDirectory(prefix="m2s_remesh_") as tmp:
+        in_path = os.path.join(tmp, "in.npz")
+        out_path = os.path.join(tmp, "out.npz")
+        params_path = os.path.join(tmp, "params.json")
+        np.savez(in_path,
+                 vertices=np.asarray(vertices, dtype=np.float64),
+                 faces=np.asarray(faces, dtype=np.int64))
+        with open(params_path, "w", encoding="utf-8") as fh:
+            json.dump({"target_quads": int(target_quads),
+                       "deterministic": bool(deterministic),
+                       "smooth_iter": int(smooth_iter),
+                       "max_memory_mb": max_memory_mb}, fh)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "mesh2step.quadremesh_runner",
+                 in_path, out_path, params_path],
+                capture_output=True, text=True, timeout=float(timeout), env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RemeshTimeout(
+                f"quad remesh exceeded {timeout:g}s (killed)") from exc
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            # A memory-ceiling / native abort typically kills the child with a
+            # signal (negative returncode) — surface it as a timeout-class failure
+            # so the caller declines rather than treating it as a benign miss.
+            err = (proc.stderr or "").strip()[:500]
+            if proc.returncode < 0:
+                raise RemeshTimeout(
+                    f"quad remesh killed (signal {-proc.returncode}); {err}")
+            raise RuntimeError(f"quad remesh subprocess failed: {err}")
+        with np.load(out_path) as data:
+            qv = np.asarray(data["qv"], dtype=np.float64)
+            quads = np.asarray(data["quads"], dtype=np.int64)
+    return qv, quads
 
 
 @contextlib.contextmanager
@@ -71,6 +136,7 @@ def quad_remesh(
     *,
     deterministic: bool = True,
     smooth_iter: int = 2,
+    config=None,
 ):
     """Remesh a triangle mesh into an all-quad cage of ~``target_quads`` faces.
 
@@ -79,7 +145,22 @@ def quad_remesh(
     the actual face count can differ from ``target_quads`` (it subdivides a mesh
     that is too coarse for the requested edge length). ``posy=4`` forces pure-quad
     extraction. ``deterministic`` makes the field optimisation reproducible so
-    byte-stability holds across runs. Raises if the dependency is unavailable."""
+    byte-stability holds across runs. Raises if the dependency is unavailable.
+
+    When ``config.organic_remesh_timeout`` is set, the native call runs in a
+    separate process with that wall-clock timeout and an RLIMIT_AS memory ceiling
+    (``config.organic_remesh_max_memory_mb``): the remesher can hang or run memory
+    away on some meshes, and a C-extension call can't be interrupted in-process,
+    so isolation is the only robust guard. On timeout / OS kill this raises
+    :class:`RemeshTimeout`; the caller declines the organic pass (never regress)."""
+    timeout = getattr(config, "organic_remesh_timeout", None) if config is not None else None
+    if timeout is not None:
+        max_mb = getattr(config, "organic_remesh_max_memory_mb", None)
+        return _isolated_remesh(
+            vertices, faces, target_quads,
+            deterministic=deterministic, smooth_iter=smooth_iter,
+            timeout=float(timeout), max_memory_mb=max_mb)
+
     import pynanoinstantmeshes as pnim
 
     v = np.ascontiguousarray(vertices, dtype=np.float32)
@@ -253,7 +334,7 @@ def repair_quad_cage(qv: np.ndarray, quads: np.ndarray, *, max_hole: int = 64):
     return qv, quads
 
 
-def build_quad_cage(vertices, faces, target_quads, on_progress=None):
+def build_quad_cage(vertices, faces, target_quads, on_progress=None, config=None):
     """Remesh + repair + target back-off -> a closed-manifold-all-quad cage.
 
     The remesher (pynanoinstantmeshes) is more robust at coarser targets: a fine
@@ -276,7 +357,14 @@ def build_quad_cage(vertices, faces, target_quads, on_progress=None):
     repaired_fallback = None   # (qv, quads, detail) — used only if no clean cage
     for t in ladder:
         try:
-            qv, quads = quad_remesh(vertices, faces, t)
+            qv, quads = quad_remesh(vertices, faces, t, config=config)
+        except RemeshTimeout as exc:
+            # A hang / memory runaway is not going to behave better at another
+            # target — abort the whole ladder so the pass declines promptly
+            # rather than re-hanging on each rung and blowing the time budget.
+            progress(f"Organic: quad remesh timed out ({exc}); declining")
+            return None, None, {"reason": f"remesh timeout: {exc}", "target": t,
+                                "ok": False, "timed_out": True}
         except Exception as exc:  # noqa: BLE001
             last_detail = {"reason": f"remesh failed: {exc}", "target": t}
             continue

@@ -177,3 +177,16 @@ def test_new_freeform_and_sphere_config_defaults():
     assert cfg.freeform_claim_max_missing == 0.30
     assert cfg.freeform_max_split_depth == 2
     assert cfg.sphere_rtaf_gate is True
+    # P0/P1 hardening defaults (regression net): freeform pre-emption of the swept
+    # pool is ON but gated by buildability + a swept-arc veto; the organic passes
+    # are budgeted; the region flatness gate is on.
+    assert cfg.freeform_claim_swept_pool is True
+    assert cfg.freeform_claim_requires_buildable is True
+    assert cfg.freeform_claim_max_swept_arc_frac == 0.15
+    assert cfg.organic_pass_time_budget == 120.0
+    assert cfg.organic_remesh_timeout == 45.0
+    assert cfg.organic_boolean_timeout == 90.0
+    assert cfg.organic_boolean_isolate_min_base_faces == 3000
+    assert cfg.organic_multipatch_max_swept_walls == 6
+    assert cfg.organic_multipatch_max_subdiv_quads == 2500
+    assert cfg.organic_region_min_curve_frac == 0.03

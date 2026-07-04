@@ -218,8 +218,8 @@ def _fit_region_limit(vertices, faces, region, config: ConversionConfig):
     base = int(config.organic_region_target_quads)
     target = int(min(base * 3, max(base, len(region.face_indices) // 6)))
     try:
-        qv, quads = quad_remesh(sub_v, sub_f, target)
-    except Exception as exc:  # noqa: BLE001
+        qv, quads = quad_remesh(sub_v, sub_f, target, config=config)
+    except Exception as exc:  # noqa: BLE001 - incl. RemeshTimeout (hang/runaway)
         detail["reason"] = f"remesh failed: {exc}"
         return None, None, detail
     if quads.ndim != 2 or quads.shape[1] != 4 or len(quads) < 8:
@@ -383,7 +383,7 @@ def _surface_deviation(surf, region_verts, n_cap: int = 3000) -> float:
     return worst
 
 
-def boolean_clean_region(solid, surf, region, Part):
+def boolean_clean_region(solid, surf, region, Part, config=None):
     """Replace a region's faceted facets with its B-spline surface via a guarded CUT.
 
     Mirrors ``builder._boolean_clean_freeform``: extrude the (oversized) surface
@@ -417,7 +417,12 @@ def boolean_clean_region(solid, surf, region, Part):
     if expected_vol > 0 and tool.Volume < 0.25 * expected_vol:
         raise ValueError("region tool collapsed (wrapping extrude)")
     n_before = sum(1 for f in solid.Faces if "BSpline" in f.Surface.TypeId)
-    result = solid.cut(tool)
+    # Timeout-guarded cut (P0): a valid B-spline tool can still send OCC's face-face
+    # intersection into a multi-minute uninterruptible grind, so on a dense base run
+    # it in a child process under a wall-clock ceiling (a timeout raises and the
+    # caller's guard reverts, region stays faceted). See builder._maybe_isolated_cut.
+    from .builder import _maybe_isolated_cut
+    result = _maybe_isolated_cut(solid, tool, Part, config)
     solids = getattr(result, "Solids", [])
     if len(solids) != 1 or not solids[0].isValid():
         raise ValueError("region cut did not yield one valid solid")

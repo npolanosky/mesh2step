@@ -158,6 +158,11 @@ def test_routing_gate_respects_flag_and_residual():
     # Low residual -> not organic, don't attempt (even if remesher present).
     cfg = ConversionConfig(organic_multipatch_min_residual=0.6)
     assert organic.should_attempt({"rtaf": 0.2}, faces, cfg) is False
+    # Prismatic-signal veto: high RTAF but many swept walls -> vetoed (the
+    # gridfinity_bin_1x1x3 P0; its sew merely failed to close, it isn't organic).
+    cfg_v = ConversionConfig(organic_multipatch_max_swept_walls=6)
+    assert organic.should_attempt(
+        {"rtaf": 0.9, "swept_walls_detected": 11}, faces, cfg_v) is False
 
 
 def test_quad_cage_validation_rejects_open_and_nonquad():

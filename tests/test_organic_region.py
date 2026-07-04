@@ -140,6 +140,36 @@ def test_flat_plate_has_no_organic_region():
     assert regions == []
 
 
+def test_nearly_flat_warped_panel_is_rejected_by_curvature_gate():
+    """A large panel that gently warps (tiny height off its mean plane over a big
+    span) has smooth-step seeds but is NOT organic — extruding its huge flat
+    B-spline into a boolean tool grinds OCC (the fan_panel P0 hang). The
+    ``organic_region_min_curve_frac`` gate rejects it; a genuinely curved cap of
+    the same span survives."""
+    # A very shallow, large-radius cap: a real spherical surface (so its rows form
+    # smooth-curve seeds and it IS grabbed with the gate off), but with a tiny
+    # theta sweep so its height off the mean plane is a small fraction of its span
+    # (curve_frac below the 0.03 gate). This is the fan_panel signature: a big
+    # gently-warped panel, not a genuine organic cap.
+    v, f = _dome_cap(n_theta=26, n_phi=44, R=400.0, max_theta_frac=0.05)
+    off = ConversionConfig(organic_region_min_curve_frac=None)
+    grabbed = segment_organic_regions(v, f, set(), off)
+    if not grabbed:
+        pytest.skip("synthetic shallow cap did not seed a region on this build")
+    from mesh2step.segmentation import _axis_basis
+    reg = grabbed[0]
+    fa = np.array(reg.face_indices)
+    cent = v[f[fa]].mean(axis=1)
+    rel = cent - cent.mean(axis=0)
+    ax = np.array(reg.axis)
+    e1, e2 = _axis_basis(ax)
+    span = float(np.hypot((rel @ e1).ptp(), (rel @ e2).ptp())) or 1.0
+    assert ((rel @ ax).ptp() / span) < 0.03, "cap should be below the flatness gate"
+    # With the gate ON (default), the near-flat cap is rejected.
+    gated = segment_organic_regions(v, f, set(), ConversionConfig())
+    assert gated == [], "a near-flat warped panel must not be an organic region"
+
+
 def test_bump_region_is_injective_and_detected():
     """The Gaussian bump is one injective organic region (foldover ~0)."""
     v, f = _bump_region()

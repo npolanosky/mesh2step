@@ -708,6 +708,38 @@ class ConversionConfig:
     # the swept detector (port_cover regression: 44 swept walls -> 0).
     freeform_claim_max_missing: float = 0.30
 
+    # Let a confident freeform sheet PRE-EMPT the swept-wall pool (claim its facets
+    # so the swept detector doesn't fragment a genuine doubly-curved bump into
+    # empty 0-arc "swept walls" that claim-and-build-nothing, starving the sheet).
+    # Necessary for a true freeform bump (freeform_bump: without the claim, swept
+    # grabs the 1237-facet dome as 6 arc-less walls and the B-spline never builds).
+    # BUT a naive claim regresses prismatic parts whose "freeform" regions are
+    # really swept walls the double-curvature detector mis-fired on (insert_cable
+    # 0.20 -> 0.40). The two are separated by two gates below:
+    # ``freeform_claim_requires_buildable`` (the sheet's own fit must land) AND
+    # ``freeform_claim_max_swept_arc_frac`` (the sheet must NOT overlap arc-bearing
+    # swept walls that would de-facet it better). With both, a bump claims (no
+    # competing arcs) while a mis-detected prismatic panel does not (swept builds
+    # its arcs). False disables pre-emption entirely (swept-first, sheets attempted
+    # after, RTAF-arbitrated).
+    freeform_claim_swept_pool: bool = True
+
+    # Only claim a sheet that will ACTUALLY BUILD — its undivided B-spline fit
+    # lands within tolerance on the real facets. Coverage confidence (``missing``)
+    # alone is not enough (a well-covered region can still fit a B-spline that
+    # misses the mesh), so this pre-fits each candidate and rejects a claim whose
+    # deviation exceeds tol. Requires OCC (Part) at claim time.
+    freeform_claim_requires_buildable: bool = True
+
+    # Do NOT let a sheet pre-empt the swept pool when arc-bearing swept walls
+    # already cover more than this fraction of its facets — those walls de-facet
+    # the region more reliably than a single B-spline sheet, and letting the sheet
+    # claim them starves the swept build (the insert_cable / countersink / bin_2x1x2
+    # P1 regressions: a buildable sheet mis-detected on prismatic swept walls). A
+    # genuine freeform bump has ~0 swept-arc coverage (its curvature yields no
+    # constant-cross-section arcs) and so still claims. None disables this veto.
+    freeform_claim_max_swept_arc_frac: float = 0.15
+
     # Cost ceiling: the guarded boolean of a doubly-curved sheet against the
     # faceted base is O(base_faces) and can be slow. Skip freeform integration
     # when the base exceeds this many faces (leave the region faceted) rather
@@ -747,6 +779,18 @@ class ConversionConfig:
     # it; whole-body quad remeshing would destroy their clean analytic faces.
     organic_multipatch_min_residual: float = 0.6
 
+    # Prismatic-signal veto (P0 gate right-sizing). RTAF alone mis-routes a
+    # prismatic part whose reconstruction merely failed to SEW into a closed solid:
+    # an open shell reads a high RTAF (its faceted chains), so gridfinity_bin_1x1x3
+    # (a boxy bin) crossed the residual gate and entered whole-body quad remeshing
+    # — where the native remesher ran memory away. But a genuinely-organic body (a
+    # sculpted cat) has essentially NO constant-cross-section swept walls, whereas
+    # bin_1x1x3 detected 11 (plus spheres). So a reconstruction that found at least
+    # this many swept walls is prismatic-with-features and is NOT routed to the
+    # whole-body organic tier regardless of RTAF (the region-level pass still runs
+    # in the boolean tier and is separately budgeted). None disables the veto.
+    organic_multipatch_max_swept_walls: int | None = 6
+
     # Target quad count for the control cage (before Catmull-Clark subdivision).
     # Coarser = fewer patches + fewer extraordinary vertices (cleaner sew) but
     # higher deviation; the remesher treats this as an edge-length target, so the
@@ -774,6 +818,80 @@ class ConversionConfig:
     # remesh + per-patch OCC build gets slow on huge scans; decimation upstream
     # usually keeps it well under). None disables the guard.
     organic_multipatch_max_faces: int | None = 200000
+
+    # --- Organic-pass safety budgets (P0 net) ---------------------------------
+    # The organic tiers (whole-body multi-patch AND region-level / multi-chart)
+    # call the native quad remesher and run subdivision + limit-fit + boolean
+    # ladders. On adversarial inputs those can hang, explode memory, or grind for
+    # tens of minutes for zero correctness gain (the pass always falls back to the
+    # already-good pre-pass solid). These budgets are the safety net: a pass that
+    # exceeds them bails and KEEPS the existing solid (never regress, never hang).
+    #
+    # Wall-clock ceiling for ONE organic pass (whole-body build, or the whole
+    # region/multi-chart loop). Checked between attempts/regions; a pass that has
+    # already spent this long stops issuing new work and returns what it has. The
+    # native remesh itself is additionally hard-bounded by its own subprocess
+    # timeout (organic_remesh_timeout) since a wall-clock check can't interrupt a
+    # C-extension call. None disables the ceiling.
+    organic_pass_time_budget: float | None = 120.0
+
+    # Hard wall-clock timeout (seconds) for a SINGLE native quad-remesh call. The
+    # remesher (pynanoinstantmeshes) can hang or run away on memory for some
+    # meshes (gridfinity_bin_1x1x3: a 894-facet prepared mesh drove it into a
+    # multi-GB runaway). The call runs in a separate subprocess (quadremesh_runner)
+    # with this timeout and a memory ceiling; on breach it is killed and the caller
+    # treats the remesh as failed (declines the pass). None disables isolation
+    # (runs the remesh in-process, unguarded — the old behaviour).
+    organic_remesh_timeout: float | None = 45.0
+
+    # Memory ceiling (MB) for the isolated quad-remesh subprocess (RLIMIT_AS). A
+    # remesh that tries to allocate past this is killed by the OS instead of
+    # exhausting the machine (the bin_1x1x3 runaway climbed past 20 GB). Generous
+    # for a legitimate coarse cage (which needs well under a GB) while catching a
+    # blow-up. None leaves the subprocess uncapped.
+    organic_remesh_max_memory_mb: int | None = 4096
+
+    # Hard wall-clock timeout (seconds) for a single organic-tier boolean CUT
+    # (freeform-sheet integration and organic-region integration). A B-spline tool
+    # cut against a faceted base can send OCC's face-face intersection into a
+    # pathological multi-minute grind even on a valid, small tool (the usb_holder
+    # freeform P0 hang) — and the call is uninterruptible in-process, so a caller
+    # wall-clock budget can't stop it. When set, these cuts run in a separate
+    # process (boolean_runner) under this timeout; on breach the op is treated as
+    # failed and reverted (the region/sheet stays faceted — never regress, never
+    # hang). The trade-off: a fresh child must import FreeCAD before the cut, which
+    # costs tens of seconds PER op, so this is only worth paying when the cut is
+    # known-risky (see ``organic_boolean_isolate_min_base_faces`` — the cut is
+    # isolated only on a base large enough for the pathological grind, and run
+    # in-process on small bases where it is always fast). None disables isolation
+    # entirely (all cuts in-process, unguarded — the old, hang-prone behaviour).
+    organic_boolean_timeout: float | None = 90.0
+
+    # Only pay the subprocess-isolation cost for an organic-tier boolean CUT when
+    # the base solid has at least this many faces — the pathological multi-minute
+    # grind is a dense-base phenomenon (usb_holder's freeform cut ground on its
+    # boolean base), while a cut against a small base is always sub-second and is
+    # far cheaper to run in-process than to isolate (isolation adds a FreeCAD
+    # cold-import per op). Below this the cut runs in-process (fast, unisolated);
+    # at or above it the cut is isolated under ``organic_boolean_timeout``. None
+    # isolates every cut (when a timeout is set) regardless of base size.
+    organic_boolean_isolate_min_base_faces: int | None = 3000
+
+    # Cap the whole-body organic subdivision escalation by the resulting quad
+    # count: each Catmull-Clark step is 4x the faces, and the escalation ladder
+    # (subdiv .. subdiv+3) can reach thousands of quads on a cage that never
+    # closes, paying a large per-level shell build (one Stam B-spline patch + EV
+    # cap per quad) AND a per-face tessellation for the deviation/RTAF checks —
+    # both uninterruptible OCC calls that a wall-clock budget can't stop mid-call
+    # (animal_figurine hung in BRepMesh tessellating a 3952-quad shell). A
+    # subdivision level whose quad count would exceed this is not attempted (the
+    # escalation stops early; if no level is small enough the pass declines and
+    # keeps the existing solid). 2500 admits the corpus's real organic cages (dog
+    # ~250, cat ~1000 at the level they close) while stopping the pathological
+    # escalation before it grinds. The whole-body tier has never ADOPTED on the
+    # corpus (it always declines after a strict RTAF/bbox gate), so a tight cap
+    # costs no real reconstruction. None disables the cap.
+    organic_multipatch_max_subdiv_quads: int | None = 2500
 
     # --- Region-level Candidate A (organic patch regions). See
     # docs/ORGANIC_CONVERSION_RESEARCH.md (Candidate A, region-level). The
@@ -804,6 +922,19 @@ class ConversionConfig:
     # (negligible RTAF, and a tiny cage remeshes poorly).
     organic_region_min_facets: int = 300
     organic_region_min_area: float = 200.0
+
+    # Reject a near-FLAT region: an organic patch shell is only worth building (and
+    # only produces a well-behaved boolean tool) when the region genuinely curves.
+    # A large flat/gently-warped panel (the fan_panel residual: a 269 mm-diagonal
+    # face that reads foldover 0 and fits a 2 mm-deviation B-spline) is NOT organic
+    # — it is a planar face the sew/planar path owns, and extruding its huge flat
+    # B-spline into a boolean tool grinds OCC for minutes (the fan_panel P0 hang).
+    # Require the region's peak-to-peak height about its mean plane to be at least
+    # this fraction of its in-plane diagonal; below it the region is flat and is NOT
+    # routed to the organic patch pass (stays faceted/planar). None disables the
+    # gate. Calibrated: a genuine cast top (port_cover, tweezer shell) curves well
+    # past 3% of its span; a flat panel is ~0.
+    organic_region_min_curve_frac: float | None = 0.03
 
     # Reject a region whose foldover (facet-area fraction facing away from its mean
     # normal) exceeds this. A region must project INJECTIVELY along its mean normal

@@ -166,6 +166,17 @@ def should_attempt(reconstructed_stats: dict, faces, config: ConversionConfig) -
     cap = config.organic_multipatch_max_faces
     if cap is not None and len(faces) > cap:
         return False
+    # Prismatic-signal veto: a genuinely organic body has essentially no
+    # constant-cross-section swept walls; a boxy part whose reconstruction merely
+    # failed to sew (open shell -> high RTAF) still detects many. Don't route such
+    # a part to whole-body quad remeshing (bin_1x1x3: 11 swept walls -> native
+    # remesher memory runaway). The region-level pass still runs in the boolean
+    # tier (separately budgeted) for any true residual organic region.
+    swept_cap = config.organic_multipatch_max_swept_walls
+    if swept_cap is not None:
+        swept_detected = reconstructed_stats.get("swept_walls_detected", 0) or 0
+        if swept_detected >= swept_cap:
+            return False
     rtaf = reconstructed_stats.get("rtaf")
     if not isinstance(rtaf, (int, float)):
         # RTAF wasn't computed (e.g. huge shell); fall back on the skipped-facet
@@ -197,10 +208,18 @@ def build_organic_shell(vertices, faces, config: ConversionConfig, on_progress=N
     # non-manifold quads at a given target; build_quad_cage repairs them and, if
     # needed, backs off to a coarser (more robust) target until the cage validates
     # closed-manifold-all-quad. On failure it returns None and we decline.
+    import time as _time
+    pass_start = _time.monotonic()
+    pass_budget = config.organic_pass_time_budget
+
+    def _over_budget() -> bool:
+        return (pass_budget is not None
+                and _time.monotonic() - pass_start > pass_budget)
+
     target = int(config.organic_multipatch_target_quads)
     progress(f"Organic: quad-remeshing to ~{target} quads")
     qv, quads, cage_detail = build_quad_cage(
-        vertices, faces, target, on_progress=on_progress)
+        vertices, faces, target, on_progress=on_progress, config=config)
     stats["organic_cage"] = cage_detail
     ok = cage_detail.get("ok", False)
     progress(f"Organic: cage {cage_detail.get('quads')} quads, "
@@ -228,12 +247,24 @@ def build_organic_shell(vertices, faces, config: ConversionConfig, on_progress=N
     # self-intersects at a sharp feature (and is rejected) usually behaves one level
     # finer. Start at the configured level and escalate up to a small ceiling.
     base_subdiv = max(1, int(config.organic_multipatch_subdiv))
+    subdiv_quad_cap = config.organic_multipatch_max_subdiv_quads
     shape = None
     watertight = False
     for nsub in range(base_subdiv, base_subdiv + 3):
+        if _over_budget():
+            progress(f"Organic: time budget {pass_budget:g}s exceeded; "
+                     "stopping subdivision escalation")
+            break
         sv, sq = qv, quads
         for _ in range(nsub):
             sv, sq = catmull_clark_subdivide(sv, sq)
+        # Memory-aware cap: each level is 4x the quads, and a cage that never
+        # closes can escalate to thousands of quads paying a large per-level shell
+        # build for nothing. Stop before a level that would exceed the cap.
+        if subdiv_quad_cap is not None and len(sq) > subdiv_quad_cap:
+            progress(f"Organic: subdiv {nsub}x would be {len(sq)} quads > cap "
+                     f"{subdiv_quad_cap}; stopping escalation")
+            break
         progress(f"Organic: cage subdivided {nsub}x to {len(sq)} quads")
         shape, watertight, sub_stats = _build_shell_from_cage(sv, sq, diag, Part, progress)
         stats.update(sub_stats)

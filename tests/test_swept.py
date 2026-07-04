@@ -109,6 +109,10 @@ def test_swept_reconstruction_produces_analytic_walls_and_zero_rtaf():
     assert stats["is_solid"] is True
     assert stats["swept_walls_detected"] == 2
     assert stats["swept_walls_built"] == 2
+    # Invariant: built is a WALL count (distinct profiles with >=1 arc op), so it
+    # can never exceed the detected wall count. (It used to be the arc-op success
+    # count, which made built > detected — dualsense 17 > 10.)
+    assert stats["swept_walls_built"] <= stats["swept_walls_detected"]
 
     cyl_radii = sorted(
         f.Surface.Radius for f in shape.Faces
