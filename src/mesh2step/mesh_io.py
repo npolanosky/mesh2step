@@ -156,6 +156,74 @@ def split_components(
     return comps
 
 
+def bodies_share_coincident_vertices(
+    components: list[tuple[np.ndarray, np.ndarray]], tol: float = 1e-3
+) -> bool:
+    """True if two bodies have near-coincident vertices (a shared/touching seam).
+
+    The conservative signal that several disjoint components are really ONE part
+    exported as multiple shells: they meet along a shared boundary, so some of
+    their vertices coincide (to within ``tol`` mm). This is what distinguishes a
+    lid-modelled-through-its-base (shells that touch — combine) from a
+    print-in-place hinge whose pin sits *inside* the knuckle with a clearance gap
+    (interpenetrating bounding boxes but NO coincident vertices — keep separate).
+
+    Bbox overlap alone would mis-classify the hinge (its boxes interpenetrate); a
+    coincident-vertex test does not, so "auto" stays conservative and never fuses
+    a functional assembly that was meant to move.
+
+    Vertices are quantised onto a ``tol`` grid; if any grid cell is hit by two
+    different bodies, they touch. O(total vertices).
+    """
+    if len(components) < 2:
+        return False
+    scale = 1.0 / max(tol, 1e-12)
+    seen: dict[tuple, int] = {}
+    for body_i, (verts, _faces) in enumerate(components):
+        if len(verts) == 0:
+            continue
+        keys = np.round(verts * scale).astype(np.int64)
+        for key in map(tuple, np.unique(keys, axis=0)):
+            owner = seen.get(key)
+            if owner is not None and owner != body_i:
+                return True
+            seen[key] = body_i
+    return False
+
+
+def bodies_bbox_overlap(
+    components: list[tuple[np.ndarray, np.ndarray]], rel_touch: float = 1e-3
+) -> bool:
+    """True if ANY two bodies' axis-aligned bounding boxes overlap or touch.
+
+    A coarse spatial-proximity test used together with
+    :func:`bodies_share_coincident_vertices` by the "auto" heuristic. Overlapping
+    boxes are necessary-but-not-sufficient for "one part" (a print-in-place hinge
+    overlaps too), so the coincident-vertex test is the deciding signal; this one
+    is kept as a cheap pre-filter and for callers that want the looser notion.
+
+    ``rel_touch`` widens each box by this fraction of the overall scene diagonal
+    before the overlap test, so boxes that merely *abut* count as touching.
+    """
+    boxes = []
+    for verts, _faces in components:
+        if len(verts) == 0:
+            continue
+        boxes.append((verts.min(axis=0), verts.max(axis=0)))
+    if len(boxes) < 2:
+        return False
+    lo = np.min([b[0] for b in boxes], axis=0)
+    hi = np.max([b[1] for b in boxes], axis=0)
+    pad = float(np.linalg.norm(hi - lo)) * rel_touch
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            (imin, imax), (jmin, jmax) = boxes[i], boxes[j]
+            # Overlap on every axis (with the touch pad) => boxes intersect/abut.
+            if np.all(imin - pad <= jmax) and np.all(jmin - pad <= imax):
+                return True
+    return False
+
+
 def write_binary_stl(vertices: np.ndarray, faces: np.ndarray, path: str | Path) -> None:
     """Write a welded ``(vertices, faces)`` mesh to a binary STL file.
 

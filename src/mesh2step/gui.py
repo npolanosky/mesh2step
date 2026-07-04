@@ -38,6 +38,7 @@ except Exception:  # noqa: BLE001
 DND_ACTIVE = False
 
 UNIT_CHOICES = ["mm", "cm", "m", "in"]
+MULTIBODY_CHOICES = ["auto", "combine", "separate"]
 
 
 def _log_dir() -> Path:
@@ -222,6 +223,7 @@ class App:
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.units_var = tk.StringVar(value="mm")
+        self.multibody_var = tk.StringVar(value="auto")
         self.detect_var = tk.BooleanVar(value=True)
         self.faceted_var = tk.BooleanVar(value=False)
         self.repair_var = tk.BooleanVar(value=True)
@@ -404,6 +406,14 @@ class App:
         cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_units())
         self.units_preview = ttk.Label(urow, text="STEP output is always mm", style="Muted.TLabel")
         self.units_preview.pack(side="left", padx=8)
+        # Multi-body handling: auto / combine / separate.
+        mrow = ttk.Frame(c2, style="Card.TFrame")
+        mrow.pack(fill="x", pady=(8, 0))
+        ttk.Label(mrow, text="Multi-body").pack(side="left")
+        ttk.Combobox(mrow, textvariable=self.multibody_var, values=MULTIBODY_CHOICES,
+                     width=9, state="readonly").pack(side="left", padx=8)
+        ttk.Label(mrow, text="auto: fuse touching shells, else keep bodies separate",
+                  style="Muted.TLabel").pack(side="left", padx=8)
         self._checkbutton(c2, "Detect cylindrical holes / bosses (best-fit radius)",
                           self.detect_var).pack(anchor="w", pady=(8, 0))
         self._checkbutton(c2, "Repair mesh (fix self-intersections, duplicates, normals) — "
@@ -698,6 +708,7 @@ class App:
             "output": self.output_var.get().strip() or None,
             "config": {
                 "source_units": self.units_var.get(),
+                "multibody_mode": self.multibody_var.get(),
                 "detect_cylinders": self.detect_var.get(),
                 "faceted": self.faceted_var.get(),
                 "repair_mesh": self.repair_var.get(),

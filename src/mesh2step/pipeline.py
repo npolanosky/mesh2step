@@ -64,16 +64,69 @@ def convert(
     from . import builder
 
     # Multi-body dispatch: a mesh with several disjoint bodies (a print-in-place
-    # hinge, a snap-fit lid+base) can never close into ONE watertight solid, so
-    # convert each body independently and combine into a STEP compound of N
-    # solids. Detected on the raw welded mesh (matching what each tier reloads).
+    # hinge, a snap-fit lid+base). The connected components are split up front —
+    # cheaply, via union-find — so every heavy step (repair, self-intersection
+    # union, decimation, reconstruction, boolean clean-up) runs per body on the
+    # SMALLER meshes instead of once on the whole combined mesh. ``multibody_mode``
+    # then decides what to do with the split:
+    #
+    #   "separate": convert each body independently -> a STEP compound of N solids.
+    #   "combine":  union the bodies into ONE solid -> the ordinary single-body path.
+    #   "auto":     combine only when the bodies actually TOUCH — their bboxes
+    #               overlap AND they share near-coincident vertices along a seam
+    #               (one part exported as multiple shells). Bodies with a clearance
+    #               gap (a print-in-place hinge pin inside its knuckle: boxes
+    #               interpenetrate but no coincident faces) stay SEPARATE so a
+    #               functional assembly is never fused. Falls back to separate on
+    #               any combine failure, so it never regresses.
+    #
     # A single-body mesh falls straight through to the ordinary path below.
     if config.multi_body:
         raw_v, raw_f = load_stl(input_path, weld_tol=config.weld_tol)
-        from .mesh_io import split_components
+        from .mesh_io import (
+            bodies_bbox_overlap,
+            bodies_share_coincident_vertices,
+            split_components,
+        )
 
         components = split_components(raw_v, raw_f)
         if len(components) > 1:
+            mode = config.multibody_mode
+            if mode == "auto":
+                # Conservative: combine only shells that genuinely touch (bbox
+                # overlap is a cheap pre-filter; a shared coincident seam is the
+                # deciding signal). A clearance-gap assembly stays separate.
+                touching = (bodies_bbox_overlap(components)
+                            and bodies_share_coincident_vertices(
+                                components, tol=config.multibody_combine_weld))
+                mode = "combine" if touching else "separate"
+                progress(f"Multi-body ({len(components)} bodies): auto -> {mode} "
+                         f"(bodies {'share a coincident seam' if touching else 'are disjoint / gap-separated'})")
+            else:
+                progress(f"Multi-body ({len(components)} bodies): mode={mode}")
+
+            if mode == "combine":
+                combined = _combine_bodies_to_stl(
+                    raw_v, raw_f, input_path, config, progress)
+                if combined is not None:
+                    # Union succeeded: run the ordinary single-body pipeline on the
+                    # fused mesh (multi_body off so it can't re-split).
+                    import dataclasses
+
+                    combined_stl, combine_report = combined
+                    cfg1 = dataclasses.replace(config, multi_body=False)
+                    try:
+                        res = convert(combined_stl, output_path, cfg1, on_progress=progress)
+                    finally:
+                        import shutil
+
+                        shutil.rmtree(combined_stl.parent, ignore_errors=True)
+                    res.stats["multibody_mode"] = "combine"
+                    res.stats["multibody_combine"] = combine_report
+                    return res
+                progress("Multi-body combine unavailable/failed — "
+                         "falling back to separate per-body conversion")
+
             return _convert_multibody(
                 components, input_path, output_path, config, builder, progress)
 
@@ -470,6 +523,34 @@ def convert(
                             outputs=[output_path])
 
 
+def _combine_bodies_to_stl(raw_v, raw_f, input_path, config, progress):
+    """Union a multi-body mesh into one solid and write it to a temp STL.
+
+    Returns ``(Path, report)`` on success (the caller runs the ordinary
+    single-body pipeline on the fused STL), or ``None`` if the union is
+    unavailable/failed (the caller falls back to the separate per-body path).
+    The union runs on the raw welded mesh in source units — the single-body
+    ``convert`` call scales it to mm afterwards, exactly as it would the original.
+    """
+    import tempfile
+
+    from . import meshprep
+    from .mesh_io import write_binary_stl
+
+    progress("Multi-body combine: unioning bodies into one solid (manifold3d)")
+    combined = meshprep.combine_bodies(
+        raw_v, raw_f, weld=config.multibody_combine_weld, on_progress=progress)
+    if combined is None:
+        return None
+    cv, cf, report = combined
+    progress(f"  combined {report['bodies_in']} bodies "
+             f"({report['faces_in']:,} -> {report['faces_out']:,} facets)")
+    tmp = Path(tempfile.mkdtemp(prefix="mesh2step_combine_"))
+    combined_stl = tmp / (Path(input_path).stem + "_combined.stl")
+    write_binary_stl(cv, cf, combined_stl)
+    return combined_stl, report
+
+
 def _convert_multibody(components, input_path, output_path, config, builder,
                        progress) -> ConversionResult:
     """Convert a multi-body mesh: one STEP compound of N independent solids.
@@ -543,6 +624,7 @@ def _convert_multibody(components, input_path, output_path, config, builder,
         "watertight": all_solid,
         "quality": worst,
         "multi_body": True,
+        "multibody_mode": "separate",
     }
     if rtafs:
         stats["rtaf"] = round(max(rtafs), 4)  # worst (most-faceted) body

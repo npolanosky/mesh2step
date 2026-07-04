@@ -44,6 +44,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="repair the mesh first (fix self-intersections, duplicates, normals)",
     )
     p.add_argument(
+        "--multibody", choices=list(ConversionConfig.MULTIBODY_MODES), default="auto",
+        metavar="MODE",
+        help="how to handle a mesh with several disjoint bodies: 'separate' "
+             "(one STEP compound of N solids), 'combine' (union all bodies into "
+             "one solid), or 'auto' (default: combine only bodies that share a "
+             "coincident seam, else keep separate)",
+    )
+    p.add_argument(
         "--closed", action="store_true",
         help="guarantee a watertight solid (faceted fallback if reconstruction can't close)",
     )
@@ -117,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         source_units=args.units,
         detect_cylinders=not args.no_cylinders,
         repair_mesh=args.repair,
+        multibody_mode=args.multibody,
         full_closed=args.closed,
         faceted=args.faceted,
         freecad_bin=args.freecad_bin,

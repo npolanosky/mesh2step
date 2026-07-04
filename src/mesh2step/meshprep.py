@@ -140,6 +140,95 @@ def resolve_self_intersections(
         return None
 
 
+def combine_bodies(
+    vertices: np.ndarray, faces: np.ndarray, *, weld: float = 1e-3, on_progress=None
+) -> tuple[np.ndarray, np.ndarray, dict] | None:
+    """Union a multi-shell mesh into ONE solid via the manifold3d winding boolean.
+
+    The "combine" multi-body mode: several disjoint (or coincident/near-coincident)
+    shells that are really one part are fused into a single watertight surface.
+    This is the same winding-number engine ``resolve_self_intersections`` uses, but
+    driven unconditionally (the caller has decided the bodies belong together) and
+    with a small vertex *weld* first so shells that meet across a sub-tolerance gap
+    still merge rather than staying two solids.
+
+    Bit-exact / quantised coincidence is already handled by manifold3d's own
+    ``Mesh.merge``; ``weld`` (mm) snaps near-coincident vertices onto a shared grid
+    beforehand so a tiny modelled seam (faces that should touch but differ by FP
+    noise) collapses to a shared boundary and the union welds through it.
+
+    Unlike ``resolve_self_intersections`` there is deliberately NO bbox-stability
+    guard: fusing two shells can legitimately change the combined silhouette (two
+    touching cubes become one bar). Returns ``(vertices, faces, report)`` on
+    success, or ``None`` (logged with a reason) on any failure, so the caller can
+    fall back to the per-body "separate" path.
+    """
+    def log(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
+
+    try:
+        import manifold3d as m3
+    except ImportError:
+        log("  multi-body combine: SKIPPED — manifold3d not installed "
+            "(environment/provisioning issue, not a geometry problem)")
+        return None
+
+    v = np.asarray(vertices, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    # Optional pre-weld: snap near-coincident vertices onto a shared grid so a
+    # tiny modelled seam between two shells collapses to a shared boundary the
+    # union can fuse through. weld<=0 leaves the mesh untouched (manifold3d's own
+    # merge still handles bit-exact coincidence).
+    welded = 0
+    if weld and weld > 0:
+        scale = 1.0 / weld
+        keys = np.round(v * scale).astype(np.int64)
+        uniq, first_idx, inverse = np.unique(
+            keys, axis=0, return_index=True, return_inverse=True)
+        if len(first_idx) < len(v):
+            welded = int(len(v) - len(first_idx))
+            # ``inverse`` maps each ORIGINAL vertex to its merged index; remap the
+            # face indices through it, then keep the surviving unique vertices.
+            # (np.unique may return inverse with a trailing 1-dim; flatten it.)
+            inverse = np.asarray(inverse).reshape(-1)
+            v = v[first_idx]
+            f = inverse[f].astype(np.int64)
+            good = (f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])
+            f = f[good]
+
+    try:
+        mesh = m3.Mesh(vert_properties=v.astype(np.float32),
+                       tri_verts=f.astype(np.uint32))
+        mesh.merge()
+        man = m3.Manifold(mesh)
+        if man.is_empty():
+            log("  multi-body combine: REJECTED — manifold construction produced "
+                "an empty solid (bodies not valid closed volumes)")
+            return None
+        parts = man.decompose()
+        if len(parts) > 1:
+            man = m3.Manifold.batch_boolean(parts, m3.OpType.Add)
+        out = man.to_mesh()
+        v2 = np.array(out.vert_properties, dtype=np.float64)[:, :3]
+        f2 = np.array(out.tri_verts, dtype=np.int64)
+        if len(f2) == 0:
+            log("  multi-body combine: REJECTED — union produced an empty mesh "
+                "(0 faces)")
+            return None
+        report = {
+            "bodies_in": int(len(parts)),
+            "faces_in": int(len(faces)),
+            "faces_out": int(len(f2)),
+            "welded_vertices": welded,
+        }
+        return v2, f2, report
+    except Exception as exc:  # noqa: BLE001 - combine is best-effort
+        log(f"  multi-body combine: FAILED — manifold3d raised "
+            f"{type(exc).__name__}: {exc} (kernel/runtime issue)")
+        return None
+
+
 def problem_points(path: str, cap: int = 4000) -> list[list[float]]:
     """3D points marking mesh defects, for highlighting in the preview.
 

@@ -65,6 +65,35 @@ class ConversionConfig:
     # mesh is unaffected — it takes the ordinary path byte-for-byte.
     multi_body: bool = True
 
+    # How a multi-body mesh (>= 2 disjoint connected components) is handled.
+    # Only consulted when ``multi_body`` is True and the mesh actually splits:
+    #
+    #   "auto" (default): a conservative heuristic per file. If the bodies'
+    #       bounding boxes overlap or touch (they are almost certainly one part
+    #       that was exported as several shells — e.g. a lid modelled through its
+    #       base, tabs interpenetrating a wall), attempt to COMBINE them into a
+    #       single solid via the manifold3d winding-number union. If every body
+    #       is bbox-disjoint (a genuinely separate print-in-place hinge pin, two
+    #       loose parts on one plate), keep them SEPARATE (one compound of N
+    #       solids). On any failure of the combine attempt it falls back to
+    #       separate — auto never regresses relative to the old behaviour.
+    #
+    #   "combine": always union all bodies into ONE solid via manifold3d (the
+    #       same winding-number boolean the self-intersection resolver uses).
+    #       For bodies that are really one part split into coincident/near-
+    #       coincident shells. A small weld/merge pass first bridges tiny gaps so
+    #       near-coincident (not bit-exact) faces still fuse.
+    #
+    #   "separate": always convert each body independently and emit a STEP
+    #       compound of N solids (the historical multi-body behaviour).
+    multibody_mode: str = "auto"
+
+    # Gap (mm) up to which "combine" welds near-coincident vertices across bodies
+    # before the union, so shells that meet with sub-tolerance FP gaps still fuse
+    # into one solid. manifold3d's own merge handles bit-exact/quantised
+    # coincidence; this widens it slightly for meshes exported with tiny seams.
+    multibody_combine_weld: float = 1e-3
+
     # Guarantee a watertight solid. If surface reconstruction can't close (common
     # for organic meshes, where analytic hole edges can't meet the faceted
     # surrounding surface), fall back to a watertight faceted solid. Slower, and
@@ -567,6 +596,16 @@ class ConversionConfig:
     # The corpus's largest chain analysis (tweezer, ~10.5k faces) stays in
     # single-digit seconds well under this cap. None disables the guard.
     rtaf_max_faces: int | None = 40000
+
+    # Accepted values for ``multibody_mode``; also used by the CLI/GUI choices.
+    MULTIBODY_MODES = ("auto", "combine", "separate")
+
+    def __post_init__(self) -> None:
+        if self.multibody_mode not in self.MULTIBODY_MODES:
+            raise ValueError(
+                f"unknown multibody_mode {self.multibody_mode!r}; "
+                f"expected one of {list(self.MULTIBODY_MODES)}"
+            )
 
     @property
     def angle_tol_cos(self) -> float:
