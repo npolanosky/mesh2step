@@ -219,6 +219,76 @@ def test_sse_events_for_finished_job(tmp_path, monkeypatch):
     assert any(e.get("state") == "done" for e in events)
 
 
+def test_job_timestamps_server_authoritative(tmp_path, monkeypatch):
+    """Jobs carry created/started/finished epochs and endpoints expose a server
+    clock (``now``) so the UI can compute elapsed without the page-load clock."""
+    client = _client(tmp_path, monkeypatch)
+    job_id = _convert(client)
+    d = _wait_done(client, job_id)
+
+    # Detail payload: monotonic timestamps + server-computed elapsed + now.
+    assert d["created"] <= d["started"] <= d["finished"]
+    assert d["elapsed"] == pytest.approx(d["finished"] - d["started"], abs=0.02)
+    assert d["now"] >= d["finished"]
+
+    # List payload: per-job timestamps + a top-level server clock for the
+    # history page's live-ticking elapsed column.
+    lst = client.get("/api/jobs").json()
+    assert lst["now"] > 0
+    me = next(j for j in lst["jobs"] if j["id"] == job_id)
+    assert me["started"] == d["started"] and me["finished"] == d["finished"]
+
+    # SSE snapshot: same timestamps + server now, so a late subscriber (page
+    # reload / history Open) bases its timer on true process time.
+    with client.stream("GET", f"/api/jobs/{job_id}/events") as r:
+        body = "".join(chunk for chunk in r.iter_text())
+    snap = next(json.loads(ln[6:]) for ln in body.splitlines()
+                if ln.startswith("data: "))
+    assert snap["type"] == "snapshot"
+    assert snap["started"] == d["started"]
+    assert snap["finished"] == d["finished"]
+    assert snap["now"] > 0
+
+
+def test_running_state_event_carries_started(tmp_path, monkeypatch):
+    """The RUNNING state event includes the start epoch, so a client already
+    watching a queued job can base its elapsed timer on the true start time."""
+    import queue as _q
+    import threading
+
+    gate = threading.Event()
+
+    def slow_worker(job, freecad_python, *, on_line=None, on_start=None, timeout=0):
+        gate.wait(5.0)
+        return _fake_run_worker_ok(job, freecad_python, on_line=on_line)
+
+    client = _client(tmp_path, monkeypatch, worker=slow_worker)
+    # Occupy the single worker, then queue a second job and subscribe to its
+    # events BEFORE it starts (exactly what a watching browser does).
+    a = _convert(client)
+    _wait_state(client, a, ("running",))
+    b = _convert(client)
+    store = client.app.state.store
+    sub = store.subscribe(b)
+    gate.set()  # release a -> b starts
+
+    running_ev = None
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            ev = sub.get(timeout=0.5)
+        except _q.Empty:
+            continue
+        if ev.get("type") == "state" and ev.get("state") == "running":
+            running_ev = ev
+            break
+    store.unsubscribe(b, sub)
+    assert running_ev is not None, "never saw the running state event"
+    assert running_ev.get("started"), "running event missing 'started' epoch"
+    _wait_done(client, a)
+    _wait_done(client, b)
+
+
 def test_failing_mesh_records_to_failstore(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch, worker=_fake_run_worker_not_watertight)
     # Toggle failure saving on (mirrors the GUI checkbox).

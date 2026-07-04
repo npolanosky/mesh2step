@@ -120,6 +120,21 @@ select {
 .dz-browse { pointer-events: auto; }
 .filename { margin-top: 10px; font-weight: 600; word-break: break-all; }
 
+/* selected-files list (multi-upload) */
+.file-list { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.file-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px;
+  background: #f8fafc; font-size: 12.5px;
+}
+.file-row-name { flex: 1; font-weight: 600; word-break: break-all; }
+.file-row-size { color: var(--muted); font-family: ui-monospace, Menlo, monospace; font-size: 11px; white-space: nowrap; }
+.file-row-rm {
+  border: 0; background: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; padding: 0 2px; line-height: 1;
+}
+.file-row-rm:hover { color: var(--err); }
+
 /* ---- buttons ---- */
 .btn-primary {
   width: 100%; border: 0; border-radius: var(--radius);

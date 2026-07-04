@@ -285,7 +285,10 @@ class JobStore:
         job.started = time.time()
         job.status_line = "Starting…"
         self._persist(job)
-        self._publish(job.id, {"type": "state", "state": RUNNING})
+        # ``started`` rides along so a client already subscribed (e.g. watching
+        # a queued job) can base its elapsed timer on the true start time.
+        self._publish(job.id, {"type": "state", "state": RUNNING,
+                               "started": job.started})
 
         def emit(kind: str, payload: Any) -> None:
             if kind == "proc":

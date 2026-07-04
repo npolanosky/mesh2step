@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
@@ -198,19 +199,23 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
     @app.get("/api/jobs")
     def jobs() -> dict:
         # Trim logs in the list view; the detail endpoint has the full log.
+        # ``now`` is the server clock so the UI can tick running rows'
+        # elapsed = now - started without trusting the client clock.
         out = []
         for j in store.list():
             d = j.public()
             d["log"] = d["log"][-3:]
             out.append(d)
-        return {"jobs": out}
+        return {"jobs": out, "now": time.time()}
 
     @app.get("/api/jobs/{job_id}")
     def job_detail(job_id: str) -> dict:
         job = store.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="No such job.")
-        return job.public()
+        d = job.public()
+        d["now"] = time.time()
+        return d
 
     @app.get("/api/active")
     def active() -> dict:
@@ -263,10 +268,15 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
         sub = store.subscribe(job_id)
 
         async def gen():
-            # Replay current state so a late subscriber isn't stuck.
+            # Replay current state so a late subscriber isn't stuck. Timestamps
+            # + the server clock (``now``) make the client's elapsed timer
+            # server-authoritative: elapsed = server_now - started, immune to
+            # page reloads and client clock skew.
             snapshot = {"type": "snapshot", "state": job.state,
                         "progress": job.progress, "status": job.status_line,
-                        "log": job.log[-50:]}
+                        "log": job.log[-50:],
+                        "created": job.created, "started": job.started,
+                        "finished": job.finished, "now": time.time()}
             yield f"data: {json.dumps(snapshot)}\n\n"
             if job.state in ("done", "failed", "cancelled"):
                 yield f"data: {json.dumps({'type': 'state', 'state': job.state, 'error': job.error})}\n\n"

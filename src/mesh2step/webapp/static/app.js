@@ -8,11 +8,17 @@
   });
 
   let viewer = null;
-  let selectedFile = null;       // File chosen but not yet converted
+  let selectedFiles = [];        // Files chosen but not yet converted
   let currentJob = null;         // active/last job id
   let jobDone = false;
   let evtSource = null;
   let timer = null;
+  // Server-authoritative elapsed time: the SSE snapshot carries the job's
+  // started/finished epochs plus the server clock ("now"); we keep the
+  // client-server clock skew and tick elapsed = server_now - started. Robust
+  // across page reloads and history opens — the clock never restarts.
+  let clockSkew = 0;             // client_seconds - server_seconds
+  let jobStarted = null;         // server epoch when the watched job started
   const meshCache = {};          // view -> ArrayBuffer for the current job
 
   // ---- viewer init (lazy, needs a sized container) ---------------------- //
@@ -55,6 +61,8 @@
   });
 
   // ---- in-progress count (main-page badge, live) ------------------------ //
+  let lastActiveKey = null; // "running/queued" fingerprint to detect changes
+
   function refreshActive() {
     return fetch("/api/active").then((r) => r.json()).then((a) => {
       const badge = $("active-badge");
@@ -67,6 +75,15 @@
       } else {
         badge.hidden = true;
       }
+      // A state transition (queued->running, running->done/cancelled) while the
+      // history page is open: re-render the table so running rows' live timers
+      // start/stop and final elapsed/actions appear.
+      const key = a.running + "/" + a.queued;
+      if (lastActiveKey !== null && key !== lastActiveKey &&
+          $("page-corpus").classList.contains("active")) {
+        loadCorpus();
+      }
+      lastActiveKey = key;
       return a;
     }).catch(() => {});
   }
@@ -102,7 +119,7 @@
 
   fileInput.addEventListener("change", (e) => {
     pickerBusy = false;
-    if (e.target.files[0]) pickFile(e.target.files[0]);
+    if (e.target.files.length) addFiles(e.target.files);
   });
 
   $("browse-btn").addEventListener("click", (e) => {
@@ -115,19 +132,53 @@
   // deliberately does NOT open the dialog (only the Browse button does).
   ["dragover", "dragenter"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
   ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
-  dz.addEventListener("drop", (e) => { if (e.dataTransfer.files[0]) pickFile(e.dataTransfer.files[0]); });
+  dz.addEventListener("drop", (e) => { if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
 
-  function pickFile(f) {
-    if (!f.name.toLowerCase().endsWith(".stl")) { alert("Please choose a .stl file."); return; }
-    selectedFile = f;
-    $("mesh-name").textContent = f.name + "  (" + (f.size / 1024).toFixed(0) + " KB)";
-    $("mesh-name").hidden = false;
-    $("convert-btn").disabled = false;
-    // Reset any prior result view.
+  // Multiple files may be selected/dropped at once; each becomes its own job
+  // on Convert. Non-.stl entries are dropped with a note.
+  function addFiles(list) {
+    const files = [...list].filter((f) => f.name.toLowerCase().endsWith(".stl"));
+    if (!files.length) { alert("Please choose .stl files."); return; }
+    if (files.length < list.length) alert("Skipped " + (list.length - files.length) + " non-.stl file(s).");
+    for (const f of files) {
+      // De-dupe by name+size so re-dropping the same selection doesn't stack.
+      if (!selectedFiles.some((s) => s.name === f.name && s.size === f.size)) selectedFiles.push(f);
+    }
+    renderFileList();
+    // Reset any prior result view and preview the first file client-side.
     resetResult();
-    // Preview the input STL immediately by uploading a scratch job? No — we
-    // render the STL client-side from the raw file for instant feedback.
-    previewLocalStl(f);
+    previewLocalStl(selectedFiles[0]);
+  }
+
+  function renderFileList() {
+    const el = $("file-list");
+    el.innerHTML = "";
+    el.hidden = selectedFiles.length === 0;
+    selectedFiles.forEach((f, i) => {
+      const row = document.createElement("div");
+      row.className = "file-row";
+      const name = document.createElement("span");
+      name.className = "file-row-name";
+      name.textContent = f.name;
+      const size = document.createElement("span");
+      size.className = "file-row-size";
+      size.textContent = (f.size / 1024).toFixed(0) + " KB";
+      const rm = document.createElement("button");
+      rm.className = "file-row-rm";
+      rm.title = "Remove";
+      rm.textContent = "✕";
+      rm.addEventListener("click", () => {
+        selectedFiles.splice(i, 1);
+        renderFileList();
+        if (selectedFiles.length) previewLocalStl(selectedFiles[0]);
+      });
+      row.appendChild(name); row.appendChild(size); row.appendChild(rm);
+      el.appendChild(row);
+    });
+    const btn = $("convert-btn");
+    btn.disabled = selectedFiles.length === 0;
+    btn.textContent = selectedFiles.length > 1
+      ? "Convert " + selectedFiles.length + " files → STEP" : "Convert → STEP";
   }
 
   // Parse a binary/ascii STL in the browser for instant input preview.
@@ -202,7 +253,7 @@
 
   // ---- convert ---------------------------------------------------------- //
   $("convert-btn").addEventListener("click", () => {
-    if (!selectedFile) return;
+    if (!selectedFiles.length) return;
     const options = {
       source_units: $("units").value,
       detect_cylinders: $("opt-detect").checked,
@@ -210,17 +261,35 @@
       full_closed: $("opt-closed").checked,
       faceted: $("opt-faceted").checked,
     };
-    const fd = new FormData();
-    fd.append("file", selectedFile, selectedFile.name);
-    fd.append("options", JSON.stringify(options));
+    const files = selectedFiles.slice();
     $("convert-btn").disabled = true;
     resetResult();
     $("progress-card").hidden = false;
-    setStatus("Uploading…", 2);
-    api("/api/convert", { method: "POST", body: fd })
-      .then((r) => r.json())
-      .then((d) => { watchJob(d.id); refreshActive(); })
-      .catch((err) => { setStatus("Failed: " + err.message, 0); $("convert-btn").disabled = false; showCancel(false); });
+    setStatus(files.length > 1 ? "Uploading " + files.length + " files…" : "Uploading…", 2);
+
+    // Submit every file as its own job (one POST each) with the same options;
+    // the server queues them in order. We then watch the FIRST job live — the
+    // rest stay reachable from History / the active badge.
+    (async () => {
+      const ids = [];
+      for (const f of files) {
+        const fd = new FormData();
+        fd.append("file", f, f.name);
+        fd.append("options", JSON.stringify(options));
+        const r = await api("/api/convert", { method: "POST", body: fd });
+        ids.push((await r.json()).id);
+      }
+      return ids;
+    })().then((ids) => {
+      selectedFiles = [];
+      renderFileList();
+      refreshActive();
+      watchJob(ids[0]);
+      if (ids.length > 1) {
+        appendLog(ids.length + " jobs queued — watching the first; the others run "
+          + "in order (open them from Corpus & history).", "l-stage");
+      }
+    }).catch((err) => { setStatus("Failed: " + err.message, 0); renderFileList(); showCancel(false); });
   });
 
   // ---- cancel ----------------------------------------------------------- //
@@ -239,6 +308,32 @@
   $("cancel-btn").addEventListener("click", () => {
     cancelJob(currentJob, $("cancel-btn")).then(() => setStatus("Cancelling…", null));
   });
+
+  // ---- new conversion (reset without refresh) ---------------------------- //
+  // Returns the page to a fresh upload state. The job we were watching keeps
+  // running server-side — only our SSE subscription is dropped; its progress
+  // stays reachable from History (Open) and the active badge.
+  function newConversion() {
+    if (evtSource) { evtSource.close(); evtSource = null; }
+    clearInterval(timer);
+    currentJob = null;
+    jobDone = false;
+    jobStarted = null;
+    selectedFiles = [];
+    renderFileList();
+    resetResult();
+    $("progress-card").hidden = true;
+    showCancel(false);
+    setStatus("Ready", 0);
+    $("elapsed").textContent = "0.0s";
+    if (viewer) viewer.clear();
+    const ve = $("viewer-empty");
+    ve.textContent = "Select an STL to preview it here.";
+    ve.hidden = false;
+    setViewTab("stl");
+    refreshActive();
+  }
+  $("new-conv-btn").addEventListener("click", newConversion);
 
   function resetResult() {
     jobDone = false;
@@ -269,15 +364,28 @@
   function watchJob(id) {
     currentJob = id;
     jobDone = false;
-    const t0 = Date.now();
+    jobStarted = null;
     clearInterval(timer);
-    timer = setInterval(() => { if (!jobDone) $("elapsed").textContent = ((Date.now()-t0)/1000).toFixed(1) + "s"; }, 100);
+    // The clock is server-authoritative: elapsed = server_now - started (from
+    // the SSE snapshot / running event), NOT time-since-page-load — so a reload
+    // or a history Open mid-run shows the true process time.
+    timer = setInterval(() => {
+      if (jobDone) return;
+      if (jobStarted != null) {
+        const nowSrv = Date.now() / 1000 - clockSkew;
+        $("elapsed").textContent = Math.max(0, nowSrv - jobStarted).toFixed(1) + "s";
+      } else {
+        $("elapsed").textContent = "queued";
+      }
+    }, 100);
     if (evtSource) evtSource.close();
     showCancel(true);
     evtSource = new EventSource("/api/jobs/" + id + "/events");
     evtSource.onmessage = (e) => {
       const ev = JSON.parse(e.data);
       if (ev.type === "snapshot") {
+        if (ev.now) clockSkew = Date.now() / 1000 - ev.now;
+        if (ev.started) jobStarted = ev.started;
         setStatus(ev.status || "Working…", ev.progress || 2);
         (ev.log || []).forEach((l) => appendLog(l.startsWith("PROGRESS:") ? l.slice(9).trim() : l,
           l.startsWith("PROGRESS:") ? "l-stage" : ""));
@@ -288,6 +396,9 @@
         appendLog(ev.message, "l-stage");
       } else if (ev.type === "log") {
         appendLog(ev.message, /error|traceback/i.test(ev.message) ? "l-err" : "");
+      } else if (ev.type === "state" && ev.state === "running") {
+        // A watched queued job just started: base the clock on its true start.
+        if (ev.started) jobStarted = ev.started;
       } else if (ev.type === "state" && _TERMINAL[ev.state]) {
         evtSource.close();
         finishJob(id, ev.state, ev.error);
@@ -307,7 +418,8 @@
     $("page-convert").classList.add("active");
     if (viewer) viewer._resize();
 
-    selectedFile = null;
+    selectedFiles = [];
+    renderFileList();
     resetResult();
     $("progress-card").hidden = false;
     $("convert-btn").disabled = true;
@@ -324,9 +436,14 @@
   function finishJob(id, state, error) {
     jobDone = true;
     showCancel(false);
-    $("convert-btn").disabled = !selectedFile;
+    $("convert-btn").disabled = !selectedFiles.length;
     refreshActive();
-    fetch("/api/jobs/" + id).then((r) => r.json()).then((job) => renderResult(job, state, error));
+    fetch("/api/jobs/" + id).then((r) => r.json()).then((job) => {
+      // Final elapsed comes from the server (finished - started), never the
+      // page-load clock.
+      if (job.elapsed) $("elapsed").textContent = job.elapsed.toFixed(1) + "s";
+      renderResult(job, state, error);
+    });
   }
 
   function renderResult(job, state, error) {
@@ -436,7 +553,7 @@
     setViewTab(view);
     $("scalebar").hidden = view !== "heatmap";
     $("dev-stats").hidden = view !== "heatmap";
-    if (view === "stl" && selectedFile && !currentJob) return; // already local-previewed
+    if (view === "stl" && selectedFiles.length && !currentJob) return; // already local-previewed
     const url = "/api/jobs/" + currentJob + "/mesh/" + view;
     if (meshCache[view]) { renderMesh(meshCache[view].buf, view, meshCache[view].stats); return; }
     $("viewer-empty").hidden = true;
@@ -478,10 +595,30 @@
   }
 
   // ---- corpus + history ------------------------------------------------- //
+  let historySkew = 0; // client_seconds - server_seconds, from /api/jobs "now"
+
   function loadCorpus() {
-    fetch("/api/jobs").then((r) => r.json()).then((d) => renderHistory(d.jobs));
+    fetch("/api/jobs").then((r) => r.json()).then((d) => {
+      if (d.now) historySkew = Date.now() / 1000 - d.now;
+      renderHistory(d.jobs);
+    });
     fetch("/api/corpus").then((r) => r.json()).then((d) => renderCorpus(d));
   }
+
+  // Tick running rows' Elapsed in place (no table re-render): each running row
+  // renders a span carrying its server started-epoch; one interval updates the
+  // text. Terminal transitions re-render the table via the active poll below,
+  // which replaces the live spans with the final server-computed elapsed.
+  setInterval(() => {
+    document.querySelectorAll("#history .elapsed-live").forEach((el) => {
+      const st = parseFloat(el.dataset.started);
+      if (!isNaN(st)) {
+        const nowSrv = Date.now() / 1000 - historySkew;
+        el.textContent = Math.max(0, nowSrv - st).toFixed(1) + "s";
+      }
+    });
+  }, 500);
+
   function renderHistory(jobs) {
     const el = $("history");
     if (!jobs.length) { el.innerHTML = '<p class="muted">No conversions yet.</p>'; return; }
@@ -510,12 +647,17 @@
         actions += "<button class='btn-mini' data-rerun='" + j.id + "'>Re-run</button>";
       }
       actions += "</div>";
+      // Running rows tick live from the server started-epoch; queued rows show
+      // a dash; terminal rows show the final server-computed elapsed.
+      const elapsedCell = (j.state === "running" && j.started)
+        ? "<span class='elapsed-live' data-started='" + j.started + "'>…</span>"
+        : (j.elapsed ? j.elapsed.toFixed(1) + "s" : "—");
       h += "<tr><td class='wrap'>" + esc(j.filename) + "</td>" +
         "<td><span class='tag " + j.state + "'>" + j.state + "</span></td>" +
         "<td>" + (s.quality || "—") + "</td>" +
         "<td>" + (s.is_solid == null ? "—" : (s.is_solid ? "✓" : "✗")) + "</td>" +
         "<td>" + ((j.result && j.result.method) || "—") + "</td>" +
-        "<td>" + (j.elapsed ? j.elapsed.toFixed(1) + "s" : "—") + "</td>" +
+        "<td>" + elapsedCell + "</td>" +
         "<td>" + actions + "</td></tr>";
     }
     el.innerHTML = h + "</tbody></table>";

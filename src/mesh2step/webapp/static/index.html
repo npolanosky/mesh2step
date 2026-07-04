@@ -34,11 +34,11 @@
             <h2>1 · Input mesh</h2>
             <div id="dropzone" class="dropzone">
               <div class="dz-icon">⤓</div>
-              <div class="dz-text">Drag an STL here</div>
+              <div class="dz-text">Drag STL files here</div>
               <button type="button" id="browse-btn" class="btn-secondary dz-browse">Browse…</button>
-              <input type="file" id="file-input" accept=".stl" hidden>
+              <input type="file" id="file-input" accept=".stl" multiple hidden>
             </div>
-            <div id="mesh-name" class="filename" hidden></div>
+            <div id="file-list" class="file-list" hidden></div>
           </div>
 
           <div class="card">
@@ -73,6 +73,7 @@
               <span class="progress-head-right">
                 <span id="elapsed" class="elapsed">0.0s</span>
                 <button id="cancel-btn" class="btn-cancel" hidden>Cancel</button>
+                <button id="new-conv-btn" class="btn-mini" title="Start a fresh upload — running jobs keep going (see History)">New conversion</button>
               </span>
             </div>
             <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
