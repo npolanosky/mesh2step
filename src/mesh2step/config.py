@@ -853,6 +853,48 @@ class ConversionConfig:
     organic_region_max_ops: int = 6
     organic_region_max_base_faces: int | None = 40000
 
+    # --- Multi-chart parametrization (organic_region.region_charts) ------------
+    # A thin WRAPPING residual shell (the port_cover cast top, the tweezer shell,
+    # the patton_pad residual) has no single injective projection — its facet
+    # normals span far past a hemisphere, so the single-surface region pass rejects
+    # it (surface folds; extrude tool self-intersects). When enabled, such a region
+    # is split into connected SINGLE-SIDED charts, each of which IS individually
+    # parametrizable, and each chart is reconstructed + cut in by the same guarded
+    # extrude+cut boolean the single-region pass uses (processed sequentially, each
+    # revertable). Behind this flag so it can be disabled independently.
+    organic_region_multichart: bool = True
+
+    # A chart admits a connected region facet only while its normal is within this
+    # many degrees of BOTH the chart axis and the fixed seed normal — the injectivity
+    # ("stop at the fold") criterion, seed-anchored so each chart is a COMPACT
+    # geodesic cap (not an annular ring that wraps around the axis and never projects
+    # single-valued). ~50 deg keeps each cap comfortably inside the silhouette so its
+    # single fitted B-spline surface and the extruded boolean tool do not
+    # self-intersect (measured: the open Catmull-Clark limit-fit balloons a
+    # near-hemisphere chart, so the cap must stay well under 90 deg).
+    organic_region_chart_half_angle: float = 50.0
+
+    # A chart must have at least this many facets (and this surface area, mm^2, or
+    # this fraction of the parent region's area) to be worth reconstructing; smaller
+    # charts stay faceted (negligible RTAF, and a tiny cage remeshes poorly).
+    organic_region_chart_min_facets: int = 300
+    organic_region_chart_min_area: float = 150.0
+    organic_region_chart_min_area_frac: float = 0.02
+
+    # Cap on charts built per region (each is a full remesh + fit + boolean). A
+    # wrapping shell is 2-8 natural charts; beyond this the region is left faceted.
+    organic_region_chart_max: int = 8
+
+    # A region is only routed to the multi-chart pass when its foldover is at least
+    # this high (i.e. it genuinely wraps) — below it the single-surface region pass
+    # already claims it (or correctly declines a gentle residual). Keeps the extra
+    # remesh/boolean cost off the injective regions the single pass handles.
+    organic_region_multichart_min_foldover: float = 0.02
+
+    # A wrapping region must have at least this many facets total to bother splitting
+    # (the split + per-chart remesh is only worth it on a large residual).
+    organic_region_multichart_min_facets: int = 900
+
     # --- Spheres: domes and corner blends (M3). See docs/CURVED_FEATURES.md §3,
     # §4. A dome (grille cap, rounded boss top) or the spherical blend where three
     # fillets meet is a spherical cap: its facet normals fan out in all directions

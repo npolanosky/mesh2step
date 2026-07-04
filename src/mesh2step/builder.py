@@ -1228,23 +1228,22 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
     bbox_guard = config.boolean_max_bbox_growth
     detected = len(regions)
     built = 0
-    ops = 0
-    for region in regions:
-        if ops >= config.organic_region_max_ops:
-            break
+    state = {"solid": solid, "rtaf": rtaf_before, "ops": 0}
+
+    def try_one(rg, label):
+        """Build + dev-gate + boolean + RTAF-gate ONE region/chart against the
+        current state. Returns ``(adopted, detail)``; mutates ``state`` on adopt.
+        Shared by the single-region path and each chart of a multi-chart split."""
         surf, detail = oreg.build_region_surface(
-            vertices, faces, region, config, Part, on_progress=progress)
+            vertices, faces, rg, config, Part, on_progress=progress)
         if surf is None:
-            progress(f"  organic region declined ({detail.get('reason')}, "
-                     f"{region.size} facets)")
-            details.append(detail)
-            continue
+            return False, detail
         # Deviation gate: a surface that misses the real facets would distort the
         # part — do not pay the boolean. Tolerance is the max of an absolute floor,
         # an edge-scaled term (coarse-STL chord sagitta), and a fraction of the
         # region's diagonal (a resolution-honest ceiling on a large cast region,
         # mirroring the whole-body organic tier's 2%-of-diag gate).
-        edge = (resolution.edge_for(region.face_indices)
+        edge = (resolution.edge_for(rg.face_indices)
                 if resolution is not None else 1.0)
         rdiag = detail.get("diag_mm", 0.0) or 0.0
         dev_tol = max(config.organic_region_dev_tol_abs,
@@ -1253,43 +1252,98 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
         detail["dev_tol_mm"] = round(dev_tol, 4)
         dev = detail.get("deviation_mm")
         if dev is not None and dev > dev_tol:
-            progress(f"  organic region rejected: deviation {dev:.2f} mm > tol "
-                     f"{dev_tol:.2f} ({region.size} facets)")
-            details.append(detail)
-            continue
-        ops += 1
+            detail["reason"] = (f"deviation {dev:.2f} mm > tol {dev_tol:.2f}")
+            progress(f"  organic {label} rejected: deviation {dev:.2f} mm > tol "
+                     f"{dev_tol:.2f} ({rg.size} facets)")
+            return False, detail
+        state["ops"] += 1
         candidate, ok = _try_boolean_step(
-            solid,
-            lambda s, sf=surf, rg=region:
-                oreg.boolean_clean_region(s, sf, rg, Part),
+            state["solid"],
+            lambda s, sf=surf, r=rg: oreg.boolean_clean_region(s, sf, r, Part),
             max_bbox_growth=bbox_guard)
         if not ok:
-            progress(f"  organic region reverted: boolean invalid/bbox "
-                     f"({region.size} facets)")
-            details.append(detail)
-            continue
+            detail["reason"] = "boolean invalid/bbox"
+            progress(f"  organic {label} reverted: boolean invalid/bbox "
+                     f"({rg.size} facets)")
+            return False, detail
         rtaf_after = None
-        if rtaf_before is not None:
+        if state["rtaf"] is not None:
             try:
                 rtaf_after = compute_rtaf(candidate, config).get("rtaf")
             except Exception:  # noqa: BLE001
                 rtaf_after = None
-            if rtaf_after is not None and rtaf_after >= rtaf_before - 1e-4:
-                progress(f"  organic region reverted: RTAF {rtaf_before:.3f} -> "
+            if rtaf_after is not None and rtaf_after >= state["rtaf"] - 1e-4:
+                detail["reason"] = "no RTAF improvement"
+                progress(f"  organic {label} reverted: RTAF {state['rtaf']:.3f} -> "
                          f"{rtaf_after:.3f} (no improvement)")
-                details.append(detail)
-                continue
-        solid = candidate
+                return False, detail
+        state["solid"] = candidate
         if rtaf_after is not None:
-            rtaf_before = rtaf_after
-        built += 1
+            state["rtaf"] = rtaf_after
         detail["adopted"] = True
         detail["rtaf_after"] = rtaf_after
-        details.append(detail)
-        progress(f"  organic region built ({region.size} facets, "
+        progress(f"  organic {label} built ({rg.size} facets, "
                  f"{detail.get('poles')} B-spline poles, dev "
                  f"{detail.get('deviation_mm')} mm, RTAF -> {rtaf_after})")
-    return solid, detected, built, details
+        return True, detail
+
+    def is_fold_decline(detail) -> bool:
+        r = (detail.get("reason") or "").lower()
+        return "fold" in r or "degenerate (u,v)" in r or "collapsed" in r
+
+    for region in regions:
+        if state["ops"] >= config.organic_region_max_ops:
+            break
+        adopted, detail = try_one(region, "region")
+        if adopted:
+            built += 1
+            details.append(detail)
+            continue
+        # Multi-chart fallback: a WRAPPING region whose single-surface projection
+        # folds (or squashes) is not one height field, but it decomposes into
+        # connected single-sided charts that each ARE. Split it and cut each chart
+        # in sequentially — the same guarded boolean, each revertable — so the
+        # wrapping residual is de-faceted chart by chart instead of declining whole.
+        details.append(detail)
+        wrap = (config.organic_region_multichart
+                and is_fold_decline(detail)
+                and region.size >= config.organic_region_multichart_min_facets
+                and region.foldover >= config.organic_region_multichart_min_foldover)
+        if not wrap:
+            if not detail.get("adopted"):
+                progress(f"  organic region declined ({detail.get('reason')}, "
+                         f"{region.size} facets)")
+            continue
+        charts = oreg.region_charts(vertices, faces, region, config)
+        if not charts:
+            progress(f"  organic region: no injective charts ({region.size} facets)")
+            continue
+        progress(f"  organic region: split into {len(charts)} chart(s) "
+                 f"(sizes {[c.size for c in charts]})")
+        chart_built = 0
+        chart_detail: list[dict] = []
+        for ci, chart in enumerate(charts):
+            if state["ops"] >= config.organic_region_max_ops:
+                break
+            cadopted, cdetail = try_one(chart, f"chart {ci + 1}/{len(charts)}")
+            cdetail["chart_index"] = ci
+            chart_detail.append(cdetail)
+            if cadopted:
+                chart_built += 1
+        summary = {
+            "region_facets": region.size,
+            "reason": detail.get("reason"),
+            "charts_total": len(charts),
+            "charts_built": chart_built,
+            "chart_detail": chart_detail,
+            "adopted": chart_built > 0,
+        }
+        details.append(summary)
+        if chart_built:
+            built += 1
+            progress(f"  organic region reconstructed via {chart_built}/"
+                     f"{len(charts)} charts")
+    return state["solid"], detected, built, details
 
 
 def build_reconstructed_solid(

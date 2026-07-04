@@ -608,3 +608,124 @@ sphere) and the target corpus (`low_poly_cat`, `3x1 Tweezer Mount`):
   region defeats the fillers so it declines and keeps its faceted output. All
   three outcomes are non-regressing by the strict adoption gate (watertight +
   RTAF-improvement + bbox-stable + deviation + STEP re-read).
+
+### Candidate A implementation notes (region-level; `organic_region_patches`)
+
+The whole-body tier above only fires on a body that is organic *in its entirety*
+(it needs a closed-manifold cage). Real engineering parts are analytic with ONE
+(or a few) large residual organic region(s) — the `port_cover` cast top (RTAF
+0.236, ~1,625-face chain), the tweezer shell (0.818), the patton pad curved
+residual (0.807) — that neither the analytic tiers, nor the freeform *height-field*
+sheet (Candidate B, which needs an injective projection the raw noisy mesh can
+fit), nor whole-body remeshing (the whole part isn't a closed organic body) can
+claim. This milestone adds a **region-level** pass (`segmentation.segment_organic_
+regions` → `organic_region.py` → `builder._apply_organic_regions`, wired into both
+the sew and boolean-clean tiers after their freeform pass):
+
+  1. grow connected **single-sided** smooth residual regions from the reliable-
+     analytic residual (a same-side flood so a thin cast wall's top+bottom don't
+     merge into a non-reconstructable two-sided region);
+  2. per region, quad-remesh the OPEN submesh (pynanoinstantmeshes handles open
+     meshes — it preserves the boundary loop, verified), **subdivide first then
+     least-squares fit the dense Catmull-Clark cage's LIMIT to the region facets**
+     (fitting the coarse cage then subdividing lets the open boundary re-extrapolate
+     and balloon — subdivide-first keeps it hugging, 8 mm → <1 mm on port_cover
+     regions). The limit cloud is a smooth, dense, noise-free sample of the surface;
+  3. project the limit cloud onto the region's mean-normal (u,v) plane, grid it by
+     **smooth (linear) interpolation** — a nearest-node fill dips the surface below
+     the region and fragments the base in the boolean; linear interpolation of the
+     clean limit cloud gives one single-valued surface — oversized ~15 % past the
+     footprint so the CUT trims the overshoot against the surrounding walls;
+  4. fit ONE `Part.BSplineSurface` through the grid (one surface, not a 5,000-patch
+     network — the extruded boolean tool stays a single prism, so the CUT is as fast
+     as the proven freeform-sheet op) and integrate by the identical guarded
+     extrude+cut boolean (`organic_region.boolean_clean_region` mirrors
+     `builder._boolean_clean_freeform`), RTAF/bbox-gated with strict rollback.
+
+  **Guards that make it safe:** foldover gate (only *injective* regions, so the
+  single-surface projection + extrude tool don't self-intersect); a **folded-surface
+  guard** (reject a fit whose area >> its (u,v) footprint — a fold — BEFORE any
+  boolean); a tool self-intersection/collapse check before the cut; the per-op
+  deviation gate (max(abs, rel·edge, 2 %·region-diag)); and `_try_boolean_step` +
+  the RTAF-improvement gate. A region that fails any of these keeps its faceted
+  output.
+
+- **VERIFIED, works:** on a genuinely injective doubly-curved region (a Gaussian
+  bump; and the synthetic gentle-cap unit fixtures) the CC-limit sampler + single-
+  B-spline fit lands **≤0.11 mm** on the mesh and the extrude+cut boolean plants the
+  smooth B-spline face into **one valid solid in ~0.1 s** — this is the core
+  primitive, covered by a FreeCAD+remesher integration test.
+- **Honest negative on the three real targets.** With every guard in place the pass
+  DETECTS the residual region(s) on all three (`port_cover` 4, `patton_pad` 3,
+  `tweezer` 1) and **declines every one**: their residuals are thin, wrapping cast
+  shells whose mean-normal projection *folds* (surface area 13–300× the (u,v)
+  footprint) or squashes to a near-degenerate footprint — exactly the non-height-
+  field geometry that already defeated the analytic tiers, the freeform sheet, AND
+  whole-body remeshing (this is why they were the remaining frontier). So RTAF is
+  unchanged on the three targets: `port_cover` 0.236, `tweezer` 0.818, `patton_pad`
+  0.837 — no improvement, but **no regression**. A 10-part stability A/B sweep
+  (analytic + curved + gears + multibody) is byte-outcome-identical with the pass ON
+  vs OFF (0 regressions). The pass is the correct, safe *scaffold*; closing these
+  specific wrapping-cast regions needs a **multi-chart** parametrization (split the
+  region into injective sub-charts, or an intrinsic cage-(u,v) rather than a single
+  spatial projection) so the residual no longer has to be one height field — the
+  natural next milestone, on top of this infrastructure.
+
+### Multi-chart parametrization (region-level; `organic_region_multichart`)
+
+Built on top of the region pass above: when `build_region_surface` declines a
+detected wrapping region as *folded* (its single mean-normal projection is not
+injective), `organic_region.region_charts` splits the region into connected
+**single-sided charts** and the builder reconstructs + cuts in each chart
+sequentially through the *same* guarded extrude+cut boolean (each chart is its own
+`OrganicRegion`, so no new integration surface). Charts are grown by a
+**seed-anchored normal-cone**: a facet joins a chart only while its normal is within
+`organic_region_chart_half_angle` (~50 deg) of BOTH the chart's running-mean axis AND
+the fixed seed normal. The seed-anchor is load-bearing — a pure mean-axis cone floods
+a shell that wraps around an axis (a sphere's equatorial band) into one annular chart
+that is *not* a height field; anchoring to the seed bounds each chart to a compact
+geodesic cap that DOES project single-valued. Every chart still passes through the
+fold guard, deviation gate, `_try_boolean_step`, and the RTAF-improvement gate, so a
+chart that doesn't validly de-facet reverts (never regress).
+
+- **VERIFIED, the mechanism works (covered by an end-to-end test).** On a deep
+  spherical cap (theta up to ~150 deg, normals fanning past a hemisphere)
+  `build_region_surface` on the whole region correctly declines (fold guard),
+  `region_charts` splits it into ~6 seed-anchored caps, and 3+ of them each
+  reconstruct into a valid sub-mm B-spline surface — geometry the single-surface
+  pass cannot claim. A 10-part stability A/B sweep (multichart ON vs OFF: sharpie /
+  drive_bay / USB / rack_mount / gear / hexwall / plate / freeform_bump, + the
+  analytic corpus) is **byte-outcome identical** (0 regressions): the pass only fires
+  on fold-declined wrapping regions, which none of those have.
+- **Honest negative on the three real targets — each blocked by a DIFFERENT
+  structural issue, none of which chart-count fixes:**
+  - **`port_cover`** never closes into a valid solid (its reconstructed shell is
+    open — `is_solid=False`), so the region/chart pass (which cuts a tool *from a
+    solid*) cannot run on it at all. This is a base-closure regression upstream of
+    the organic tier, not a parametrization problem — the multi-chart machinery is
+    ready the moment the base closes.
+  - **`tweezer`** IS a valid solid and its residual is detected + declined as folded,
+    but the residual is a **multiply-connected thin wrapping shell** (measured: genus
+    0 with **7 interior holes**, 8 boundary loops). The open Catmull-Clark limit-fit
+    of a thin holed strip *balloons* at every decomposition granularity measured —
+    spatial projection, seed-anchored normal-cone charts (down to 25 deg half-angle),
+    and spatial N×N tiling (up to N=4) all leave >=90% of tiles folding, and an
+    LSCM (libigl) intrinsic parametrization, while topologically clean (0.1% flipped
+    tris), maps a uniform grid so non-uniformly that the fitted surface still
+    balloons ~200x. The thin-holed-shell limit-fit is the true blocker, not the
+    projection choice.
+  - **`patton_pad`** is a genuinely **whole-body organic** part (213k facets, one
+    smooth component spanning the full sphere); RTAF comes back `null` (no single
+    residual solid to score), so the region pass has no gate to key off and does not
+    engage. This is the whole-body organic tier's domain, not the region tier's.
+- **Deferral / next step:** the chart *decomposition + sequential-boolean
+  infrastructure* is correct, safe, and non-regressing, and it de-facets cooperative
+  wrapping shells (the synthetic cap). Claiming the three real targets additionally
+  needs, respectively: (a) a base-closure fix so `port_cover` yields a solid; (b) a
+  thin-shell-robust chart fitter (the open-boundary limit-fit must stop ballooning on
+  narrow holed strips — a boundary-pinned or intrinsic-grid fit, not the current free
+  open-boundary shrink-wrap); and (c) routing genuinely whole-body organic parts
+  (`patton_pad`) to the whole-body tier rather than the region tier. Config:
+  `organic_region_multichart` (flag), `organic_region_chart_half_angle`,
+  `organic_region_chart_min_facets/min_area/min_area_frac`, `organic_region_chart_max`,
+  `organic_region_multichart_min_foldover/min_facets`.

@@ -150,6 +150,115 @@ def test_bump_region_is_injective_and_detected():
 
 
 # --------------------------------------------------------------------------- #
+# Multi-chart decomposition (pure numpy — no FreeCAD / remesher)
+# --------------------------------------------------------------------------- #
+
+
+def _full_hemisphere(n_theta: int = 40, n_phi: int = 64, R: float = 20.0,
+                     max_theta_frac: float = 0.95):
+    """A deep spherical cap that wraps far past 90 deg (theta up to ~171 deg by
+    default) — the WRAPPING shell class the multi-chart pass must decompose: its
+    facet normals span most of a sphere, so no single projection is injective."""
+    verts: list[list[float]] = []
+    idx: dict[tuple[int, int], int] = {}
+    for i in range(n_theta):
+        theta = (np.pi * max_theta_frac) * i / (n_theta - 1)
+        for j in range(n_phi):
+            phi = 2 * np.pi * j / n_phi
+            idx[(i, j)] = len(verts)
+            verts.append([R * np.sin(theta) * np.cos(phi),
+                          R * np.sin(theta) * np.sin(phi),
+                          R * np.cos(theta)])
+    faces: list[list[int]] = []
+    for i in range(n_theta - 1):
+        for j in range(n_phi):
+            a = idx[(i, j)]
+            b = idx[(i, (j + 1) % n_phi)]
+            c = idx[(i + 1, (j + 1) % n_phi)]
+            d = idx[(i + 1, j)]
+            faces.append([a, b, c])
+            faces.append([a, c, d])
+    return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int64)
+
+
+def test_wrapping_region_splits_into_injective_charts():
+    """A deep, wrapping cap (normals spanning most of a sphere) decomposes into
+    several connected single-sided charts, and EACH chart is injective — every one
+    of its facet normals sits within the half-angle cone about the chart axis, so
+    the single-surface region builder can reconstruct it."""
+    from mesh2step import organic_region as oreg
+    from mesh2step.segmentation import (
+        OrganicRegion,
+        face_normals_and_areas,
+    )
+
+    v, f = _full_hemisphere()
+    cfg = ConversionConfig()
+    normals, _ = face_normals_and_areas(v, f)
+    region = OrganicRegion(face_indices=list(range(len(f))),
+                           axis=np.array([0.0, 0.0, 1.0]), area=5.0e3, foldover=0.5)
+    charts = oreg.region_charts(v, f, region, cfg)
+    assert len(charts) >= 2, "a wrapping cap must split into multiple charts"
+    cos_half = float(np.cos(np.radians(cfg.organic_region_chart_half_angle)))
+    for ch in charts:
+        fa = np.array(ch.face_indices, dtype=int)
+        dots = normals[fa] @ (ch.axis / np.linalg.norm(ch.axis))
+        # Injective: every facet in a chart lies within the half-angle cone about
+        # its axis (allow a hair of numerical slack from the axis refresh).
+        assert dots.min() >= cos_half - 0.02, (
+            f"chart not single-sided: min n.axis {dots.min():.3f} < {cos_half:.3f}")
+        assert ch.size >= cfg.organic_region_chart_min_facets
+
+
+def test_wrapping_charts_cover_most_of_the_region():
+    """The charts of a wrapping cap together cover the bulk of the region's facets
+    (the decomposition is not throwing most of the shell away)."""
+    from mesh2step import organic_region as oreg
+    from mesh2step.segmentation import OrganicRegion
+
+    v, f = _full_hemisphere()
+    cfg = ConversionConfig()
+    region = OrganicRegion(face_indices=list(range(len(f))),
+                           axis=np.array([0.0, 0.0, 1.0]), area=5.0e3, foldover=0.5)
+    charts = oreg.region_charts(v, f, region, cfg)
+    covered = set()
+    for ch in charts:
+        covered.update(ch.face_indices)
+    assert len(covered) >= 0.6 * len(f), (
+        f"charts cover only {len(covered)}/{len(f)} facets")
+
+
+def test_injective_cap_is_one_chart():
+    """A cap that fits comfortably inside one half-angle cone does not fragment — it
+    is a single chart spanning essentially the whole region (no spurious
+    over-splitting; the seed-anchored gate only cuts when the shell exceeds the
+    cone)."""
+    from mesh2step import organic_region as oreg
+    from mesh2step.segmentation import OrganicRegion
+
+    # theta up to ~40 deg -> well inside the ~50 deg chart half-angle cone.
+    v, f = _dome_cap(max_theta_frac=0.22)
+    cfg = ConversionConfig()
+    region = OrganicRegion(face_indices=list(range(len(f))),
+                           axis=np.array([0.0, 0.0, 1.0]), area=2.0e3, foldover=0.0)
+    charts = oreg.region_charts(v, f, region, cfg)
+    assert len(charts) == 1
+    assert charts[0].size >= 0.9 * len(f)
+
+
+def test_small_region_yields_no_charts():
+    """A region below the multi-chart facet floor produces no charts (left faceted)."""
+    from mesh2step import organic_region as oreg
+    from mesh2step.segmentation import OrganicRegion
+
+    v, f = _dome_cap(n_theta=8, n_phi=10)  # ~140 facets
+    cfg = ConversionConfig()
+    region = OrganicRegion(face_indices=list(range(len(f))),
+                           axis=np.array([0.0, 0.0, 1.0]), area=50.0, foldover=0.0)
+    assert oreg.region_charts(v, f, region, cfg) == []
+
+
+# --------------------------------------------------------------------------- #
 # Reconstruction + boolean integration (FreeCAD + remesher required)
 # --------------------------------------------------------------------------- #
 
@@ -185,6 +294,65 @@ def test_region_surface_reconstructs_injective_bump_and_cuts_clean():
     assert len(solids) == 1 and solids[0].isValid()
     n_after = sum(1 for fc in result.Faces if "BSpline" in fc.Surface.TypeId)
     assert n_after > n_before, "cut must plant the B-spline face"
+
+
+@pytest.mark.skipif(not (HAVE_FREECAD and HAVE_PNIM),
+                    reason="FreeCAD + pynanoinstantmeshes required")
+def test_wrapping_cap_declines_as_one_surface_but_charts_build():
+    """The multi-chart mechanism, end to end on a decomposable wrapping shell:
+    a DEEP spherical cap (theta up to ~150 deg, normals fanning past a hemisphere)
+    has NO single injective projection, so :func:`build_region_surface` on the whole
+    region declines (its fold guard fires) — but :func:`region_charts` splits it into
+    injective normal-cone charts and MULTIPLE charts reconstruct into valid B-spline
+    surfaces. This is the proof that the chart decomposition claims geometry the
+    single-surface pass cannot."""
+    import Part  # type: ignore
+
+    from mesh2step import organic_region as oreg
+    from mesh2step.segmentation import OrganicRegion
+
+    # theta up to ~150 deg -> the (u,v) projection genuinely folds.
+    n_theta, n_phi, R = 34, 60, 20.0
+    verts, idx = [], {}
+    for i in range(n_theta):
+        theta = (np.pi * 0.83) * i / (n_theta - 1)
+        for j in range(n_phi):
+            phi = 2 * np.pi * j / n_phi
+            idx[(i, j)] = len(verts)
+            verts.append([R * np.sin(theta) * np.cos(phi),
+                          R * np.sin(theta) * np.sin(phi),
+                          R * np.cos(theta)])
+    faces = []
+    for i in range(n_theta - 1):
+        for j in range(n_phi):
+            a = idx[(i, j)]
+            b = idx[(i, (j + 1) % n_phi)]
+            c = idx[(i + 1, (j + 1) % n_phi)]
+            d = idx[(i + 1, j)]
+            faces.append([a, b, c])
+            faces.append([a, c, d])
+    v = np.asarray(verts, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    cfg = ConversionConfig()
+    region = OrganicRegion(face_indices=list(range(len(f))),
+                           axis=np.array([0.0, 0.0, 1.0]),
+                           area=float(2 * np.pi * R * R), foldover=0.2)
+
+    # One surface over the whole wrapping cap folds -> declined.
+    whole, wdet = oreg.build_region_surface(v, f, region, cfg, Part)
+    assert whole is None
+    assert "fold" in (wdet.get("reason") or "").lower()
+
+    # Charts: several injective pieces; multiple reconstruct into a valid surface.
+    charts = oreg.region_charts(v, f, region, cfg)
+    assert len(charts) >= 2, f"cap should split into charts, got {len(charts)}"
+    built = 0
+    for ch in charts:
+        surf, _det = oreg.build_region_surface(v, f, ch, cfg, Part)
+        if surf is not None:
+            built += 1
+    assert built >= 2, (
+        f"at least two charts must reconstruct into a valid surface (got {built})")
 
 
 @pytest.mark.skipif(not (HAVE_FREECAD and HAVE_PNIM),

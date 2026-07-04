@@ -45,7 +45,152 @@ from .catmull_clark import (
 )
 from .config import ConversionConfig
 from .quadremesh import quad_remesh
-from .segmentation import _axis_basis
+from .segmentation import (
+    OrganicRegion,
+    _axis_basis,
+    build_edge_adjacency,
+    face_normals_and_areas,
+)
+
+
+def region_charts(vertices, faces, region, config: ConversionConfig):
+    """Split a folded/wrapping organic region into injective sub-charts.
+
+    A thin wrapping cast shell (the ``port_cover`` cast top, the tweezer shell, the
+    ``patton_pad`` residual) has no single injective projection: its facet normals
+    span far more than a hemisphere, so a single mean-normal (u,v) grid folds (its
+    fitted surface area is many times its footprint) and the extrude tool
+    self-intersects — exactly what :func:`build_region_surface` rejects with its fold
+    guard. This decomposes the region into connected **single-sided** charts, each of
+    which IS individually parametrizable: the growth fixes a chart axis from its seed
+    facet's normal and admits a connected neighbour only while its normal stays within
+    ``organic_region_chart_half_angle`` degrees of that axis (refreshed to the chart's
+    running area-weighted mean). The half-angle gate is the injectivity ("stop at the
+    fold") criterion — the direct multi-chart generalisation of the region pass's
+    single-projection foldover gate. Each chart is returned as its own
+    :class:`OrganicRegion` (``axis`` = chart mean normal) so the existing
+    :func:`build_region_surface` + :func:`boolean_clean_region` reconstruct and cut it
+    with no further special-casing.
+
+    Facets are consumed largest-normal-cluster first (biggest chart = biggest RTAF
+    win), and a chart is emitted only if it is large enough to reconstruct
+    (``organic_region_chart_min_facets`` / a fraction of the region's area). Leftover
+    facets too small or too curved for any chart are left faceted (never regress).
+    Pure numpy; returns ``[]`` when the region does not usefully decompose."""
+    fa_all = np.asarray(region.face_indices, dtype=int)
+    if len(fa_all) < config.organic_region_chart_min_facets:
+        return []
+    normals, areas = face_normals_and_areas(vertices, faces)
+
+    # Adjacency restricted to the region's own facets (charts must be connected
+    # patches of the region, not leak into claimed/other geometry).
+    region_set = set(int(x) for x in fa_all)
+    adjacency = build_edge_adjacency(faces)
+    nbr: dict[int, list[int]] = {int(x): [] for x in fa_all}
+    for incident in adjacency.values():
+        if len(incident) == 2:
+            a, b = int(incident[0]), int(incident[1])
+            if a in region_set and b in region_set:
+                nbr[a].append(b)
+                nbr[b].append(a)
+
+    cos_half = float(np.cos(np.radians(config.organic_region_chart_half_angle)))
+    region_area = float(areas[fa_all].sum())
+    min_facets = int(config.organic_region_chart_min_facets)
+    min_area = max(config.organic_region_chart_min_area,
+                   config.organic_region_chart_min_area_frac * region_area)
+
+    seed_normal_ref = {"n": None}
+
+    def grow(seed: int, axis0: np.ndarray, taken: set[int]) -> list[int]:
+        """Flood single-sided from ``seed``: admit a connected region facet only
+        while its normal stays within the half-angle cone about ``axis0`` AND within
+        that cone of the SEED's own normal. The second (seed-anchored) gate is what
+        keeps each chart a COMPACT geodesic patch instead of an annular ring: on a
+        shell that wraps around an axis (a sphere's equatorial band, a pipe), a
+        pure-mean-axis cone would flood the whole ring — one connected chart that is
+        not a height field. Anchoring to the fixed seed normal bounds the chart's
+        angular extent to the half-angle, so every chart is a bounded cap that DOES
+        project single-valued."""
+        sn = seed_normal_ref["n"]
+        comp = [seed]
+        local = {seed}
+        stack = [seed]
+        while stack:
+            x = stack.pop()
+            for y in nbr[x]:
+                if y in local or y in taken:
+                    continue
+                if float(normals[y] @ axis0) < cos_half:
+                    continue
+                if sn is not None and float(normals[y] @ sn) < cos_half:
+                    continue
+                local.add(y)
+                comp.append(y)
+                stack.append(y)
+        return comp
+
+    # Seed each chart from the most CENTRAL unused facet — the one whose normal is
+    # closest to the mean normal of the still-unused facets. This grows the maximal
+    # single-sided cap first (a rim-facet seed would tilt the chart axis and clip
+    # the far side), then the leftover ring re-centres on its own mean and forms the
+    # next chart. Recomputing the seed dynamically keeps every chart maximal.
+    region_axis = np.asarray(region.axis, dtype=float)
+    region_axis = region_axis / (np.linalg.norm(region_axis) or 1.0)
+    taken: set[int] = set()
+    charts: list[OrganicRegion] = []
+
+    def next_seed() -> int | None:
+        rest = [int(x) for x in fa_all if int(x) not in taken]
+        if not rest:
+            return None
+        ra = np.array(rest, dtype=int)
+        mn = (normals[ra] * areas[ra][:, None]).sum(axis=0)
+        nn = float(np.linalg.norm(mn))
+        centre = (mn / nn) if nn > 1e-6 else region_axis
+        # Most-aligned facet with the unused-set mean normal (ties: larger area).
+        aligned = normals[ra] @ centre
+        best = int(ra[int(np.lexsort((areas[ra], aligned))[-1])])
+        return best
+
+    while True:
+        seed = next_seed()
+        if seed is None:
+            break
+        axis = normals[seed].astype(float).copy()
+        seed_normal_ref["n"] = axis.copy()
+        comp = grow(seed, axis, taken)
+        # Refresh the axis to the chart's area-weighted mean normal and re-grow
+        # once so a tilted seed facet doesn't clip one edge of the chart.
+        fa0 = np.array(comp, dtype=int)
+        mn0 = (normals[fa0] * areas[fa0][:, None]).sum(axis=0)
+        nmn = float(np.linalg.norm(mn0))
+        if nmn > 1e-6:
+            new_axis = mn0 / nmn
+            if float(new_axis @ axis) < 0.9995:
+                axis = new_axis
+                comp = grow(seed, axis, taken)
+        for c in comp:
+            taken.add(c)
+        fa = np.array(comp, dtype=int)
+        ar = areas[fa]
+        tot = float(ar.sum())
+        if len(fa) < min_facets or tot < min_area:
+            continue
+        mn = (normals[fa] * ar[:, None]).sum(axis=0)
+        na = float(np.linalg.norm(mn))
+        if na < 1e-6:
+            continue
+        axis = mn / na
+        dots = normals[fa] @ axis
+        fold = float(ar[dots < -0.05].sum()) / tot if tot > 0 else 1.0
+        charts.append(OrganicRegion(
+            face_indices=sorted(int(i) for i in comp),
+            axis=axis, area=tot, foldover=fold))
+        if len(charts) >= config.organic_region_chart_max:
+            break
+    charts.sort(key=lambda c: -c.area)
+    return charts
 
 
 def _region_submesh(vertices, faces, face_indices):
