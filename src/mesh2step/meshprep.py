@@ -67,7 +67,7 @@ def has_self_intersections(vertices: np.ndarray, faces: np.ndarray) -> bool:
 
 
 def resolve_self_intersections(
-    vertices: np.ndarray, faces: np.ndarray
+    vertices: np.ndarray, faces: np.ndarray, on_progress=None
 ) -> tuple[np.ndarray, np.ndarray, dict] | None:
     """Rebuild a self-intersecting / overlapping-body mesh as one clean solid.
 
@@ -83,12 +83,22 @@ def resolve_self_intersections(
     the true outer surface, eliminating the interpenetrations while leaving all
     other geometry bit-identical — no voxelising, no rounded edges.
 
-    Returns ``(vertices, faces, report)`` on success, or None if manifold3d is
-    unavailable or the result looks degenerate (callers keep the original mesh).
+    Returns ``(vertices, faces, report)`` on success, or ``None`` on failure.
+    Failure is ambiguous by return value alone, so (P1-2) the *reason* is logged
+    via ``on_progress`` — an environment problem (manifold3d not installed / a
+    kernel crash) reads very differently from a geometric rejection (the union
+    moved the part, or produced an empty result), and diagnosing which no longer
+    requires re-running with instrumentation.
     """
+    def log(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
+
     try:
         import manifold3d as m3
     except ImportError:
+        log("  self-intersection resolve: SKIPPED — manifold3d not installed "
+            "(environment/provisioning issue, not a geometry problem)")
         return None
     try:
         mesh = m3.Mesh(vert_properties=vertices.astype(np.float32),
@@ -96,6 +106,8 @@ def resolve_self_intersections(
         mesh.merge()  # weld near-duplicate vertices so construction succeeds
         man = m3.Manifold(mesh)
         if man.is_empty():
+            log("  self-intersection resolve: REJECTED — manifold construction "
+                "produced an empty solid (mesh not a valid closed volume)")
             return None
         parts = man.decompose()
         if len(parts) > 1:
@@ -104,11 +116,16 @@ def resolve_self_intersections(
         v2 = np.array(out.vert_properties, dtype=np.float64)[:, :3]
         f2 = np.array(out.tri_verts, dtype=np.int64)
         if len(f2) == 0:
+            log("  self-intersection resolve: REJECTED — union produced an empty "
+                "mesh (0 faces)")
             return None
         # Sanity: the union must not have moved the part (bbox within 1%).
         ext_in = vertices.max(axis=0) - vertices.min(axis=0)
         ext_out = v2.max(axis=0) - v2.min(axis=0)
         if np.any(np.abs(ext_out - ext_in) > 0.01 * np.maximum(ext_in, 1.0)):
+            log(f"  self-intersection resolve: REJECTED — union moved the part's "
+                f"bounding box beyond 1% (in {ext_in.tolist()} vs "
+                f"out {ext_out.tolist()}); keeping original mesh")
             return None
         report = {
             "bodies": int(len(parts)),
@@ -116,7 +133,10 @@ def resolve_self_intersections(
             "faces_out": int(len(f2)),
         }
         return v2, f2, report
-    except Exception:  # noqa: BLE001 - resolution is best-effort
+    except Exception as exc:  # noqa: BLE001 - resolution is best-effort
+        log(f"  self-intersection resolve: FAILED — manifold3d raised "
+            f"{type(exc).__name__}: {exc} (kernel/runtime issue, not a geometry "
+            f"rejection)")
         return None
 
 

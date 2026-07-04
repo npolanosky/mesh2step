@@ -580,6 +580,15 @@ def _guarded_cut(solid, tool, max_removed_frac: float = 0.5):
         raise ValueError(
             f"swept lens cut rejected: would remove {removed:.2f} of the tool's "
             f"{tool.Volume:.2f} volume (mis-fitted profile)")
+    # Collapse guard: a local cut can only remove a bounded share of the tool, so
+    # it must never carve away most of the WHOLE part. A degenerate boolean can
+    # return a valid-but-tiny fragment (seen on gridfinity_base_lid: a cap op left
+    # a 6mm cube from a 210mm plate) whose small `removed` slips past the check
+    # above. Reject any cut that removes more than 30% of the solid's volume.
+    if removed > 0.30 * solid.Volume:
+        raise ValueError(
+            f"cut rejected: would remove {removed:.2f} of the part's "
+            f"{solid.Volume:.2f} volume (degenerate boolean / part collapse)")
     return cut
 
 
@@ -974,6 +983,15 @@ def build_reconstructed_solid(
     progress(f"Sewing {len(occ_faces):,} faces into a solid")
     shape, is_solid = _faces_to_solid(occ_faces, Part, config.sew_tolerance, on_progress)
 
+    # Snapshot the freshly-sewn solid BEFORE any boolean truing ops (P0-3): the
+    # ops below (swept lenses, sphere balls, freeform sheets) can leave a solid
+    # that passes isValid() in memory yet re-reads invalid from the exported STEP
+    # (the tweezer's sew-tier ball-fuse). If the post-op export round-trip fails,
+    # we revert to this known-good pre-op solid rather than shipping an invalid
+    # file — bringing the reconstructed tier to export-revalidation parity with
+    # the boolean tier's back-off ladder.
+    pre_ops_shape = shape.copy() if is_solid else None
+
     # Swept-wall lens ops (M4): on a closed, valid solid, replace each fitted
     # arc segment's chordal strip fan with the analytic surface via a boolean
     # cut/fuse. Every op reverts on invalidity, so this can only improve the
@@ -995,11 +1013,16 @@ def build_reconstructed_solid(
             solids = getattr(shape, "Solids", [])
             is_solid = bool(solids) and solids[0].isValid()
 
+    # Sphere ball ops carry the same bbox-growth guard as the boolean tier (P0-2):
+    # a mis-fit corner-blend ball that bulges past the silhouette (the tweezer's
+    # 3.7mm over-grow) is reverted here instead of shipping an off-dimension solid.
     sphere_ok = 0
     if is_solid and spheres:
+        bbox_guard = config.boolean_max_bbox_growth
         for sph in spheres:
             shape, ok = _try_boolean_step(
-                shape, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part))
+                shape, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part),
+                max_bbox_growth=bbox_guard)
             sphere_ok += ok
         if sphere_ok:
             progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
@@ -1019,6 +1042,34 @@ def build_reconstructed_solid(
             progress(f"  freeform sheets built {freeform_ok}/{freeform_ops}")
             solids = getattr(shape, "Solids", [])
             is_solid = bool(solids) and solids[0].isValid()
+
+    # Export round-trip re-validation with back-off (P0-3): if the truing ops
+    # produced a solid that re-reads invalid from an exported STEP, revert to the
+    # pre-op sewn solid (if it round-trips clean). This is the sew-tier analogue
+    # of the boolean tier's decimation back-off ladder — a boolean op that passes
+    # isValid() in memory but writes an invalid STEP (self-intersecting wires from
+    # a ball fuse) must not ship. Only runs when ops actually modified the solid.
+    export_revalidated = None
+    ops_applied = bool(swept_built or sphere_ok or freeform_ok)
+    if (is_solid and ops_applied and pre_ops_shape is not None
+            and config.revalidate_export):
+        if not _reread_valid(shape, Part, progress):
+            progress("  reconstructed solid re-reads INVALID after truing ops; "
+                     "reverting to pre-op sewn solid")
+            if _reread_valid(pre_ops_shape, Part, progress):
+                shape = pre_ops_shape
+                swept_ops = swept_built = sphere_ok = 0
+                freeform_ops = freeform_ok = 0
+                export_revalidated = True
+                solids = getattr(shape, "Solids", [])
+                is_solid = bool(solids) and solids[0].isValid()
+            else:
+                # Even the pre-op solid doesn't round-trip; keep the truing result
+                # (the pipeline's final revalidation will flag it) rather than
+                # trading it for an equally-invalid solid with worse RTAF.
+                export_revalidated = False
+        else:
+            export_revalidated = True
 
     stats = {
         "faces_in": int(len(faces)),
@@ -1051,6 +1102,8 @@ def build_reconstructed_solid(
         "skipped_facets": skipped,
         "is_solid": is_solid,
     }
+    if export_revalidated is not None:
+        stats["export_revalidated"] = export_revalidated
     return shape, stats
 
 
@@ -1194,6 +1247,60 @@ def _safe_remove_splitter(shape, Part):
         return shape
 
 
+def _shell_from_faces(occ_faces, Part, progress):
+    """Build a ``Part.Shell`` from a face list, flattening non-``Face`` entries.
+
+    The fast path is a single ``Part.Shell(occ_faces)``. But if any entry is a
+    ``Compound`` or ``Shell`` rather than a bare ``Face`` — one can leak from a
+    gap-fill patch whose ``removeSplitter`` merged its facets into a compound —
+    the bulk call throws ``TopoDS_UnCompatibleShapes`` (``TopoDS_Builder::Add``),
+    which previously aborted reconstruction entirely and dropped the whole part
+    to a fully-faceted fallback (double_4u: 3,262 faces, 0% analytic surfaces,
+    43% RTAF — P1-1). ``TopoDS_Builder::Add`` only accepts ``Face`` shapes, so
+    explode every entry into its constituent faces (a bare ``Face`` yields
+    itself); that keeps ALL the geometry — no drop-and-gap-fill needed — and the
+    shell builds cleanly. Genuinely unusable entries (null shapes, or ones with
+    no faces) are dropped and logged.
+    """
+    flat = []
+    exploded = 0
+    dropped = 0
+    for f in occ_faces:
+        try:
+            if f is None or f.isNull():
+                dropped += 1
+                continue
+            if f.ShapeType == "Face":
+                flat.append(f)
+                continue
+            member_faces = f.Faces  # Compound / Shell / Solid -> its faces
+            if member_faces:
+                flat.extend(member_faces)
+                exploded += 1
+            else:
+                dropped += 1
+        except Exception:  # noqa: BLE001 - a bad entry must not abort the shell
+            dropped += 1
+    if exploded or dropped:
+        progress(f"  shell: flattened {exploded} compound/shell entr(ies), "
+                 f"dropped {dropped} unusable; {len(flat)} faces")
+    try:
+        return Part.Shell(flat)
+    except Exception as exc:  # noqa: BLE001 - last-resort per-face isolation
+        progress(f"  shell build still hit {exc}; isolating face-by-face")
+        accepted = []
+        skipped = 0
+        for f in flat:
+            try:
+                Part.Shell(accepted + [f])
+                accepted.append(f)
+            except Exception:  # noqa: BLE001
+                skipped += 1
+        progress(f"  shell built from {len(accepted)}/{len(flat)} faces "
+                 f"({skipped} incompatible dropped)")
+        return Part.Shell(accepted)
+
+
 def _faces_to_solid(occ_faces, Part, tolerance: float = 1e-3, on_progress=None):
     """Sew faces into a (hopefully) closed solid. Returns ``(shape, is_solid)``.
 
@@ -1206,7 +1313,7 @@ def _faces_to_solid(occ_faces, Part, tolerance: float = 1e-3, on_progress=None):
         if on_progress is not None:
             on_progress(msg)
 
-    shell = Part.Shell(occ_faces)
+    shell = _shell_from_faces(occ_faces, Part, progress)
     sewn = shell.copy()
     try:
         progress("  sewShape...")
@@ -1468,6 +1575,15 @@ def _guarded_fuse(solid, tool, max_added_frac: float = 0.30):
         raise ValueError(
             f"boss fuse rejected: would add {added:.2f} of the tool's "
             f"{tool.Volume:.2f} volume (mis-detected boss)")
+    # Collapse guard: a fuse ADDS material, so the result can never be smaller
+    # than the input. A degenerate OCC fuse can return a valid-but-tiny solid
+    # (seen on gridfinity_base_lid: a cap fuse turned a 210mm plate into a 6mm
+    # cube, Vol 173576 -> 119, yet `added` was hugely NEGATIVE so the check above
+    # passed it). Reject any fuse that shrinks the part at all beyond FP noise.
+    if fused.Volume < solid.Volume * 0.999 - 1e-6:
+        raise ValueError(
+            f"boss fuse rejected: shrank the part from {solid.Volume:.2f} to "
+            f"{fused.Volume:.2f} (degenerate boolean / part collapse)")
     return fused
 
 
@@ -1621,6 +1737,31 @@ def _bbox_grew(before, after, rel_tol: float, abs_tol: float = 0.05) -> bool:
     return False
 
 
+# Fraction below which a boolean op's result bounding box (largest side) is
+# treated as a catastrophic collapse. A legitimate cut/fuse trues up a local
+# feature and can trim a boundary sliver, but never shrinks the part's overall
+# silhouette by a third. A degenerate OCC boolean can return a valid-but-tiny
+# fragment (gridfinity_base_lid: a cap fuse left a 6mm cube from a 210mm plate);
+# this catches that regardless of which op produced it or how the per-op
+# volume/added guards were configured. Deliberately loose so it only ever fires
+# on true collapse, never on a legitimate edge trim.
+_BBOX_COLLAPSE_FRAC = 0.5
+
+
+def _bbox_collapsed(before, after) -> bool:
+    """True if ``after``'s largest bbox side collapsed far below ``before``'s.
+
+    Complements ``_bbox_grew``: growth is a mis-fit feature, collapse is a
+    degenerate boolean returning a tiny valid fragment. Compares the LARGEST side
+    only, so a thin part whose small sides legitimately change is unaffected —
+    only a wholesale collapse of the dominant dimension trips it.
+    """
+    if not before or not after:
+        return False
+    b0, a0 = before[0], after[0]
+    return b0 > 1e-6 and a0 < _BBOX_COLLAPSE_FRAC * b0
+
+
 def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None):
     """Apply one boolean cleanup step; revert if it breaks solid validity.
 
@@ -1629,6 +1770,11 @@ def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None
     revert any op that enlarges the solid's bounding box beyond that relative
     fraction: a cut/fuse-back that grows the silhouette is a mis-detected feature
     (see _bbox_grew) and must not silently distort the part's dimensions.
+
+    Independently of ``max_bbox_growth``, ALWAYS revert an op whose result
+    collapses the bounding box (a degenerate OCC boolean returning a tiny valid
+    fragment — gridfinity_base_lid's 210mm→6mm sphere fuse). Collapse is never a
+    legitimate outcome, so this net applies to every op in both tiers.
     """
     try:
         candidate = fn(current_solid)
@@ -1637,6 +1783,11 @@ def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None
     solids = getattr(candidate, "Solids", [])
     if len(solids) != 1 or not solids[0].isValid():
         return current_solid, False
+    try:
+        if _bbox_collapsed(_bbox_dims(current_solid), _bbox_dims(candidate)):
+            return current_solid, False
+    except Exception:  # noqa: BLE001 - bbox read must not break the step
+        pass
     if max_bbox_growth is not None:
         try:
             if _bbox_grew(_bbox_dims(current_solid), _bbox_dims(candidate),
@@ -1763,7 +1914,7 @@ def build_boolean_clean_solid(
         progress("  still invalid; resolving self-intersections (boolean union)")
         from .meshprep import resolve_self_intersections
 
-        resolved = resolve_self_intersections(vertices, faces)
+        resolved = resolve_self_intersections(vertices, faces, on_progress=progress)
         if resolved is not None:
             rv, rf, rep = resolved
             candidate = build_faceted_solid(rv, rf)
@@ -2202,3 +2353,34 @@ def revalidate_step(out_path: str | Path, expected_solids: int | None = None) ->
         return info
     info["valid"] = True
     return info
+
+
+def _reread_valid(shape, Part, progress=None) -> bool:
+    """Write ``shape`` to a temp STEP and confirm it re-reads as a valid solid.
+
+    Used by the reconstructed tier's export back-off (P0-3): some boolean-op
+    defects pass ``isValid()`` in memory but re-read invalid from a written STEP.
+    Best-effort — a write/read error is treated as "not valid" so the caller
+    backs off conservatively. Never raises.
+    """
+    import tempfile
+
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".step", delete=False) as fh:
+            tmp = fh.name
+        shape.exportStep(tmp)
+        reread = Part.Shape()
+        reread.read(tmp)
+        solids = getattr(reread, "Solids", [])
+        return bool(solids) and solids[0].isValid()
+    except Exception as exc:  # noqa: BLE001
+        if progress is not None:
+            progress(f"  re-read check failed ({exc}); treating as invalid")
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                Path(tmp).unlink()
+            except OSError:
+                pass

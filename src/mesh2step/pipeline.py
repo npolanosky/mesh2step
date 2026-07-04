@@ -220,7 +220,8 @@ def convert(
         # its panel, tabs interpenetrating a base) can never form a valid base.
         if meshprep.has_self_intersections(bverts, bfaces):
             progress("Base mesh self-intersects; unioning overlapping bodies (manifold)")
-            resolved = meshprep.resolve_self_intersections(bverts, bfaces)
+            resolved = meshprep.resolve_self_intersections(
+                bverts, bfaces, on_progress=progress)
             if resolved is not None:
                 bverts, bfaces, resolve_report = resolved
                 stats["self_intersection_resolve"] = resolve_report
@@ -355,6 +356,56 @@ def convert(
         else:
             stats.setdefault("warnings_extra", []).append(
                 "Fully-closed fallback could not produce a watertight solid.")
+
+    # Hard bounding-box ceiling gate (P0-1): a tier can ship a watertight, valid-
+    # on-reread solid whose dimensions are catastrophically wrong (a degenerate
+    # boolean collapsing a plate to a cube). The per-op guards catch this at the
+    # source, but this is the last-line net: if the adopted output's bbox differs
+    # from the input mesh by more than the ceiling on any axis, REJECT that tier's
+    # result and fall back to a dimensionally-faithful watertight faceted solid.
+    if config.bbox_reject_delta is not None and _is_solid(shape):
+        delta = _bbox_delta(shape, input_dims)
+        if delta is not None and delta > config.bbox_reject_delta:
+            progress(f"Bounding-box GATE: output differs from input by "
+                     f"{delta * 100:.1f}% (> {config.bbox_reject_delta * 100:.0f}% "
+                     f"ceiling) — REJECTING the '{method}' result as dimensionally "
+                     f"destroyed; falling back to a watertight faceted solid")
+            stats["bbox_gate_rejected"] = {
+                "rejected_method": method,
+                "delta_pct": round(delta * 100, 2),
+                "ceiling_pct": round(config.bbox_reject_delta * 100, 2),
+            }
+            gverts, gfaces = load_stl(input_path, weld_tol=config.weld_tol)
+            if scale != 1.0:
+                gverts = gverts * scale
+            gshape = builder.build_faceted_solid(gverts, gfaces)
+            # A self-intersecting mesh (base_lid) won't form a valid faceted solid
+            # directly; resolve overlapping bodies first (same path the boolean
+            # tier uses) so the fallback actually produces a watertight solid.
+            if not _is_solid(gshape):
+                from . import meshprep as _mp
+
+                if _mp.has_self_intersections(gverts, gfaces):
+                    resolved = _mp.resolve_self_intersections(
+                        gverts, gfaces, on_progress=progress)
+                    if resolved is not None:
+                        rv, rf, _ = resolved
+                        gshape = builder.build_faceted_solid(rv, rf)
+            if _is_solid(gshape):
+                gdelta = _bbox_delta(gshape, input_dims)
+                if gdelta is None or gdelta <= config.bbox_reject_delta:
+                    shape, method = gshape, "faceted-closed"
+                    clean_shape, dual, boolean_exported = None, False, False
+                    stats["bbox_gate_fallback"] = "faceted-closed"
+                else:
+                    # The faithful fallback should always be dimensionally sane;
+                    # if even it is off, keep it (it is at worst the raw mesh) but
+                    # record that the gate could not recover a clean result.
+                    shape, method = gshape, "faceted-closed"
+                    clean_shape, dual, boolean_exported = None, False, False
+                    stats["bbox_gate_fallback"] = "faceted-closed (still off-dimension)"
+            else:
+                stats["bbox_gate_fallback"] = "failed (no watertight faceted solid)"
 
     _assess_quality(shape, input_dims, method, stats, config, builder)
 
@@ -522,6 +573,22 @@ def _is_solid(shape) -> bool:
     """True if the shape is a single valid (watertight) solid."""
     solids = getattr(shape, "Solids", [])
     return bool(solids) and solids[0].isValid()
+
+
+def _bbox_delta(shape, input_dims) -> float | None:
+    """Max relative bbox difference (any axis) between ``shape`` and the input.
+
+    ``input_dims`` is the sorted (desc) input mesh side lengths. Returns the
+    largest per-axis relative delta, or ``None`` if the box can't be read. Shared
+    by the hard bbox-ceiling gate and mirrors the metric ``_assess_quality``
+    reports, so the gate fires on exactly the number the user sees.
+    """
+    try:
+        bb = shape.BoundBox
+        out_dims = sorted([bb.XLength, bb.YLength, bb.ZLength], reverse=True)
+        return max((abs(o - i) / i) for o, i in zip(out_dims, input_dims) if i > 1e-9)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _bbox_stable(before, after, config: ConversionConfig, rel: float = 0.03) -> bool:

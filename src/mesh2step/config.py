@@ -111,6 +111,20 @@ class ConversionConfig:
     # (the feature is left faceted). None disables the guard.
     boolean_max_bbox_growth: float | None = 0.02
 
+    # Hard bounding-box distortion ceiling (fraction). A boolean/reconstruction
+    # tier can silently ship a watertight, valid-on-reread solid whose dimensions
+    # are catastrophically wrong (gridfinity_base_lid: a degenerate sphere fuse
+    # collapsed a 210x126x12mm plate to a 6mm cube — 97% off — yet it passed every
+    # validity gate). The per-op guards catch this at the source, but this is the
+    # last-line safety net: if the adopted tier's output bbox differs from the
+    # input mesh by MORE than this fraction on any axis, that tier's result is
+    # REJECTED (never shipped), the pipeline falls back to a watertight faceted
+    # solid (dimensionally faithful by construction), and the quality verdict is
+    # forced to "problems" with a loud error. 0.25 (25%) sits well above the
+    # corpus's worst legitimate drift (~16% on the carabiner) yet far below any
+    # real collapse. None disables the gate.
+    bbox_reject_delta: float | None = 0.25
+
     # Post-export re-validation. After writing the STEP, re-read it and confirm
     # the solid still loads, is valid, is closed, and the solid count matches the
     # in-memory result. Some defects (self-intersecting wires from sliver
