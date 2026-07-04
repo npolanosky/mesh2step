@@ -165,7 +165,8 @@ select {
 .badge.b-warn { background: #fef3c7; color: #92400e; border-color: #fde68a; }
 .badge.b-err { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
 
-.result-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.result-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+.dl-links { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ---- log ---- */
 .log-card summary { cursor: pointer; font-weight: 600; }
@@ -245,11 +246,12 @@ td.wrap { white-space: normal; max-width: 320px; }
 .tag.queued { background: #f1f5f9; color: #475569; }
 .tag.cancelled { background: #f3f4f6; color: #6b7280; }
 
-/* history row action buttons */
-.row-actions { display: flex; gap: 6px; }
+/* history row action buttons (also used as <a> download links) */
+.row-actions { display: flex; gap: 6px; align-items: center; }
 .btn-mini {
   border: 1px solid var(--border); background: #fff; color: var(--text);
   border-radius: 6px; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+  text-decoration: none; display: inline-block; line-height: 1.4;
 }
 .btn-mini:hover { background: #f3f4f6; }
 .btn-mini.stop { border-color: #fecaca; background: #fef2f2; color: #b91c1c; }

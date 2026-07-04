@@ -362,11 +362,21 @@
 
     for (const w of (s.warnings || [])) appendLog("⚠ " + w, "l-err");
 
-    // Result actions.
+    // Result actions: one download link PER output (dual-output jobs offer
+    // both files), every href keyed by this job's id — never in-memory state.
     $("result-actions").hidden = false;
-    const dl = $("download-btn");
-    dl.href = "/api/jobs/" + job.id + "/download";
-    dl.setAttribute("download", job.outputs[0] || "output.step");
+    const dlc = $("download-links");
+    dlc.innerHTML = "";
+    const outs = job.outputs && job.outputs.length ? job.outputs : [];
+    outs.forEach((name) => {
+      const a = document.createElement("a");
+      a.className = "btn-secondary";
+      a.href = "/api/jobs/" + job.id + "/download?name=" + encodeURIComponent(name);
+      a.setAttribute("download", name);
+      a.textContent = outs.length > 1 ? "Download " + name : "Download STEP";
+      a.title = name;
+      dlc.appendChild(a);
+    });
     $("flag-btn").disabled = !s.is_solid;
     $("flag-btn").onclick = () => {
       $("flag-btn").disabled = true;
@@ -485,6 +495,18 @@
         if (j.state === "running") actions += "<button class='btn-mini open' data-open='" + j.id + "'>Open</button>";
         actions += "<button class='btn-mini stop' data-stop='" + j.id + "'>Stop</button>";
       } else {
+        // Terminal jobs (done/failed/cancelled): Open loads the full result
+        // (verdict, badges, viewer tabs, downloads) into the convert page —
+        // everything is keyed by this row's job id, not any "current" job.
+        actions += "<button class='btn-mini open' data-open='" + j.id + "'>Open</button>";
+        if (j.state === "done") {
+          const outs = j.outputs || [];
+          outs.forEach((name) => {
+            actions += "<a class='btn-mini' href='/api/jobs/" + j.id +
+              "/download?name=" + encodeURIComponent(name) + "' download='" + esc(name) +
+              "' title='" + esc(name) + "'>⤓" + (outs.length > 1 ? " " + esc(name) : "") + "</a>";
+          });
+        }
         actions += "<button class='btn-mini' data-rerun='" + j.id + "'>Re-run</button>";
       }
       actions += "</div>";

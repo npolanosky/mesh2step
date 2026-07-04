@@ -307,6 +307,107 @@ def test_download_path_traversal_guarded(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# history: by-id access, dual outputs, restart persistence                     #
+# --------------------------------------------------------------------------- #
+
+
+def _fake_run_worker_two_outputs(job, freecad_python, *, on_line=None,
+                                 on_start=None, timeout=0):
+    """Emulate a conversion that writes TWO STEP files (e.g. solid + faceted)."""
+    out = Path(job["output"])
+    out2 = out.with_name(out.stem + "_faceted.step")
+    out.write_text("ISO-10303-21; /* primary */ END-ISO-10303-21;")
+    out2.write_text("ISO-10303-21; /* faceted */ END-ISO-10303-21;")
+    return {
+        "ok": True, "mode": "convert", "output": str(out),
+        "outputs": [str(out), str(out2)], "method": "reconstructed",
+        "stats": {"is_solid": True, "quality": "good", "faces_in": 12,
+                  "faces_out": 8, "rtaf": 0.0, "warnings": []},
+    }
+
+
+def test_dual_output_job_lists_and_serves_both_files(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch, worker=_fake_run_worker_two_outputs)
+    job_id = _convert(client)
+    d = _wait_done(client, job_id)
+    assert d["outputs"] == ["cube.step", "cube_faceted.step"]
+
+    # Each output is downloadable by name, keyed only by job id.
+    r1 = client.get(f"/api/jobs/{job_id}/download", params={"name": "cube.step"})
+    assert r1.status_code == 200 and b"primary" in r1.content
+    r2 = client.get(f"/api/jobs/{job_id}/download",
+                    params={"name": "cube_faceted.step"})
+    assert r2.status_code == 200 and b"faceted" in r2.content
+    # Default (no name) falls back to the first output.
+    r = client.get(f"/api/jobs/{job_id}/download")
+    assert r.status_code == 200 and b"primary" in r.content
+    # The history list carries both output names for the UI's download links.
+    jobs = client.get("/api/jobs").json()["jobs"]
+    me = next(j for j in jobs if j["id"] == job_id)
+    assert me["outputs"] == ["cube.step", "cube_faceted.step"]
+
+
+def test_completed_jobs_openable_by_id_after_restart(tmp_path, monkeypatch):
+    """Queued-then-completed jobs stay fully accessible by id across a restart.
+
+    Two jobs are submitted back-to-back (concurrency 1, so the second takes the
+    QUEUED -> RUNNING path). Then a brand-new app instance is built over the
+    same data dir — simulating a server restart — and BOTH jobs must still
+    serve detail, download, and viewer payloads purely from the job dir on
+    disk (nothing keyed off in-memory 'current job' state).
+    """
+    client = _client(tmp_path, monkeypatch)
+    a = _convert(client)
+    b = _convert(client)  # queued behind a
+    da = _wait_done(client, a)
+    db = _wait_done(client, b)
+    # The queue path must persist results identically to a direct run.
+    for d in (da, db):
+        assert d["state"] == "done"
+        assert d["outputs"] == ["cube.step"]
+        assert d["result"]["stats"]["is_solid"] is True
+    # On-disk records match what the API returned.
+    for jid in (a, b):
+        rec = json.loads((tmp_path / "web" / "jobs" / jid / "job.json").read_text())
+        assert rec["state"] == "done" and rec["outputs"] == ["cube.step"]
+        assert rec["result"]["stats"]["quality"] == "good"
+
+    # ---- simulate a restart: fresh app over the same data dir ---- #
+    cfg = WebConfig(data_dir=tmp_path / "web", freecad_python="/fake/python",
+                    failures_dir=str(tmp_path / "corpus"))
+    client2 = TestClient(app_module.create_app(cfg))
+
+    for jid in (a, b):
+        d = client2.get(f"/api/jobs/{jid}").json()
+        assert d["state"] == "done"
+        assert d["result"]["stats"]["is_solid"] is True
+        assert d["outputs"] == ["cube.step"]
+
+        r = client2.get(f"/api/jobs/{jid}/download")
+        assert r.status_code == 200 and r.content.startswith(b"ISO-10303-21")
+        r = client2.get(f"/api/jobs/{jid}/download", params={"name": "cube.step"})
+        assert r.status_code == 200
+
+        # Viewer payloads: input STL and tessellated STEP re-derive from disk.
+        r = client2.get(f"/api/jobs/{jid}/mesh/stl")
+        assert r.status_code == 200 and r.content[:4] == b"M2SM"
+        r = client2.get(f"/api/jobs/{jid}/mesh/step")
+        assert r.status_code == 200 and r.content[:4] == b"M2SM"
+        r = client2.get(f"/api/jobs/{jid}/mesh/heatmap")
+        assert r.status_code == 200 and r.content[:4] == b"M2SM"
+        assert "X-Deviation-Stats" in r.headers
+
+    # SSE for a finished job replays its terminal state (what the history
+    # "Open" button relies on to render the full result).
+    with client2.stream("GET", f"/api/jobs/{a}/events") as r:
+        body = "".join(chunk for chunk in r.iter_text())
+    events = [json.loads(ln[6:]) for ln in body.splitlines()
+              if ln.startswith("data: ")]
+    assert events[0]["type"] == "snapshot"
+    assert any(e.get("state") == "done" for e in events)
+
+
+# --------------------------------------------------------------------------- #
 # cancel + active count                                                        #
 # --------------------------------------------------------------------------- #
 
