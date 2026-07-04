@@ -91,6 +91,7 @@ def _make_runner(cfg: WebConfig, store: JobStore, save_failures_flag):
             "config": job.options,
         }
         result = run_worker(conv_job, fc, on_line=lambda ln: emit("log", ln),
+                            on_start=lambda proc: emit("proc", proc),
                             timeout=cfg.convert_timeout)
         job.result = result
 
@@ -211,6 +212,28 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="No such job.")
         return job.public()
 
+    @app.get("/api/active")
+    def active() -> dict:
+        """In-progress job count (running + queued) for the main-page badge."""
+        return store.active_count()
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def cancel(job_id: str) -> dict:
+        """Cancel a queued or running job.
+
+        Queued jobs are dequeued and marked cancelled; running jobs have their
+        worker process tree killed (killpg) so the FreeCAD/meshprep child dies
+        too. Idempotent-ish: a job that's already terminal returns 409.
+        """
+        job = store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job.")
+        result = store.cancel(job_id)
+        if result is None:
+            raise HTTPException(status_code=409,
+                                detail="Job is not running or queued.")
+        return {"id": job_id, "state": result.state}
+
     @app.post("/api/jobs/{job_id}/rerun")
     def rerun(job_id: str) -> dict:
         job = store.requeue(job_id)
@@ -245,7 +268,7 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
                         "progress": job.progress, "status": job.status_line,
                         "log": job.log[-50:]}
             yield f"data: {json.dumps(snapshot)}\n\n"
-            if job.state in ("done", "failed"):
+            if job.state in ("done", "failed", "cancelled"):
                 yield f"data: {json.dumps({'type': 'state', 'state': job.state, 'error': job.error})}\n\n"
                 store.unsubscribe(job_id, sub)
                 return
@@ -258,7 +281,7 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
                         yield ": keep-alive\n\n"
                         continue
                     yield f"data: {json.dumps(event)}\n\n"
-                    if event.get("type") == "state" and event["state"] in ("done", "failed"):
+                    if event.get("type") == "state" and event["state"] in ("done", "failed", "cancelled"):
                         break
             finally:
                 store.unsubscribe(job_id, sub)
@@ -320,7 +343,12 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
         mesh_file = _ensure_step_mesh(job, step)
         from .meshdata import mesh_blob
 
-        return Response(mesh_blob(mesh_file), media_type="application/octet-stream")
+        try:
+            blob = mesh_blob(mesh_file)
+        except Exception as exc:  # noqa: BLE001 - surface a clear reason to the UI
+            raise HTTPException(status_code=500,
+                                detail=f"STEP mesh failed: {exc}") from exc
+        return Response(blob, media_type="application/octet-stream")
 
     @app.get("/api/jobs/{job_id}/mesh/heatmap")
     def mesh_heatmap(job_id: str) -> Response:
@@ -333,7 +361,15 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
         mesh_file = _ensure_step_mesh(job, step)
         from .meshdata import deviation_payload
 
-        blob, stats = deviation_payload(store.input_path(job_id), mesh_file)
+        # Deviation is pure numpy but can still blow up on a degenerate/empty
+        # tessellation — return a clear detail the UI shows in the viewer rather
+        # than a bare 500 traceback (silent blank on the deployed app).
+        try:
+            blob, stats = deviation_payload(store.input_path(job_id), mesh_file)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=500,
+                detail=f"Deviation computation failed: {exc}") from exc
         return Response(blob, media_type="application/octet-stream",
                         headers={"X-Deviation-Stats": json.dumps(stats)})
 
@@ -342,9 +378,18 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
         mesh_file = store.job_dir(job.id) / (step.stem + "_tess.stl")
         if not mesh_file.is_file():
             if not cfg.freecad_python:
-                raise HTTPException(status_code=503, detail="FreeCAD not available.")
-            tessellate_step(step, mesh_file, cfg.freecad_python,
-                            deflection=cfg.deflection)
+                raise HTTPException(status_code=503,
+                                    detail="FreeCAD not available on the server; "
+                                           "cannot tessellate the STEP for preview.")
+            try:
+                tessellate_step(step, mesh_file, cfg.freecad_python,
+                                deflection=cfg.deflection)
+            except HTTPException:
+                raise
+            except Exception as exc:  # noqa: BLE001 - clear reason, not a bare 500
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"STEP tessellation failed: {exc}") from exc
         return mesh_file
 
     # ---- corpus ----------------------------------------------------------- #

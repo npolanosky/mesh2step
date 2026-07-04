@@ -26,13 +26,47 @@ all baked into the image.
 
 **Volumes:**
 
-| Volume | Mount | Contents |
-|---|---|---|
-| `mesh2step-web-data` | `/data/web` | Job history, uploads, STEP outputs (`MESH2STEP_WEB_DIR`). |
-| `mesh2step-corpus` | `/data/corpus` | Failure corpus / flagged meshes (`MESH2STEP_WEB_FAILURES_DIR`). |
+| Mount source | Container path | Kind | Contents |
+|---|---|---|---|
+| `mesh2step-web-data` | `/data/web` | named volume | Job history, uploads, STEP outputs (`MESH2STEP_WEB_DIR`). |
+| `${MESH2STEP_CORPUS_DIR:-./mesh2step-corpus}` | `/data/corpus` | **host bind mount** | Failure corpus / flagged meshes (`MESH2STEP_WEB_FAILURES_DIR`). |
 
 The prep-dep cache lives in the image (`/opt/mesh2step-state`), **not** on a
 volume — it is an image artifact, so an upgraded image ships fresh deps.
+
+### The failure corpus is a host bind mount (for Syncthing)
+
+Job history stays in an opaque named Docker volume, but the **failure corpus**
+is bind-mounted from a **host directory** so the flagged/failed meshes land on
+the host filesystem where they can be synced back to a dev machine (e.g. with
+**Syncthing** — point Syncthing at this directory).
+
+* **Default:** `./mesh2step-corpus`, i.e. a `mesh2step-corpus/` directory
+  **next to the compose file** (created on first run if missing).
+* **Override:** set `MESH2STEP_CORPUS_DIR` to any absolute (or relative) host
+  path — e.g. `MESH2STEP_CORPUS_DIR=/srv/syncthing/mesh2step-corpus`.
+
+**Permissions (important):** the container runs as **uid:gid 10001**. Unlike a
+named volume, a bind-mounted host directory is **not** auto-chowned, so the
+container can't write to it unless 10001 can. Do **one** of:
+
+```bash
+# 1) chown the host dir to the container's uid (simplest):
+mkdir -p ./mesh2step-corpus && sudo chown -R 10001:10001 ./mesh2step-corpus
+```
+
+or override the container user to match your host user in the compose service
+(add under `mesh2step-web:`), so files are written as *you* and stay easy to
+sync/edit:
+
+```yaml
+    # 2) run the container as your host uid:gid instead of the baked 10001:
+    user: "1000:1000"   # <-- replace with your `id -u`:`id -g`
+```
+
+Symptom of getting this wrong: conversions run but flagged/failed meshes never
+appear in the host dir, and the container log shows permission-denied writing to
+`/data/corpus`.
 
 ---
 
@@ -94,6 +128,7 @@ with the **Repository** build method so Portainer has the full repo context.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MESH2STEP_PORT` | `8799` | Host port to publish. |
+| `MESH2STEP_CORPUS_DIR` | `./mesh2step-corpus` | **Host directory** bind-mounted to `/data/corpus` for the failure corpus (Syncthing this back to your dev machine). Must be writable by uid 10001 — see the permissions note above. |
 | `MESH2STEP_CONCURRENCY` | `1` | Conversions run at once. Raise on a beefy box. |
 | `MESH2STEP_TIMEOUT` | `1800` | Per-conversion wall-clock ceiling (s). |
 | `MESH2STEP_MAX_UPLOAD` | `209715200` | Max upload size (bytes, 200 MB). |
@@ -149,7 +184,8 @@ curl -s   http://localhost:8799/api/health | python3 -m json.tool
 
 ## Upgrade procedure
 
-Job history and the failure corpus live in named volumes, so upgrades keep them.
+Job history lives in a named volume and the failure corpus in a host bind mount,
+so upgrades keep both.
 
 **Default (prebuilt GHCR image):**
 
@@ -169,9 +205,11 @@ Job history and the failure corpus live in named volumes, so upgrades keep them.
    rebuild* / *Re-fetch repository*). This rebuilds the image, giving you fresh
    FreeCAD + prep deps, and recreates the container against the same volumes.
 
-**Fresh start (wipe history):** delete the `mesh2step-web-data` volume. Delete
-`mesh2step-corpus` to also clear the failure corpus. Both are safe to remove
-while the stack is down; they're recreated empty on next start.
+**Fresh start (wipe history):** delete the `mesh2step-web-data` volume to clear
+job history. To clear the failure corpus, empty the **host bind-mount
+directory** (`./mesh2step-corpus` or your `MESH2STEP_CORPUS_DIR`) instead — it's
+a plain host folder now, not a Docker volume. Both are safe to clear while the
+stack is down; they're recreated empty on next start.
 
 ---
 
@@ -187,6 +225,8 @@ while the stack is down; they're recreated empty on next start.
 * **Prep deps missing (`manifold3d` not importable):** the watertight boolean
   path degrades but conversions still run. Rebuild with network access so the
   build-time bake step can fetch the wheels.
-* **Permission errors on the volume:** the container runs as `uid:gid 10001`;
-  named volumes are chowned automatically. If you bind-mount a host directory
-  instead, `chown 10001:10001` it on the host first.
+* **Permission errors on the volume:** the container runs as `uid:gid 10001`.
+  The `mesh2step-web-data` **named** volume is chowned automatically. The
+  **corpus bind mount** is a host directory and is **not** — `sudo chown -R
+  10001:10001 ./mesh2step-corpus` (or add a `user: "<uid>:<gid>"` override to the
+  service). See "The failure corpus is a host bind mount" above.

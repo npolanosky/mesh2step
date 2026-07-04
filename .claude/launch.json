@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mesh2step-web",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "mesh2step.webapp", "--host", "127.0.0.1", "--port", "8765"],
+      "port": 8765,
+      "env": {
+        "PYTHONPATH": "src"
+      }
+    }
+  ]
+}

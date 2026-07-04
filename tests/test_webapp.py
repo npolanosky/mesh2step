@@ -33,7 +33,7 @@ CUBE = DATA / "cube.stl"
 # --------------------------------------------------------------------------- #
 
 
-def _fake_run_worker_ok(job, freecad_python, *, on_line=None, timeout=0):
+def _fake_run_worker_ok(job, freecad_python, *, on_line=None, on_start=None, timeout=0):
     """Emulate a successful conversion: stream progress, write the STEP."""
     for msg in ("PROGRESS: Locating FreeCAD", "PROGRESS: Loading and welding mesh",
                 "PROGRESS: Sewing 8 faces into a solid", "PROGRESS: Exporting STEP",
@@ -51,7 +51,7 @@ def _fake_run_worker_ok(job, freecad_python, *, on_line=None, timeout=0):
     }
 
 
-def _fake_run_worker_not_watertight(job, freecad_python, *, on_line=None, timeout=0):
+def _fake_run_worker_not_watertight(job, freecad_python, *, on_line=None, on_start=None, timeout=0):
     """Emulate a conversion that finishes but is NOT watertight (a corpus failure)."""
     if on_line:
         on_line("PROGRESS: Exporting STEP")
@@ -271,7 +271,7 @@ def test_queueing_two_jobs(tmp_path, monkeypatch):
     """A second conversion submitted while the first runs must queue, not crash."""
     order: list[str] = []
 
-    def slow_worker(job, freecad_python, *, on_line=None, timeout=0):
+    def slow_worker(job, freecad_python, *, on_line=None, on_start=None, timeout=0):
         order.append(Path(job["input"]).parent.name)
         time.sleep(0.3)
         return _fake_run_worker_ok(job, freecad_python, on_line=on_line)
@@ -304,3 +304,146 @@ def test_download_path_traversal_guarded(tmp_path, monkeypatch):
     _wait_done(client, job_id)
     r = client.get(f"/api/jobs/{job_id}/download", params={"name": "../../etc/passwd"})
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# cancel + active count                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def _wait_state(client: TestClient, job_id: str, states, timeout: float = 10.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        d = client.get(f"/api/jobs/{job_id}").json()
+        if d["state"] in states:
+            return d
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} not in {states} within {timeout}s")
+
+
+def test_active_count(tmp_path, monkeypatch):
+    """/api/active reports running + queued while a slow job is in flight."""
+    gate = __import__("threading").Event()
+
+    def slow_worker(job, freecad_python, *, on_line=None, on_start=None, timeout=0):
+        gate.wait(5.0)
+        return _fake_run_worker_ok(job, freecad_python, on_line=on_line)
+
+    client = _client(tmp_path, monkeypatch, worker=slow_worker)
+    assert client.get("/api/active").json() == {"running": 0, "queued": 0, "active": 0}
+
+    a = _convert(client)
+    b = _convert(client)  # queues behind a (concurrency 1)
+    _wait_state(client, a, ("running",))
+    act = client.get("/api/active").json()
+    assert act["running"] == 1 and act["queued"] == 1 and act["active"] == 2
+
+    gate.set()
+    _wait_done(client, a)
+    _wait_done(client, b)
+    assert client.get("/api/active").json()["active"] == 0
+
+
+def test_cancel_queued_job(tmp_path, monkeypatch):
+    """A queued job is dequeued and marked cancelled; it never runs."""
+    ran: list[str] = []
+    gate = __import__("threading").Event()
+
+    def slow_worker(job, freecad_python, *, on_line=None, on_start=None, timeout=0):
+        ran.append(Path(job["input"]).parent.name)
+        gate.wait(5.0)
+        return _fake_run_worker_ok(job, freecad_python, on_line=on_line)
+
+    client = _client(tmp_path, monkeypatch, worker=slow_worker)
+    a = _convert(client)  # occupies the single worker
+    b = _convert(client)  # sits in the queue
+    _wait_state(client, a, ("running",))
+
+    r = client.post(f"/api/jobs/{b}/cancel")
+    assert r.status_code == 200 and r.json()["state"] == "cancelled"
+    assert client.get(f"/api/jobs/{b}").json()["state"] == "cancelled"
+
+    gate.set()
+    _wait_done(client, a)
+    # b must never have entered the worker.
+    assert b not in ran
+    # Cancelling a terminal job is a 409.
+    assert client.post(f"/api/jobs/{a}/cancel").status_code == 409
+
+
+def test_cancel_running_kills_process_tree(tmp_path, monkeypatch):
+    """Cancelling a running job kills the worker AND its child (no orphans).
+
+    Uses a runner that spawns a real subprocess tree (parent shell -> long-lived
+    child ``sleep``) in its own session, registers it via ``emit("proc", proc)``
+    exactly as the real conversion runner does, then asserts both PIDs are gone
+    after cancel.
+    """
+    import os
+    import subprocess
+
+    from mesh2step.webapp.conversion import CancelledError
+
+    pids: dict[str, int] = {}
+
+    def tree_runner(job, emit):
+        # Parent bash spawns a child `sleep` then waits; the child's PID is
+        # printed so the test can check it too. start_new_session -> own pgroup.
+        proc = subprocess.Popen(
+            ["bash", "-c", "sleep 300 & echo CHILD:$!; wait"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, start_new_session=True,
+        )
+        emit("proc", proc)
+        pids["parent"] = proc.pid
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("CHILD:"):
+                pids["child"] = int(line.split(":", 1)[1])
+        proc.wait()
+        if proc.returncode is not None and proc.returncode < 0:
+            raise CancelledError("killed")
+        return
+
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    store = app_module.JobStore(tmp_path / "jobs", concurrency=1, runner=tree_runner)
+    from mesh2step.webapp.jobs import Job
+
+    job = Job(id="killme", filename="x.stl", options={})
+    with store._lock:
+        store._jobs[job.id] = job
+    store._queue.put(job.id)
+
+    # Wait until both parent + child are up and registered.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and ("child" not in pids or job.id not in store._procs):
+        time.sleep(0.02)
+    assert "parent" in pids and "child" in pids, "subprocess tree did not start"
+    assert _alive(pids["parent"]) and _alive(pids["child"])
+
+    result = store.cancel(job.id)
+    assert result is not None
+
+    # The worker thread should finalize the job as cancelled.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and store.get(job.id).state != "cancelled":
+        time.sleep(0.02)
+    assert store.get(job.id).state == "cancelled"
+
+    # Both processes must be gone (killpg reached the child) — no orphans.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and (_alive(pids["parent"]) or _alive(pids["child"])):
+        time.sleep(0.05)
+    assert not _alive(pids["parent"]), "worker parent still alive after cancel"
+    assert not _alive(pids["child"]), "orphaned child survived cancel"
+    # No lingering proc registration.
+    assert job.id not in store._procs

@@ -29,6 +29,40 @@
     return { positions, normals, colors, nverts };
   }
 
+  // Weld a non-indexed triangle-soup BufferGeometry into an indexed one by
+  // merging vertices at (near-)identical positions. Needed so EdgesGeometry's
+  // dihedral-angle threshold can recognise coplanar neighbours and cull interior
+  // edges — otherwise every triangle edge counts as a feature edge. Quantises
+  // positions to a grid keyed off the geometry's bounding-box size so it's
+  // scale-independent.
+  function weldGeometry(geo) {
+    const pos = geo.getAttribute("position");
+    const n = pos.count;
+    geo.computeBoundingBox();
+    const bb = geo.boundingBox;
+    const diag = bb.min.distanceTo(bb.max) || 1;
+    const q = diag * 1e-5; // weld tolerance ~ 1e-5 of the model diagonal
+    const map = new Map();
+    const outPos = [];
+    const index = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+      const key = Math.round(x / q) + "_" + Math.round(y / q) + "_" + Math.round(z / q);
+      let vi = map.get(key);
+      if (vi === undefined) {
+        vi = outPos.length / 3;
+        map.set(key, vi);
+        outPos.push(x, y, z);
+      }
+      index[i] = vi;
+    }
+    const welded = new THREE.BufferGeometry();
+    welded.setAttribute("position", new THREE.BufferAttribute(new Float32Array(outPos), 3));
+    welded.setIndex(index);
+    welded.computeVertexNormals();
+    return welded;
+  }
+
   function Viewer(container) {
     this.container = container;
     this.scene = new THREE.Scene();
@@ -39,9 +73,14 @@
     this.renderer.setPixelRatio(window.devicePixelRatio || 1);
     container.appendChild(this.renderer.domElement);
 
-    this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.12;
+    // Orbit mode: "constrained" (OrbitControls turntable, up-axis locked —
+    // Fusion-style default) or "free" (TrackballControls, no up lock). Swapped
+    // at runtime by setOrbitMode(), preserving camera position + target.
+    this.orbitMode = "constrained";
+    // Remember the camera's world-up so returning from free (trackball) mode —
+    // which tumbles `camera.up` — can restore the turntable's up axis.
+    this._up0 = this.camera.up.clone();
+    this._makeControls("constrained");
 
     // Lighting: a key light that follows the camera + soft ambient + fill, so
     // the model reads with real shading on the light background.
@@ -67,12 +106,52 @@
     })();
   }
 
+  // Build the active controls object for the given mode, transferring target.
+  Viewer.prototype._makeControls = function (mode) {
+    const prevTarget = this.controls ? this.controls.target.clone() : null;
+    if (this.controls && this.controls.dispose) this.controls.dispose();
+    if (mode === "free") {
+      const c = new THREE.TrackballControls(this.camera, this.renderer.domElement);
+      c.rotateSpeed = 3.5;
+      c.zoomSpeed = 1.2;
+      c.panSpeed = 0.8;
+      c.staticMoving = false;
+      c.dynamicDampingFactor = 0.15;
+      this.controls = c;
+    } else {
+      const c = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+      c.enableDamping = true;
+      c.dampingFactor = 0.12;
+      this.controls = c;
+    }
+    if (prevTarget) this.controls.target.copy(prevTarget);
+    this.controls.update();
+  };
+
+  // Switch orbit mode at runtime, preserving camera position + look target.
+  Viewer.prototype.setOrbitMode = function (mode) {
+    if (mode !== "free" && mode !== "constrained") return;
+    if (mode === this.orbitMode) return;
+    this.orbitMode = mode;
+    // Camera position is shared (same camera object); target is transferred in
+    // _makeControls. The up vector: TrackballControls tumbles it freely, so when
+    // returning to constrained mode we reset up to +Z-ish is wrong for our
+    // scene (Z-up parts) — restore the world up the OrbitControls expects.
+    if (mode === "constrained") {
+      // Free mode may have rolled camera.up; restore the original world-up so
+      // the turntable behaves as it did before, without jumping the view.
+      this.camera.up.copy(this._up0);
+    }
+    this._makeControls(mode);
+  };
+
   Viewer.prototype._resize = function () {
     const w = this.container.clientWidth || 1;
     const h = this.container.clientHeight || 1;
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    if (this.controls && this.controls.handleResize) this.controls.handleResize();
   };
 
   Viewer.prototype.clear = function () {
@@ -102,9 +181,16 @@
     this.mesh = new THREE.Mesh(geo, mat);
     this.scene.add(this.mesh);
 
-    // Edge overlay (wireframe-on-shaded); toggled by shade mode.
-    const egeo = new THREE.EdgesGeometry(geo, 20);
-    this.edges = new THREE.LineSegments(egeo, new THREE.LineBasicMaterial({ color: 0x334155, transparent: true, opacity: 0.35 }));
+    // Edge overlay (feature edges). EdgesGeometry with a dihedral threshold only
+    // culls interior edges when coplanar triangles SHARE vertices — but our
+    // payload is a non-indexed triangle soup, so we first weld identical
+    // positions into an indexed geometry. Without this, every triangle edge is a
+    // boundary and the STEP's "Edges"/"Wireframe" looked as dense as the STL's
+    // raw mesh (the reported bug). Welding makes STEP feature edges sparse.
+    const welded = weldGeometry(geo);
+    const egeo = new THREE.EdgesGeometry(welded, 20);
+    welded.dispose();
+    this.edges = new THREE.LineSegments(egeo, new THREE.LineBasicMaterial({ color: 0x334155, transparent: true, opacity: 0.45 }));
     this.scene.add(this.edges);
 
     this.setShade(this.shade);

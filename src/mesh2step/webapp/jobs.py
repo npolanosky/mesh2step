@@ -29,6 +29,12 @@ QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
+CANCELLED = "cancelled"
+
+# States a job can be cancelled from.
+_CANCELLABLE = (QUEUED, RUNNING)
+# Terminal states (no further transitions, no live worker).
+_TERMINAL = (DONE, FAILED, CANCELLED)
 
 # Map a progress-message substring to a percentage, so the browser can show a
 # determinate bar. Mirrors gui._MILESTONES.
@@ -93,6 +99,12 @@ class JobStore:
         self._jobs: dict[str, Job] = {}
         self._queue: queue.Queue[str] = queue.Queue()
         self._subscribers: dict[str, list[queue.Queue]] = {}
+        # Live worker subprocesses, keyed by job id, so cancel can kill the tree.
+        self._procs: dict[str, Any] = {}
+        # Job ids cancelled while queued (or mid-flight) — checked by the worker
+        # loop so a dequeued-but-cancelled job never starts, and a running job
+        # that raced a cancel is marked cancelled rather than failed.
+        self._cancelled: set[str] = set()
         self._load_existing()
         self._threads = [
             threading.Thread(target=self._work_loop, daemon=True, name=f"m2s-worker-{i}")
@@ -168,6 +180,13 @@ class JobStore:
         with self._lock:
             return sorted(self._jobs.values(), key=lambda j: j.created, reverse=True)
 
+    def active_count(self) -> dict:
+        """Count in-progress jobs (running + queued) for the main-page badge."""
+        with self._lock:
+            running = sum(1 for j in self._jobs.values() if j.state == RUNNING)
+            queued = sum(1 for j in self._jobs.values() if j.state == QUEUED)
+        return {"running": running, "queued": queued, "active": running + queued}
+
     def input_path(self, job_id: str) -> Path:
         job = self.get(job_id)
         if job is not None:
@@ -206,12 +225,58 @@ class JobStore:
         for q in subs:
             q.put(event)
 
+    # ---- cancellation ----------------------------------------------------- #
+    def cancel(self, job_id: str) -> Job | None:
+        """Cancel a queued or running job.
+
+        Queued → mark cancelled so the worker loop skips it when dequeued.
+        Running → hard-kill the worker process tree (killpg) so the FreeCAD /
+        meshprep child dies too, then mark cancelled. Returns the job, or None if
+        it doesn't exist / isn't in a cancellable state.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.state not in _CANCELLABLE:
+                return None
+            self._cancelled.add(job_id)
+            proc = self._procs.get(job_id)
+            was_running = job.state == RUNNING
+            if not was_running:
+                # Queued: finalize immediately; it will be skipped on dequeue.
+                job.state = CANCELLED
+                job.finished = time.time()
+                job.status_line = "Cancelled"
+                job.error = "cancelled before start"
+
+        # Kill outside the lock (teardown may block briefly).
+        if proc is not None:
+            from .conversion import kill_process_tree
+
+            kill_process_tree(proc)
+
+        if not was_running:
+            self._persist(job)
+            self._publish(job_id, {"type": "state", "state": CANCELLED,
+                                   "error": job.error})
+        # Running: the worker thread finalizes the state transition (it observes
+        # the killed subprocess and the _cancelled marker) so we don't race it.
+        return job
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._cancelled
+
     # ---- the worker loop -------------------------------------------------- #
     def _work_loop(self) -> None:
         while True:
             job_id = self._queue.get()
             job = self.get(job_id)
             if job is None:
+                continue
+            # Skip a job cancelled while it sat in the queue.
+            if self._is_cancelled(job_id):
+                with self._lock:
+                    self._cancelled.discard(job_id)
                 continue
             self._run_one(job)
 
@@ -223,6 +288,12 @@ class JobStore:
         self._publish(job.id, {"type": "state", "state": RUNNING})
 
         def emit(kind: str, payload: Any) -> None:
+            if kind == "proc":
+                # The conversion runner hands us the live subprocess so cancel
+                # can kill its tree.
+                with self._lock:
+                    self._procs[job.id] = payload
+                return
             if kind == "log":
                 line = str(payload)
                 job.log.append(line)
@@ -241,16 +312,33 @@ class JobStore:
             elif kind == "corpus":
                 job.corpus_action = payload
 
+        from .conversion import CancelledError
+
         try:
             self._runner(job, emit)
             job.state = DONE
             job.progress = 100
             job.status_line = "Done"
+        except CancelledError:
+            job.state = CANCELLED
+            job.error = "cancelled"
+            job.status_line = "Cancelled"
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
-            job.state = FAILED
-            job.error = str(exc)
-            job.status_line = f"Failed: {exc}"
+            # A cancel that killed the worker may surface as a generic error
+            # (e.g. WorkerError) rather than CancelledError; if this job was
+            # marked cancelled, honour that over "failed".
+            if self._is_cancelled(job.id):
+                job.state = CANCELLED
+                job.error = "cancelled"
+                job.status_line = "Cancelled"
+            else:
+                job.state = FAILED
+                job.error = str(exc)
+                job.status_line = f"Failed: {exc}"
         finally:
+            with self._lock:
+                self._procs.pop(job.id, None)
+                self._cancelled.discard(job.id)
             job.finished = time.time()
             self._persist(job)
             self._publish(job.id, {"type": "state", "state": job.state,

@@ -17,7 +17,14 @@
 
   // ---- viewer init (lazy, needs a sized container) ---------------------- //
   function ensureViewer() {
-    if (!viewer) viewer = new Viewer($("viewer"));
+    if (!viewer) {
+      viewer = new Viewer($("viewer"));
+      // Apply the persisted orbit-mode choice to the freshly-built viewer.
+      try {
+        const m = localStorage.getItem("mesh2step.orbitMode");
+        if (m === "free") viewer.setOrbitMode("free");
+      } catch (e) { /* ignore */ }
+    }
     return viewer;
   }
 
@@ -47,10 +54,65 @@
       body: JSON.stringify({ save_failures: e.target.checked }) });
   });
 
+  // ---- in-progress count (main-page badge, live) ------------------------ //
+  function refreshActive() {
+    return fetch("/api/active").then((r) => r.json()).then((a) => {
+      const badge = $("active-badge");
+      const n = a.active || 0;
+      if (n > 0) {
+        let label = a.running + " running";
+        if (a.queued) label += " · " + a.queued + " queued";
+        badge.textContent = label;
+        badge.hidden = false;
+      } else {
+        badge.hidden = true;
+      }
+      return a;
+    }).catch(() => {});
+  }
+  refreshActive();
+  // Poll every 3s so the count stays live even for jobs started in another tab.
+  setInterval(refreshActive, 3000);
+
   // ---- file selection --------------------------------------------------- //
+  // The native OS file dialog can only be opened from a genuine user gesture.
+  // Brave/macOS reopened the picker because the old dropzone-wide click handler
+  // AND the <label for> both triggered input.click() for one click on "browse".
+  // Fixes: (a) a dedicated Browse button is the ONLY thing that opens the dialog
+  // — the dropzone body no longer does; (b) stopPropagation so the button click
+  // never bubbles anywhere that could re-open it; (c) a re-entry guard that
+  // ignores click requests fired while a dialog was just opened (covers the
+  // focus-return / synthetic-click paths some browsers emit).
   const dz = $("dropzone");
-  $("file-input").addEventListener("change", (e) => { if (e.target.files[0]) pickFile(e.target.files[0]); });
-  dz.addEventListener("click", () => $("file-input").click());
+  const fileInput = $("file-input");
+  let pickerBusy = false;   // true from open until the input settles (change/focus)
+
+  function openPicker() {
+    if (pickerBusy) return;         // guard re-entry (double-fire)
+    pickerBusy = true;
+    fileInput.value = "";           // allow re-selecting the same file
+    fileInput.click();
+    // Release the guard once focus returns to the window (dialog closed) or a
+    // change lands, whichever first. A timed fallback covers a cancelled dialog
+    // that emits neither on some platforms.
+    const release = () => { pickerBusy = false; window.removeEventListener("focus", release); };
+    window.addEventListener("focus", release, { once: true });
+    setTimeout(() => { pickerBusy = false; }, 1500);
+  }
+
+  fileInput.addEventListener("change", (e) => {
+    pickerBusy = false;
+    if (e.target.files[0]) pickFile(e.target.files[0]);
+  });
+
+  $("browse-btn").addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();            // don't let it bubble to any dropzone handler
+    openPicker();
+  });
+
+  // Drag & drop still works on the whole dropzone; clicking the dropzone body
+  // deliberately does NOT open the dialog (only the Browse button does).
   ["dragover", "dragenter"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
   ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
   dz.addEventListener("drop", (e) => { if (e.dataTransfer.files[0]) pickFile(e.dataTransfer.files[0]); });
@@ -157,8 +219,25 @@
     setStatus("Uploading…", 2);
     api("/api/convert", { method: "POST", body: fd })
       .then((r) => r.json())
-      .then((d) => watchJob(d.id))
-      .catch((err) => { setStatus("Failed: " + err.message, 0); $("convert-btn").disabled = false; });
+      .then((d) => { watchJob(d.id); refreshActive(); })
+      .catch((err) => { setStatus("Failed: " + err.message, 0); $("convert-btn").disabled = false; showCancel(false); });
+  });
+
+  // ---- cancel ----------------------------------------------------------- //
+  function showCancel(on) {
+    const b = $("cancel-btn");
+    b.hidden = !on;
+    b.disabled = false;
+  }
+  function cancelJob(id, btn) {
+    if (!id) return Promise.resolve();
+    if (btn) btn.disabled = true;
+    return api("/api/jobs/" + id + "/cancel", { method: "POST" })
+      .then((r) => r.json())
+      .catch((err) => { if (btn) btn.disabled = false; appendLog("cancel failed: " + err.message, "l-err"); throw err; });
+  }
+  $("cancel-btn").addEventListener("click", () => {
+    cancelJob(currentJob, $("cancel-btn")).then(() => setStatus("Cancelling…", null));
   });
 
   function resetResult() {
@@ -185,12 +264,16 @@
     el.appendChild(span); el.scrollTop = el.scrollHeight;
   }
 
+  const _TERMINAL = { done: 1, failed: 1, cancelled: 1 };
+
   function watchJob(id) {
     currentJob = id;
+    jobDone = false;
     const t0 = Date.now();
     clearInterval(timer);
     timer = setInterval(() => { if (!jobDone) $("elapsed").textContent = ((Date.now()-t0)/1000).toFixed(1) + "s"; }, 100);
     if (evtSource) evtSource.close();
+    showCancel(true);
     evtSource = new EventSource("/api/jobs/" + id + "/events");
     evtSource.onmessage = (e) => {
       const ev = JSON.parse(e.data);
@@ -198,12 +281,14 @@
         setStatus(ev.status || "Working…", ev.progress || 2);
         (ev.log || []).forEach((l) => appendLog(l.startsWith("PROGRESS:") ? l.slice(9).trim() : l,
           l.startsWith("PROGRESS:") ? "l-stage" : ""));
+        // An already-terminal job (e.g. Open on a just-finished row) still needs
+        // its result rendered; the server also sends a follow-up state event.
       } else if (ev.type === "progress") {
         setStatus(ev.message, ev.progress);
         appendLog(ev.message, "l-stage");
       } else if (ev.type === "log") {
         appendLog(ev.message, /error|traceback/i.test(ev.message) ? "l-err" : "");
-      } else if (ev.type === "state" && (ev.state === "done" || ev.state === "failed")) {
+      } else if (ev.type === "state" && _TERMINAL[ev.state]) {
         evtSource.close();
         finishJob(id, ev.state, ev.error);
       }
@@ -211,14 +296,48 @@
     evtSource.onerror = () => { /* SSE auto-reconnects; ignore transient drops */ };
   }
 
+  // Re-attach the convert page to an existing job (from the history "Open"
+  // button): reset the UI, switch to the convert page, replay its live SSE +
+  // state so the user watches a job started elsewhere as if they'd started it.
+  function attachToJob(id) {
+    // Switch to the convert page.
+    document.querySelectorAll(".navtab").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
+    document.querySelector('.navtab[data-page="convert"]').classList.add("active");
+    $("page-convert").classList.add("active");
+    if (viewer) viewer._resize();
+
+    selectedFile = null;
+    resetResult();
+    $("progress-card").hidden = false;
+    $("convert-btn").disabled = true;
+    setStatus("Attaching…", 2);
+    // Preview the job's input STL in the viewer.
+    $("viewer-empty").hidden = true;
+    fetch("/api/jobs/" + id + "/mesh/stl").then((r) => r.arrayBuffer()).then((buf) => {
+      meshCache["stl"] = { buf, stats: null };
+      ensureViewer().load(buf, "stl", false); setViewTab("stl"); viewer._resize();
+    }).catch(() => {});
+    watchJob(id);
+  }
+
   function finishJob(id, state, error) {
     jobDone = true;
-    $("convert-btn").disabled = false;
+    showCancel(false);
+    $("convert-btn").disabled = !selectedFile;
+    refreshActive();
     fetch("/api/jobs/" + id).then((r) => r.json()).then((job) => renderResult(job, state, error));
   }
 
   function renderResult(job, state, error) {
     const v = $("verdict");
+    if (state === "cancelled") {
+      v.className = "verdict warnings"; v.textContent = "⊘ Cancelled";
+      v.hidden = false;
+      appendLog(error || "cancelled", "l-err");
+      setStatus("Cancelled", 0);
+      return;
+    }
     if (state === "failed") {
       v.className = "verdict problems"; v.textContent = "✖ Conversion failed";
       v.hidden = false;
@@ -273,8 +392,34 @@
     b.classList.add("active");
     if (viewer) viewer.setShade(b.dataset.shade);
   });
+
+  // ---- orbit mode (constrained turntable vs free trackball) ------------- //
+  const ORBIT_KEY = "mesh2step.orbitMode";
+  function applyOrbitMode(mode) {
+    $("orbit-tabs").querySelectorAll(".seg-btn").forEach((x) =>
+      x.classList.toggle("active", x.dataset.orbit === mode));
+    if (viewer) viewer.setOrbitMode(mode);
+    try { localStorage.setItem(ORBIT_KEY, mode); } catch (e) { /* private mode */ }
+  }
+  $("orbit-tabs").addEventListener("click", (e) => {
+    const b = e.target.closest(".seg-btn"); if (!b) return;
+    applyOrbitMode(b.dataset.orbit);
+  });
+  // Restore the persisted choice (applied to the viewer lazily once it exists).
+  let savedOrbit = "constrained";
+  try { savedOrbit = localStorage.getItem(ORBIT_KEY) || "constrained"; } catch (e) { /* ignore */ }
+  $("orbit-tabs").querySelectorAll(".seg-btn").forEach((x) =>
+    x.classList.toggle("active", x.dataset.orbit === savedOrbit));
   function setViewTab(view) {
     $("view-tabs").querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  }
+
+  function viewerMessage(text) {
+    // Surface a viewer-load problem where the user can actually see it, instead
+    // of only in the collapsed log (the old silent-blank behaviour).
+    const el = $("viewer-empty");
+    el.textContent = text;
+    el.hidden = false;
   }
 
   function loadView(view) {
@@ -285,13 +430,28 @@
     const url = "/api/jobs/" + currentJob + "/mesh/" + view;
     if (meshCache[view]) { renderMesh(meshCache[view].buf, view, meshCache[view].stats); return; }
     $("viewer-empty").hidden = true;
+    if (view === "heatmap") viewerMessage("Computing deviation heatmap…"), $("viewer-empty").hidden = false;
     fetch(url).then((r) => {
+      // A non-2xx response is a JSON error body, NOT an M2SM blob. Parse it and
+      // surface the detail rather than feeding error bytes to the mesh parser
+      // (which used to fail with a silent "bad mesh magic").
+      if (!r.ok) {
+        return r.json().catch(() => ({})).then((e) => {
+          throw new Error(e.detail || ("HTTP " + r.status));
+        });
+      }
       const stats = r.headers.get("X-Deviation-Stats");
       return r.arrayBuffer().then((buf) => ({ buf, stats: stats ? JSON.parse(stats) : null }));
     }).then(({ buf, stats }) => {
       meshCache[view] = { buf, stats };
       renderMesh(buf, view, stats);
-    }).catch((err) => appendLog("viewer load failed (" + view + "): " + err.message, "l-err"));
+      $("viewer-empty").hidden = true;
+    }).catch((err) => {
+      const label = view === "heatmap" ? "Deviation heatmap unavailable" :
+                    view === "step" ? "STEP preview unavailable" : "Preview unavailable";
+      appendLog("viewer load failed (" + view + "): " + err.message, "l-err");
+      viewerMessage(label + ": " + err.message);
+    });
   }
 
   function renderMesh(buf, view, stats) {
@@ -318,18 +478,34 @@
     let h = "<table><thead><tr><th>File</th><th>State</th><th>Quality</th><th>Watertight</th><th>Method</th><th>Elapsed</th><th></th></tr></thead><tbody>";
     for (const j of jobs) {
       const s = (j.result && j.result.stats) || {};
+      const active = j.state === "running" || j.state === "queued";
+      let actions = "<div class='row-actions'>";
+      if (active) {
+        // Running/queued jobs: attach to their live progress, or stop them.
+        if (j.state === "running") actions += "<button class='btn-mini open' data-open='" + j.id + "'>Open</button>";
+        actions += "<button class='btn-mini stop' data-stop='" + j.id + "'>Stop</button>";
+      } else {
+        actions += "<button class='btn-mini' data-rerun='" + j.id + "'>Re-run</button>";
+      }
+      actions += "</div>";
       h += "<tr><td class='wrap'>" + esc(j.filename) + "</td>" +
         "<td><span class='tag " + j.state + "'>" + j.state + "</span></td>" +
         "<td>" + (s.quality || "—") + "</td>" +
         "<td>" + (s.is_solid == null ? "—" : (s.is_solid ? "✓" : "✗")) + "</td>" +
         "<td>" + ((j.result && j.result.method) || "—") + "</td>" +
         "<td>" + (j.elapsed ? j.elapsed.toFixed(1) + "s" : "—") + "</td>" +
-        "<td><button class='btn-secondary' data-rerun='" + j.id + "'>Re-run</button></td></tr>";
+        "<td>" + actions + "</td></tr>";
     }
     el.innerHTML = h + "</tbody></table>";
     el.querySelectorAll("[data-rerun]").forEach((b) => b.addEventListener("click", () => {
       api("/api/jobs/" + b.dataset.rerun + "/rerun", { method: "POST" })
-        .then((r) => r.json()).then((d) => { alert("Re-run queued (job " + d.id + ")."); loadCorpus(); });
+        .then((r) => r.json()).then((d) => { attachToJob(d.id); refreshActive(); });
+    }));
+    el.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => {
+      attachToJob(b.dataset.open);
+    }));
+    el.querySelectorAll("[data-stop]").forEach((b) => b.addEventListener("click", () => {
+      cancelJob(b.dataset.stop, b).then(() => { setTimeout(loadCorpus, 300); refreshActive(); }).catch(() => {});
     }));
   }
   function renderCorpus(d) {

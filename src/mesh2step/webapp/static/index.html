@@ -18,6 +18,7 @@
       <button class="navtab" data-page="corpus">Corpus &amp; history</button>
     </nav>
     <div class="meta">
+      <span id="active-badge" class="pill pill-active" title="Conversions in progress" hidden>0 running</span>
       <span id="version" class="pill">—</span>
       <span id="freecad-badge" class="pill pill-warn" title="FreeCAD status">FreeCAD?</span>
     </div>
@@ -33,7 +34,8 @@
             <h2>1 · Input mesh</h2>
             <div id="dropzone" class="dropzone">
               <div class="dz-icon">⤓</div>
-              <div class="dz-text">Drag an STL here, or <label class="link" for="file-input">browse</label></div>
+              <div class="dz-text">Drag an STL here</div>
+              <button type="button" id="browse-btn" class="btn-secondary dz-browse">Browse…</button>
               <input type="file" id="file-input" accept=".stl" hidden>
             </div>
             <div id="mesh-name" class="filename" hidden></div>
@@ -68,7 +70,10 @@
           <div class="card progress-card" id="progress-card" hidden>
             <div class="progress-head">
               <span id="status-line" class="status">Ready</span>
-              <span id="elapsed" class="elapsed">0.0s</span>
+              <span class="progress-head-right">
+                <span id="elapsed" class="elapsed">0.0s</span>
+                <button id="cancel-btn" class="btn-cancel" hidden>Cancel</button>
+              </span>
             </div>
             <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
             <div id="verdict" class="verdict" hidden></div>
@@ -97,6 +102,10 @@
               <button class="seg-btn active" data-shade="shaded">Shaded</button>
               <button class="seg-btn" data-shade="edges">Edges</button>
               <button class="seg-btn" data-shade="wire">Wireframe</button>
+            </div>
+            <div class="seg" id="orbit-tabs" title="Constrained keeps the up-axis locked (turntable). Free is a full trackball.">
+              <button class="seg-btn active" data-orbit="constrained">Constrained orbit</button>
+              <button class="seg-btn" data-orbit="free">Free orbit</button>
             </div>
           </div>
           <div id="viewer" class="viewer">
@@ -129,6 +138,7 @@
 
   <script src="/static/vendor/three.min.js"></script>
   <script src="/static/vendor/OrbitControls.js"></script>
+  <script src="/static/vendor/TrackballControls.js"></script>
   <script src="/static/viewer.js"></script>
   <script src="/static/app.js"></script>
 </body>

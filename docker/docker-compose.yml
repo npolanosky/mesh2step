@@ -39,9 +39,13 @@ services:
     volumes:
       # Job history + uploads + STEP outputs (survives restarts/upgrades).
       - mesh2step-web-data:/data/web
-      # Failure corpus (flagged/failed meshes for regression). Kept separate so
-      # you can back it up or wipe job history independently.
-      - mesh2step-corpus:/data/corpus
+      # Failure corpus (flagged/failed meshes for regression). HOST BIND mount so
+      # the meshes land on the host filesystem and can be synced back to a dev
+      # machine (e.g. via Syncthing). Defaults to ./mesh2step-corpus next to this
+      # compose file; override the host path with MESH2STEP_CORPUS_DIR.
+      # NOTE: the container runs as uid:gid 10001 — the host dir must be writable
+      # by that uid (see docker/README.md: chown or a `user:` override).
+      - ${MESH2STEP_CORPUS_DIR:-./mesh2step-corpus}:/data/corpus
 
     # Liveness probe hits the cheap /healthz endpoint (no disk, no subprocess).
     # Portainer shows the container as healthy/unhealthy from this.
@@ -54,7 +58,9 @@ services:
       start_period: 40s
 
 volumes:
+  # Job history stays in a named Docker volume (opaque, not synced anywhere).
   mesh2step-web-data:
     name: mesh2step-web-data
-  mesh2step-corpus:
-    name: mesh2step-corpus
+  # NOTE: the failure corpus is NO LONGER a named volume — it is a host bind
+  # mount (see the service `volumes:` above) so it can be Syncthing'd to a dev
+  # machine. Nothing to declare here for a bind mount.
