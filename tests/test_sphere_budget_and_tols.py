@@ -140,3 +140,40 @@ def test_sphere_op_budget_allows_normal_base(monkeypatch):
         base, spheres, Part=None, progress=lambda _m: None,
         bbox_guard=cfg.boolean_max_bbox_growth, config=cfg)
     assert built == 9
+
+
+def test_sphere_rtaf_gate_reverts_regression_keeps_flat(monkeypatch):
+    """The sphere RTAF gate (task §2) is a REGRESSION gate: a cap that WORSENS the
+    RTAF is reverted, but one that leaves it flat (a legitimate low-coverage dome
+    whose area is tiny beside the part's dominant surface) is KEPT. Requiring
+    strict improvement would wrongly drop real shallow caps."""
+    from mesh2step import builder
+
+    monkeypatch.setattr(builder, "_boolean_clean_sphere",
+                        lambda solid, sph, Part, **k: solid)
+    monkeypatch.setattr(builder, "_try_boolean_step",
+                        lambda cur, fn, **k: (fn(cur), True))
+    # First op keeps RTAF flat (0.30 -> 0.30) => kept; second regresses
+    # (0.30 -> 0.40) => reverted. compute_rtaf is called before the batch and
+    # after each successful op.
+    rtaf_seq = iter([0.30, 0.30, 0.40])
+    monkeypatch.setattr(builder, "compute_rtaf",
+                        lambda solid, cfg: {"rtaf": next(rtaf_seq)})
+
+    base = _FakeSolid(1_000)
+    spheres = [object(), object()]
+    cfg = ConversionConfig()
+    _out, built = builder._apply_sphere_ball_ops(
+        base, spheres, Part=None, progress=lambda _m: None,
+        bbox_guard=cfg.boolean_max_bbox_growth, config=cfg)
+    assert built == 1  # flat kept, regression reverted
+
+
+def test_new_freeform_and_sphere_config_defaults():
+    """Lock the task's new defaults so an accidental edit is caught."""
+    cfg = ConversionConfig()
+    assert cfg.freeform_inpaint is True
+    assert cfg.freeform_max_missing == 0.55
+    assert cfg.freeform_claim_max_missing == 0.30
+    assert cfg.freeform_max_split_depth == 2
+    assert cfg.sphere_rtaf_gate is True

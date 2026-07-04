@@ -69,6 +69,87 @@ def test_freeform_grid_sampling_covers_footprint():
     assert missing <= cfg.freeform_max_missing
 
 
+def test_laplace_inpaint_recovers_interior_hole_and_stays_in_range():
+    """The Laplace inpaint fills ``~mask`` cells with a smooth (minimal-curvature)
+    interpolant: covered cells are untouched, an INTERIOR hole in a linear ramp
+    is recovered exactly (a harmonic fill of a linear field is the field itself),
+    and all filled values stay within the covered range — no nearest-neighbour
+    step discontinuity, no runaway. Boundary holes use a conservative reflecting
+    (zero-gradient) extension rather than linear extrapolation, so they smooth
+    toward the interior instead of shooting off (the boolean cut trims any skirt
+    that lands outside the solid)."""
+    import numpy as np
+
+    from mesh2step.segmentation import _laplace_inpaint
+
+    ng = 12
+    xs = np.linspace(0.0, 1.0, ng)
+    height = np.repeat(xs[None, :], ng, axis=0)  # h(i,j) = xs[j], a ramp in j
+    mask = np.ones((ng, ng), dtype=bool)
+    mask[4:7, 4:7] = False       # interior hole only (away from the grid edge)
+    filled = _laplace_inpaint(height, mask)
+    # Covered cells unchanged.
+    assert np.allclose(filled[mask], height[mask])
+    # Interior hole recovers the underlying linear ramp closely.
+    assert np.max(np.abs(filled - height)) < 5e-3
+    # Nothing escapes the covered range (minimal-curvature fill can't overshoot).
+    assert filled.min() >= height.min() - 1e-6
+    assert filled.max() <= height.max() + 1e-6
+
+
+@pytest.mark.skipif(TRUTH is None, reason="freeform_bump sample not generated")
+def test_sample_grid_returns_mask_and_no_nan_when_inpainting():
+    """With inpainting on, the sampler returns a covered mask and a finite grid
+    (the missing cells are Laplace-filled, never NaN)."""
+    import numpy as np
+
+    cfg = ConversionConfig()
+    vertices, faces = load_stl(DATA / TRUTH["file"])
+    regions = segment_freeform_sheets(vertices, faces, set(), cfg)
+    assert regions
+    out = sample_freeform_grid(vertices, faces, regions[0], cfg.freeform_grid,
+                               inpaint=True, return_mask=True)
+    assert out is not None
+    grid, missing, covered = out
+    assert covered.shape == (cfg.freeform_grid, cfg.freeform_grid)
+    assert covered.dtype == bool
+    assert not np.isnan(grid).any()
+    assert 0.0 <= missing <= 1.0
+
+
+@pytest.mark.skipif(TRUTH is None, reason="freeform_bump sample not generated")
+def test_split_freeform_region_yields_valid_subfields():
+    """Splitting a genuine height-field region yields sub-regions that are each
+    still valid height fields (injective, doubly-curved) — the mechanism the
+    builder uses when a single fit's deviation fails (task §1)."""
+    from mesh2step.segmentation import split_freeform_region
+
+    cfg = ConversionConfig()
+    vertices, faces = load_stl(DATA / TRUTH["file"])
+    regions = segment_freeform_sheets(vertices, faces, set(), cfg)
+    assert regions
+    subs = split_freeform_region(vertices, faces, regions[0], cfg)
+    # The bump is large enough to bisect into two valid sub-fields.
+    assert 1 <= len(subs) <= 2
+    for sub in subs:
+        assert sub.foldover <= cfg.freeform_max_foldover
+        assert len(sub.face_indices) >= cfg.freeform_min_facets
+        # Each sub-region's facets are a subset of the parent's.
+        assert set(sub.face_indices) <= set(regions[0].face_indices)
+
+
+@pytest.mark.skipif(TRUTH is None, reason="freeform_bump sample not generated")
+def test_freeform_bump_not_split_at_segmentation_time():
+    """The bump is a single clean height field: segmentation must NOT pre-split
+    it (a quadratic-residual trigger would over-fire — build-time deviation is
+    the honest trigger). Guards the freeform_bump ground truth."""
+    cfg = ConversionConfig()
+    vertices, faces = load_stl(DATA / TRUTH["file"])
+    regions = segment_freeform_sheets(vertices, faces, set(), cfg)
+    assert len(regions) == 1
+    assert abs(float(regions[0].axis[2])) > 0.95
+
+
 def test_no_freeform_sheets_on_prismatic_parts():
     """A plain box / L-bracket has no doubly-curved residual: nothing to fit."""
     for name in ("cube", "l_bracket", "plate_with_holes"):

@@ -17,6 +17,7 @@ from .boundary import FaceLoops, extract_face_loops
 from .config import ConversionConfig
 from .fitting import (
     Cylinder,
+    FreeformSheet,
     Sphere,
     SweptProfile,
     _connected_components,
@@ -29,9 +30,11 @@ from .fitting import (
     sphere_consensus_regions,
 )
 from .segmentation import (
+    _axis_basis,
     build_edge_adjacency,
     face_normals_and_areas,
     mesh_resolution,
+    sample_freeform_grid,
     segment_planar,
     segment_smooth_bands,
     segment_swept_walls,
@@ -331,11 +334,42 @@ def _apply_sphere_ball_ops(solid, spheres, Part, progress, *, bbox_guard,
                      f"(domes/blends left faceted)")
             return solid, 0
     built = 0
+    # RTAF-regression gate (task §2): a sphere op that makes the residual
+    # tessellation WORSE — a mis-detected / bulging cap that the relaxed
+    # shallow-cap volume guard now lets through, which fractures the surface into
+    # more chains — is rolled back. Note this is a REGRESSION gate, not an
+    # improvement gate: a legitimate low-coverage dome/dish (RMS-tight, tangent to
+    # its flats) that trues up a small cap may leave the aggregate RTAF flat
+    # (its area is tiny beside a part's dominant surface) yet is still correct
+    # geometry to adopt. Requiring strict improvement wrongly reverted 4/5 real
+    # port_cover caps; requiring only "no regression" keeps them. The per-op
+    # validity + bbox guards remain the primary false-positive net.
+    rtaf_gate = config is not None and getattr(config, "sphere_rtaf_gate", True)
+    rtaf_before = None
+    if rtaf_gate:
+        try:
+            rtaf_before = compute_rtaf(solid, config).get("rtaf")
+        except Exception:  # noqa: BLE001
+            rtaf_before = None
     for sph in spheres:
-        solid, ok = _try_boolean_step(
+        candidate, ok = _try_boolean_step(
             solid, lambda s, sp=sph: _boolean_clean_sphere(s, sp, Part),
             max_bbox_growth=bbox_guard)
-        built += ok
+        if not ok:
+            continue
+        if rtaf_gate and rtaf_before is not None:
+            try:
+                rtaf_after = compute_rtaf(candidate, config).get("rtaf")
+            except Exception:  # noqa: BLE001
+                rtaf_after = None
+            if rtaf_after is not None and rtaf_after > rtaf_before + 1e-3:
+                progress(f"  sphere reverted: RTAF {rtaf_before:.3f} -> "
+                         f"{rtaf_after:.3f} (regressed)")
+                continue
+            if rtaf_after is not None:
+                rtaf_before = rtaf_after
+        solid = candidate
+        built += 1
     return solid, built
 
 
@@ -706,19 +740,43 @@ def _freeform_sheet_surface(sheet, Part):
     return surf
 
 
-def _freeform_sheet_deviation(surf, grid, stride: int = 2) -> float:
-    """Max distance from the sampled grid points to the fitted B-spline surface.
+def _freeform_sheet_deviation(surf, grid, stride: int = 2, covered=None,
+                              sample_pts=None) -> float:
+    """Max distance from the region's real surface to the fitted B-spline sheet.
 
-    Uses each grid point's nearest projection on the surface (parameter search),
-    so it measures how well the sheet reproduces the resampled mesh heights.
-    Subsamples the grid by ``stride`` (the fit is smooth; every other point is
-    a faithful deviation estimate) to keep the parameter search cheap."""
+    Projects each ground-truth point onto the surface (nearest-parameter search)
+    and returns the worst residual — how far the analytic sheet strays from the
+    mesh it replaces.
+
+    Ground truth priority:
+    - ``sample_pts`` (the region's dense facet centroids) when supplied: the
+      honest metric. The (u,v) grid — especially with an inpainted skirt —
+      samples only sparse nodes and can hide a large between-node error, so a
+      corner-wrapping region that is NOT a true height field fits its own grid
+      nodes yet misses the real facets; scoring the dense centroids catches it.
+    - else the grid cells, restricted to ``covered`` (real) cells if a mask is
+      given (an inpainted cell has no ground truth to match)."""
     import FreeCAD  # type: ignore
 
-    ng = grid.shape[0]
     worst = 0.0
+    if sample_pts is not None:
+        for p in sample_pts:
+            vp = FreeCAD.Vector(float(p[0]), float(p[1]), float(p[2]))
+            try:
+                u, v = surf.parameter(vp)
+                q = surf.value(u, v)
+                d = float((q - vp).Length)
+            except Exception:  # noqa: BLE001
+                continue
+            if d > worst:
+                worst = d
+        return worst
+
+    ng = grid.shape[0]
     for i in range(0, ng, stride):
         for j in range(0, ng, stride):
+            if covered is not None and not covered[i, j]:
+                continue
             p = FreeCAD.Vector(*grid[i, j])
             try:
                 u, v = surf.parameter(p)
@@ -769,7 +827,32 @@ def _boolean_clean_freeform(solid, sheet, surf, Part):
     return result
 
 
-def _apply_freeform_sheets(solid, sheets, config, Part, progress):
+def _refit_subsheet(vertices, faces, region, config, resolution):
+    """Re-sample + wrap a split sub-region as a FreeformSheet (mirrors
+    fit_freeform_sheets' per-region body). Returns the sheet or None."""
+    ng = int(config.freeform_grid)
+    sampled = sample_freeform_grid(vertices, faces, region, ng,
+                                   inpaint=config.freeform_inpaint,
+                                   return_mask=True)
+    if sampled is None:
+        return None
+    grid, missing, covered = sampled
+    if missing > config.freeform_max_missing:
+        return None
+    edge = resolution.edge_for(region.face_indices)
+    dev_tol = max(config.freeform_dev_tol_abs, config.freeform_dev_tol_rel * edge)
+    fa = np.array(region.face_indices, dtype=int)
+    centroids = vertices[faces[fa]].mean(axis=1)
+    if len(centroids) > 400:
+        centroids = centroids[::int(np.ceil(len(centroids) / 400.0))]
+    return FreeformSheet(
+        grid=grid, axis=region.axis, face_indices=region.face_indices,
+        area=region.area, curvature=region.curvature, foldover=region.foldover,
+        missing=missing, dev_tol=dev_tol, covered=covered, sample_pts=centroids)
+
+
+def _apply_freeform_sheets(solid, sheets, config, Part, progress,
+                           vertices=None, faces=None):
     """Integrate freeform B-spline sheets into a valid solid, adopting each only
     when it validates, stays bbox-stable, and LOWERS the RTAF (never trades a
     faceted strip fan for something worse). Returns ``(solid, attempted, built)``.
@@ -777,7 +860,15 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress):
     Every op goes through ``_try_boolean_step`` (reverts on invalidity), plus a
     per-op RTAF check: the whole point is de-faceting, so an op that doesn't
     reduce residual tessellation is rolled back. Bounded by a base-face cost
-    ceiling (the boolean of a doubly-curved sheet is O(base_faces))."""
+    ceiling (the boolean of a doubly-curved sheet is O(base_faces)).
+
+    Build-time region splitting (task §1): when a sheet's fitted B-spline misses
+    the real mesh (deviation gate fails), the region is bisected along its
+    curvature ridge and each half re-sampled + re-fitted, up to
+    ``freeform_max_split_depth`` levels. This lets a large cast surface that is
+    locally — but not globally — a height field be represented by 2-4 sub-sheets
+    instead of shipping faceted, using the true B-spline deviation as the trigger
+    (a quadratic-residual trigger over-fires on gentle single bumps)."""
     if not sheets:
         return solid, 0, 0
     limit = config.freeform_max_base_faces
@@ -789,10 +880,14 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress):
         progress(f"  freeform sheets skipped: base {base_faces} faces > "
                  f"ceiling {limit} (left faceted)")
         return solid, len(sheets), 0
-    # Each boolean cut is O(base_faces) (seconds on a dense shell); cap the
-    # number of attempts and try the largest-area sheets first, so a part with
-    # many small doomed candidates can't spend minutes on rejected attempts.
-    sheets = sorted(sheets, key=lambda s: -s.area)[:config.freeform_max_ops]
+    can_split = (vertices is not None and faces is not None
+                 and config.freeform_max_split_depth > 0)
+    resolution = None
+    if can_split:
+        try:
+            resolution = mesh_resolution(vertices, faces, config)
+        except Exception:  # noqa: BLE001
+            can_split = False
     bbox_guard = config.boolean_max_bbox_growth
     built = 0
     attempted = 0
@@ -802,16 +897,53 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress):
         rtaf_before = compute_rtaf(solid, config).get("rtaf")
     except Exception:  # noqa: BLE001
         rtaf_before = None
-    for sheet in sheets:
-        attempted += 1
+    # Work queue of (sheet, depth); largest-area first. A split pushes its two
+    # sub-sheets back on at depth+1. ``freeform_max_ops`` caps the number of
+    # actual BOOLEAN attempts (each is O(base_faces)) so a doomed part can't
+    # grind for minutes; a split (pure numpy re-fit) does NOT consume that budget,
+    # only a bounded fan-out via ``freeform_max_split_depth`` and the queue.
+    boolean_ops = 0
+    max_queue = config.freeform_max_ops * (2 ** config.freeform_max_split_depth + 1)
+    queue = [(s, 0) for s in sorted(sheets, key=lambda s: -s.area)]
+    processed = 0
+    while queue and boolean_ops < config.freeform_max_ops and processed < max_queue:
+        sheet, depth = queue.pop(0)
+        processed += 1
         surf = _freeform_sheet_surface(sheet, Part)
-        if surf is None:
+        dev = None
+        if surf is not None:
+            dev = _freeform_sheet_deviation(
+                surf, sheet.grid, covered=getattr(sheet, "covered", None),
+                sample_pts=getattr(sheet, "sample_pts", None))
+        if surf is None or dev > sheet.dev_tol * 1.5:
+            # The single fit misses the mesh. Split the region and re-fit each
+            # half (deviation-triggered, task §1) rather than shipping faceted.
+            if can_split and depth < config.freeform_max_split_depth:
+                from .segmentation import FreeformRegion, split_freeform_region
+                region = FreeformRegion(
+                    face_indices=list(sheet.face_indices), axis=sheet.axis,
+                    e1=_axis_basis(sheet.axis)[0], e2=_axis_basis(sheet.axis)[1],
+                    origin=np.array(vertices[faces[np.array(sheet.face_indices)]]
+                                    .reshape(-1, 3).mean(axis=0)),
+                    area=sheet.area, curvature=sheet.curvature,
+                    foldover=sheet.foldover)
+                subs = split_freeform_region(vertices, faces, region, config)
+                new_sheets = [_refit_subsheet(vertices, faces, r, config, resolution)
+                              for r in subs]
+                new_sheets = [s for s in new_sheets if s is not None]
+                if new_sheets:
+                    progress(f"  freeform sheet split ({len(sheet.face_indices)} "
+                             f"facets -> {len(new_sheets)} sub-sheets, dev "
+                             f"{dev if dev is not None else float('nan'):.2f} mm)")
+                    for s in sorted(new_sheets, key=lambda s: -s.area):
+                        queue.append((s, depth + 1))
+                    continue
+            if dev is not None:
+                progress(f"  freeform sheet rejected: deviation {dev:.2f} mm > "
+                         f"tol {sheet.dev_tol:.2f} ({len(sheet.face_indices)} facets)")
             continue
-        dev = _freeform_sheet_deviation(surf, sheet.grid)
-        if dev > sheet.dev_tol * 1.5:
-            progress(f"  freeform sheet rejected: deviation {dev:.2f} mm > "
-                     f"tol {sheet.dev_tol:.2f} ({len(sheet.face_indices)} facets)")
-            continue
+        boolean_ops += 1
+        attempted += 1
         candidate, ok = _try_boolean_step(
             solid, lambda s, sh=sheet, sf=surf: _boolean_clean_freeform(s, sh, sf, Part),
             max_bbox_growth=bbox_guard)
@@ -1068,7 +1200,8 @@ def build_reconstructed_solid(
     freeform_ok = 0
     if is_solid and freeform_sheets:
         shape, freeform_ops, freeform_ok = _apply_freeform_sheets(
-            shape, freeform_sheets, config, Part, progress)
+            shape, freeform_sheets, config, Part, progress,
+            vertices=vertices, faces=faces)
         if freeform_ok:
             backup = shape.copy()
             simplified = _safe_remove_splitter(shape, Part)
@@ -1698,9 +1831,18 @@ def _boolean_clean_sphere(solid, sph, Part, **_):
         tool = Part.makeSphere(R + eps, _vec(center))
     if sph.outward:
         # A correct dome fuse adds only the sliver between the inscribed facets
-        # and the true cap; a mis-classified/oversized sphere adds most of the
-        # cap. Keep the guard reasonably tight.
-        return _guarded_fuse(solid, tool, max_added_frac=0.5)
+        # and the true cap. For a DEEP cap (high solid-angle coverage) that
+        # sliver is a small fraction of the tool, so the guard is tight. But a
+        # legitimate SHALLOW dome/dish (low coverage — a gentle grille cap) is a
+        # thin lens whose padded cap tool is mostly the sliver itself, so the
+        # added fraction is naturally large; a fixed tight guard wrongly rejects
+        # it (port_cover: 4/5 shallow caps failed to build). Scale the ceiling up
+        # as coverage drops. The false-positive protection is preserved by the
+        # tight fit gate at detection (RMS <= tol, tangency prior) plus the
+        # caller's RTAF-improvement + bbox guards, not by this volume ratio alone.
+        cov = max(1e-3, float(getattr(sph, "coverage", 1.0)))
+        max_added = min(0.92, 0.5 + 0.45 * (1.0 - min(cov, 1.0)))
+        return _guarded_fuse(solid, tool, max_added_frac=max_added)
     return _guarded_cut(solid, tool, max_removed_frac=0.6)
 
 
@@ -1899,11 +2041,26 @@ def build_boolean_clean_solid(
         except Exception as exc:  # noqa: BLE001 - detection is best-effort
             progress(f"Freeform sheet detection skipped ({exc})")
             freeform_sheets = []
+        # Only CONFIDENT sheets pre-empt the swept pool. A well-covered region
+        # (low ``missing``) is a genuine height field the sweep would mis-fit, so
+        # claiming it protects the sheet. A marginal / heavily-extrapolated sheet
+        # (a split sub-region with a large inpainted skirt) must NOT steal facets
+        # from swept walls that de-facet more reliably — it is still ATTEMPTED for
+        # building below, but swept gets first crack and, since both ops are
+        # guarded + RTAF-gated and run in order, whichever improves the surface
+        # wins and the other reverts (task §1: never trade a working swept wall
+        # for a doomed sheet). This is what stops an aggressive region split from
+        # collapsing swept coverage (port_cover: 44 swept walls -> 0).
+        claim_thr = config.freeform_claim_max_missing
+        claimed_sheets = 0
         for sh in freeform_sheets:
-            claimed.update(sh.face_indices)
+            if sh.missing <= claim_thr:
+                claimed.update(sh.face_indices)
+                claimed_sheets += 1
         if freeform_sheets:
             progress(f"Found {len(freeform_sheets)} freeform sheet region(s) "
-                     f"({sum(len(s.face_indices) for s in freeform_sheets)} facets)")
+                     f"({sum(len(s.face_indices) for s in freeform_sheets)} facets; "
+                     f"{claimed_sheets} confident, claimed from swept pool)")
 
     # Swept/extruded curved walls (M4), after fillets in the detector ladder.
     # Fitted on the facets no other detector claimed; each arc segment becomes a
@@ -2053,7 +2210,8 @@ def build_boolean_clean_solid(
     freeform_ok = 0
     if freeform_sheets and _is_valid_solid(solid):
         solid, freeform_ops, freeform_ok = _apply_freeform_sheets(
-            solid, freeform_sheets, config, Part, progress)
+            solid, freeform_sheets, config, Part, progress,
+            vertices=vertices, faces=faces)
         if freeform_ok:
             backup = solid.copy()
             simplified = _safe_remove_splitter(solid, Part)

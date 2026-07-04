@@ -516,6 +516,18 @@ class ConversionConfig:
     # not approximate within tolerance and merely interpolated mesh noise).
     freeform_grid: int = 26
 
+    # Region splitting (task §1): a large cast surface can be locally a height
+    # field but curve too much to be ONE clean field — a single B-spline fit
+    # would miss it and ship faceted. Splitting is driven at BUILD time by the
+    # true B-spline deviation to the real facets (see builder._apply_freeform_
+    # sheets): a sheet whose fitted surface misses the mesh is bisected along its
+    # dominant curvature ridge and each half re-fitted, up to
+    # ``freeform_max_split_depth`` levels (0 -> no split; 2 -> up to 4 sub-sheets).
+    # Build-time deviation is the honest trigger — the segmentation-time quadratic
+    # residual over-fires on gentle single bumps a quadratic under-models but a
+    # B-spline fits perfectly (freeform_bump), so it is NOT used to split.
+    freeform_max_split_depth: int = 2
+
     # Accepted deviation (mm) of the fitted sheet to the region's facets,
     # resolution-scaled: max(this, freeform_dev_tol_rel * local_edge). Above it
     # the fit is rejected and the region left faceted.
@@ -523,10 +535,30 @@ class ConversionConfig:
     freeform_dev_tol_rel: float = 0.6
 
     # Reject a sampled region whose (u,v) grid has more than this fraction of
-    # cells outside the footprint (a ragged / non-rectangular region whose grid
-    # is mostly fabricated by nearest-centroid fallback). Such regions don't fit
-    # cleanly as one rectangular sheet and are left faceted.
-    freeform_max_missing: float = 0.35
+    # cells outside the footprint. With ``freeform_inpaint`` on, missing cells
+    # (a ragged boundary, an interior notch, an L-shaped corner) are filled by a
+    # smooth Laplace solve from the covered values and the extrapolated skirt is
+    # trimmed by the builder's boolean CUT — so a partly-covered region can still
+    # fit cleanly. The ceiling stays a guard against a region so sparse its grid
+    # is mostly fabricated (below half the cells are real surface).
+    freeform_max_missing: float = 0.55
+
+    # Fill (u,v) grid cells outside the region footprint by a discrete Laplace
+    # solve from the covered cells (minimal-curvature smooth extension) instead
+    # of a nearest-centroid step. The smooth grid fits a clean B-spline; the
+    # extrapolated skirt lands past the true surface and the boolean cut trims
+    # it. Disable to restore the historical nearest-centroid fallback.
+    freeform_inpaint: bool = True
+
+    # A freeform sheet claims its facets (removing them from the swept-wall pool)
+    # only when its ``missing`` fraction is at or below this — a well-covered,
+    # confident height field the sweep would mis-fit. A marginal / heavily-
+    # extrapolated sheet (e.g. a split sub-region with a large inpainted skirt)
+    # is still attempted for building but does NOT pre-empt swept walls, which
+    # de-facet more reliably; both ops are guarded + RTAF-gated so whichever
+    # improves the surface wins. Keeps aggressive region splitting from starving
+    # the swept detector (port_cover regression: 44 swept walls -> 0).
+    freeform_claim_max_missing: float = 0.30
 
     # Cost ceiling: the guarded boolean of a doubly-curved sheet against the
     # faceted base is O(base_faces) and can be slow. Skip freeform integration
@@ -606,6 +638,13 @@ class ConversionConfig:
     # Detect and rebuild spherical caps / corner blends. Behind this flag so the
     # whole feature can be disabled if it ever regresses a part.
     detect_spheres: bool = True
+
+    # Roll back a sphere cut/fuse that does not lower the RTAF (residual
+    # tessellation). This is the false-positive net that lets the shallow-cap
+    # fuse volume guard be relaxed (task §2): a mis-detected / bulging cap that
+    # slips past the volume + bbox guards but doesn't actually de-facet the
+    # surface is reverted, so only genuine caps are adopted.
+    sphere_rtaf_gate: bool = True
 
     # Minimum facets a compact smooth region must have to attempt a sphere fit.
     min_sphere_facets: int = 8

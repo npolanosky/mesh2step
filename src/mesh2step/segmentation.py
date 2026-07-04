@@ -795,95 +795,224 @@ def segment_freeform_sheets(
                     assigned.discard(c)
             continue
 
-        # Projection axis = the region's AREA-WEIGHTED MEAN NORMAL. This is the
-        # natural height-field direction (the surface's average facing); using
-        # the eigenvector of minimum normal-scatter instead can tilt the axis to
-        # graze the surface and manufacture a spurious one-directional bend. The
-        # foldover under the mean-normal axis is then the honest injectivity
-        # measure for this projection.
-        n = normals[fa]
-        ar = areas[fa]
-        tot = float(ar.sum())
-        mn = (n * ar[:, None]).sum(axis=0)
-        na = float(np.linalg.norm(mn))
-        if na < 1e-6:
-            continue
-        axis = mn / na
-        # Drop stragglers whose normal is near-perpendicular to the mean axis (a
-        # side wall the growth reached over a smooth edge): they are not part of
-        # this height field and would corrupt its curvature/extent. Recompute the
-        # axis once from the trimmed set for stability.
-        keep_mask = (n @ axis) >= ndot_tol
-        if keep_mask.sum() < config.freeform_min_facets:
-            continue
-        fa = fa[keep_mask]
-        n = normals[fa]
-        ar = areas[fa]
-        tot = float(ar.sum())
-        mn = (n * ar[:, None]).sum(axis=0)
-        na = float(np.linalg.norm(mn))
-        if na < 1e-6:
-            continue
-        axis = mn / na
-        dots = n @ axis
-        best_fold = float(ar[dots < -0.05].sum()) / tot if tot > 0 else 1.0
-        if best_fold > config.freeform_max_foldover:
-            continue
-
-        e1, e2 = _axis_basis(axis)
-        pts = vertices[faces[fa]].reshape(-1, 3)
-        origin = pts.mean(axis=0)
-        # Height field h(u,v) about the mean plane.
-        rel = pts - origin
-        u = rel @ e1
-        w = rel @ e2
-        h = rel @ axis
-        curvature = float(h.max() - h.min())
-        edge = res.edge_for(fa.tolist())
-        curv_floor = max(config.freeform_min_curvature,
-                         config.freeform_min_curvature_edges * edge)
-        if curvature < curv_floor:
-            continue
-
-        # Double-curvature gate: the surface must bend in BOTH in-plane
-        # directions, else it is a single-curvature wall that the swept detector
-        # owns (and de-facets more cheaply). Fit h ≈ a·u + b·w + c·u² + d·w² +
-        # e·uw by least squares; the two second-order coefficients (c, d) are the
-        # principal curvatures of the height field. A cylinder/sweep has one ≈ 0;
-        # a genuine freeform sheet has both non-negligible. We require the
-        # smaller |curvature term| over the region's span to exceed a floor
-        # (fraction of the peak-to-peak height), so a flat-along-one-axis wall is
-        # rejected here and left to the sweep.
-        try:
-            span_u = float(u.max() - u.min()) or 1.0
-            span_w = float(w.max() - w.min()) or 1.0
-            un = u / span_u
-            wn = w / span_w
-            A = np.column_stack([un, wn, un * un, wn * wn, un * wn,
-                                 np.ones_like(un)])
-            coef, *_ = np.linalg.lstsq(A, h, rcond=None)
-            bend_u = abs(float(coef[2]))  # curvature along e1 (over normalised u)
-            bend_w = abs(float(coef[3]))  # curvature along e2
-        except Exception:  # noqa: BLE001
-            bend_u = bend_w = 0.0
-        double = min(bend_u, bend_w)
-        pk = max(curvature, 1e-6)
-        if double < config.freeform_double_curve_frac * pk:
-            continue
-
-        out.append(
-            FreeformRegion(
-                face_indices=sorted(int(i) for i in fa),
-                axis=axis,
-                e1=e1,
-                e2=e2,
-                origin=origin,
-                area=float(ar.sum()),
-                curvature=curvature,
-                foldover=best_fold,
-            )
-        )
+        # Validate + emit the region as a doubly-curved height field. Build-time
+        # deviation-triggered splitting (task §1) happens in the builder, which
+        # can re-run _freeform_subregions on a sheet whose true B-spline fit
+        # misses the mesh — the honest trigger. A segmentation-time quadratic
+        # residual over-fires on gentle single bumps, so it is not used here.
+        reg = _finalize_freeform_region(
+            fa, vertices, faces, normals, areas, res, ndot_tol, config)
+        if reg is not None:
+            out.append(reg)
     return out
+
+
+def _finalize_freeform_region(
+    fa: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    normals: np.ndarray,
+    areas: np.ndarray,
+    res: "MeshResolution",
+    ndot_tol: float,
+    config: ConversionConfig,
+) -> FreeformRegion | None:
+    """Validate one facet set as a doubly-curved height field and return the
+    :class:`FreeformRegion`, or ``None`` if it fails the injectivity / curvature
+    / double-curvature gates."""
+    if len(fa) < config.freeform_min_facets:
+        return None
+
+    n = normals[fa]
+    ar = areas[fa]
+    tot = float(ar.sum())
+    mn = (n * ar[:, None]).sum(axis=0)
+    na = float(np.linalg.norm(mn))
+    if na < 1e-6:
+        return None
+    axis = mn / na
+    # Drop stragglers whose normal is near-perpendicular to the mean axis (a side
+    # wall the growth reached over a smooth edge): they are not part of this
+    # height field and would corrupt its curvature/extent. Recompute the axis
+    # once from the trimmed set for stability.
+    keep_mask = (n @ axis) >= ndot_tol
+    if keep_mask.sum() < config.freeform_min_facets:
+        return None
+    fa = fa[keep_mask]
+    n = normals[fa]
+    ar = areas[fa]
+    tot = float(ar.sum())
+    mn = (n * ar[:, None]).sum(axis=0)
+    na = float(np.linalg.norm(mn))
+    if na < 1e-6:
+        return None
+    axis = mn / na
+    dots = n @ axis
+    best_fold = float(ar[dots < -0.05].sum()) / tot if tot > 0 else 1.0
+    if best_fold > config.freeform_max_foldover:
+        return None
+
+    e1, e2 = _axis_basis(axis)
+    pts = vertices[faces[fa]].reshape(-1, 3)
+    origin = pts.mean(axis=0)
+    # Height field h(u,v) about the mean plane.
+    rel = pts - origin
+    u = rel @ e1
+    w = rel @ e2
+    h = rel @ axis
+    curvature = float(h.max() - h.min())
+    edge = res.edge_for(fa.tolist())
+    curv_floor = max(config.freeform_min_curvature,
+                     config.freeform_min_curvature_edges * edge)
+    if curvature < curv_floor:
+        return None
+
+    # Double-curvature gate: the surface must bend in BOTH in-plane directions,
+    # else it is a single-curvature wall that the swept detector owns (and
+    # de-facets more cheaply). Fit h ≈ a·u + b·w + c·u² + d·w² + e·uw by least
+    # squares; the two second-order coefficients (c, d) are the principal
+    # curvatures. A cylinder/sweep has one ≈ 0; a genuine freeform sheet has both
+    # non-negligible.
+    try:
+        span_u = float(u.max() - u.min()) or 1.0
+        span_w = float(w.max() - w.min()) or 1.0
+        un = u / span_u
+        wn = w / span_w
+        A = np.column_stack([un, wn, un * un, wn * wn, un * wn,
+                             np.ones_like(un)])
+        coef, *_ = np.linalg.lstsq(A, h, rcond=None)
+        bend_u = abs(float(coef[2]))  # curvature along e1 (over normalised u)
+        bend_w = abs(float(coef[3]))  # curvature along e2
+    except Exception:  # noqa: BLE001
+        bend_u = bend_w = 0.0
+    double = min(bend_u, bend_w)
+    pk = max(curvature, 1e-6)
+    if double < config.freeform_double_curve_frac * pk:
+        return None
+
+    return FreeformRegion(
+        face_indices=sorted(int(i) for i in fa),
+        axis=axis,
+        e1=e1,
+        e2=e2,
+        origin=origin,
+        area=float(ar.sum()),
+        curvature=curvature,
+        foldover=best_fold,
+    )
+
+
+def split_freeform_region(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    region: FreeformRegion,
+    config: ConversionConfig | None = None,
+) -> list[FreeformRegion]:
+    """Bisect a freeform region into two sub-regions along its dominant in-plane
+    curvature ridge, re-validating each as its own height field (task §1).
+
+    Used at BUILD time when a region's fitted B-spline misses the real mesh (its
+    deviation gate fails): a large cast surface can be locally a height field but
+    curve too much to be one clean field, so splitting along the ridge yields two
+    flatter sub-fields the builder can each fit. Returns 0-2 valid sub-regions
+    (an empty list means the split produced nothing usable — the caller then
+    leaves the region faceted). Pure numpy."""
+    config = config or ConversionConfig()
+    fa = np.array(region.face_indices, dtype=int)
+    if len(fa) < 2 * config.freeform_min_facets:
+        return []
+    normals, areas = face_normals_and_areas(vertices, faces)
+    res = mesh_resolution(vertices, faces, config)
+    ndot_tol = float(config.freeform_ndot_tol)
+
+    # Bisect along the in-plane basis direction with the larger span (the ridge
+    # the surface bends over): points either side of the median form two sub-
+    # fields. Using the geometric long axis (not the quadratic curvature, which
+    # is noisy) keeps the split stable.
+    origin = region.origin
+    cent = vertices[faces[fa]].mean(axis=1)
+    pu = (cent - origin) @ region.e1
+    pw = (cent - origin) @ region.e2
+    split_dir = region.e1 if (pu.max() - pu.min()) >= (pw.max() - pw.min()) else region.e2
+    proj = (cent - origin) @ split_dir
+    med = float(np.median(proj))
+    left = fa[proj <= med]
+    right = fa[proj > med]
+    out: list[FreeformRegion] = []
+    for sub in (left, right):
+        if len(sub) < config.freeform_min_facets:
+            continue
+        reg = _finalize_freeform_region(
+            sub, vertices, faces, normals, areas, res, ndot_tol, config)
+        if reg is not None:
+            out.append(reg)
+    return out
+
+
+def _border_connected(mask: np.ndarray) -> np.ndarray:
+    """Boolean mask of the ``mask`` cells reachable from the grid border through
+    other ``mask`` cells (4-connected flood fill from the edge).
+
+    Used to tell a footprint's OPEN boundary frame (missing cells touching the
+    grid edge) apart from an ENCLOSED interior hole (missing cells surrounded by
+    covered cells). Pure numpy, iterated dilation intersected with ``mask``."""
+    reach = np.zeros_like(mask, dtype=bool)
+    reach[0, :] |= mask[0, :]
+    reach[-1, :] |= mask[-1, :]
+    reach[:, 0] |= mask[:, 0]
+    reach[:, -1] |= mask[:, -1]
+    while True:
+        grown = reach.copy()
+        grown[1:, :] |= reach[:-1, :]
+        grown[:-1, :] |= reach[1:, :]
+        grown[:, 1:] |= reach[:, :-1]
+        grown[:, :-1] |= reach[:, 1:]
+        grown &= mask
+        if np.array_equal(grown, reach):
+            return reach
+        reach = grown
+
+
+def _laplace_inpaint(height: np.ndarray, mask: np.ndarray,
+                     iters: int = 400) -> np.ndarray:
+    """Fill the ``~mask`` cells of a height grid by solving a discrete Laplace
+    equation (∇²h = 0) with the covered cells as Dirichlet boundary conditions.
+
+    Jacobi/Gauss-Seidel relaxation: each unknown cell is repeatedly replaced by
+    the mean of its 4-neighbours (reflecting at the grid edge so a boundary hole
+    extrapolates the interior gradient smoothly rather than clamping to a wall).
+    This yields the smoothest (minimal-curvature) interpolant through the covered
+    values — the natural extension of a height field into ragged / notched /
+    boundary gaps, and exactly what an OCC B-spline approximation wants (no
+    nearest-neighbour step discontinuities that manufacture folds). Pure numpy.
+    """
+    h = height.astype(float).copy()
+    known = mask.astype(bool)
+    if known.all() or not known.any():
+        return h
+    # Seed unknowns with the global mean of knowns so relaxation converges fast.
+    h[~known] = float(h[known].mean())
+    ng = h.shape[0]
+    for _ in range(iters):
+        up = np.empty_like(h)
+        up[1:, :] = h[:-1, :]
+        up[0, :] = h[1, :] if ng > 1 else h[0, :]
+        dn = np.empty_like(h)
+        dn[:-1, :] = h[1:, :]
+        dn[-1, :] = h[-2, :] if ng > 1 else h[-1, :]
+        lf = np.empty_like(h)
+        lf[:, 1:] = h[:, :-1]
+        lf[:, 0] = h[:, 1] if ng > 1 else h[:, 0]
+        rt = np.empty_like(h)
+        rt[:, :-1] = h[:, 1:]
+        rt[:, -1] = h[:, -2] if ng > 1 else h[:, -1]
+        avg = 0.25 * (up + dn + lf + rt)
+        new = np.where(known, h, avg)
+        if np.max(np.abs(new - h)) < 1e-6:
+            h = new
+            break
+        h = new
+    return h
 
 
 def sample_freeform_grid(
@@ -891,15 +1020,23 @@ def sample_freeform_grid(
     faces: np.ndarray,
     region: FreeformRegion,
     ng: int,
-) -> tuple[np.ndarray, float] | None:
+    inpaint: bool = True,
+    return_mask: bool = False,
+):
     """Resample the mesh over ``region``'s (u,v) footprint into an ``ng``×``ng``
     grid of 3D points (height along ``axis`` from the outermost surface hit).
 
     Pure numpy: for each grid (u,v) the height is the max axis-projection over
     the region facets whose 2D barycentric coordinates contain (u,v) — the
-    outermost sheet along the projection. Cells outside the footprint fall back
-    to the nearest facet-centroid height. Returns ``(grid, missing_fraction)``
-    or ``None`` if the footprint is degenerate. The grid feeds the OCC B-spline
+    outermost sheet along the projection. Cells outside the footprint (a ragged
+    boundary, an interior notch, an L-shaped corner) are *inpainted* by a
+    discrete Laplace solve from the covered cells (``inpaint=True``, the default)
+    — a smooth minimal-curvature extension rather than a nearest-centroid step
+    that would manufacture a fold. The extrapolated skirt is oversized on
+    purpose: the builder's boolean CUT trims whatever lands outside the solid, so
+    a smoothly-extended grid is safe. Returns ``(grid, missing_fraction)`` (the
+    covered-cell fraction is a quality signal the caller still gates on) or
+    ``None`` if the footprint is degenerate. The grid feeds the OCC B-spline
     approximation in the builder (the only FreeCAD-touching step)."""
     fa = np.array(region.face_indices, dtype=int)
     axis, e1, e2, origin = region.axis, region.e1, region.e2, region.origin
@@ -933,8 +1070,8 @@ def sample_freeform_grid(
 
     us = np.linspace(umin, umax, ng)
     vs = np.linspace(vmin, vmax, ng)
-    grid = np.zeros((ng, ng, 3))
-    missing = 0
+    hgrid = np.zeros((ng, ng))
+    covered = np.zeros((ng, ng), dtype=bool)
     for i, uu in enumerate(us):
         pp0 = uu - Au[:, 0]
         for j, vv in enumerate(vs):
@@ -946,11 +1083,38 @@ def sample_freeform_grid(
             ub = 1.0 - vb - wb
             inside = (ub >= -0.03) & (vb >= -0.03) & (wb >= -0.03)
             if inside.any():
-                h = float(np.max((ub * Ah + vb * Bh + wb * Ch)[inside]))
+                hgrid[i, j] = float(np.max((ub * Ah + vb * Bh + wb * Ch)[inside]))
+                covered[i, j] = True
             else:
-                missing += 1
+                # Provisional nearest-centroid height; overwritten by the
+                # Laplace inpaint below when enabled (kept as the fallback so a
+                # disabled inpaint reproduces the historical behaviour).
                 k = int(np.argmin((cu - uu) ** 2 + (cv - vv) ** 2))
-                h = float(Ah[k] * (1 - vb[k] - wb[k]) + Bh[k] * vb[k] + Ch[k] * wb[k]) \
-                    if False else float(((cent[k] - origin) @ axis))
-            grid[i, j] = origin + uu * e1 + vv * e2 + h * axis
-    return grid, missing / float(ng * ng)
+                hgrid[i, j] = float((cent[k] - origin) @ axis)
+
+    missing = float((~covered).sum()) / float(ng * ng)
+    if inpaint and not covered.all() and covered.any():
+        # Inpaint INTERIOR holes (missing cells enclosed by covered cells) with a
+        # smooth Laplace solve; leave BOUNDARY-connected missing cells (the thin
+        # frame the (u,v) bounding box adds around a nearly-rectangular footprint,
+        # or an open L-shaped edge) at their nearest-centroid height. Reason: a
+        # harmonic extension of a domed field past its rim flat-extends the edge
+        # UPWARD, and the extruded cut then leaves that raised skirt — growing the
+        # part's bbox and getting the whole (correct) sheet rejected (freeform_bump
+        # regression). Interior holes have covered cells on all sides, so their
+        # harmonic fill stays inside the surface and is exactly where inpainting
+        # earns its keep (port_cover's notched / cored regions). Boundary-open
+        # regions still benefit: the raggedness that used to blow up the missing
+        # fraction is tolerated, and the real overshoot is trimmed by the cut.
+        border_missing = _border_connected(~covered)
+        interior_fill = ~covered & ~border_missing
+        if interior_fill.any():
+            hgrid = _laplace_inpaint(hgrid, covered | border_missing)
+
+    grid = np.zeros((ng, ng, 3))
+    for i, uu in enumerate(us):
+        for j, vv in enumerate(vs):
+            grid[i, j] = origin + uu * e1 + vv * e2 + hgrid[i, j] * axis
+    if return_mask:
+        return grid, missing, covered
+    return grid, missing

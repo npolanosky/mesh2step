@@ -1940,6 +1940,16 @@ class FreeformSheet:
     foldover: float
     missing: float
     dev_tol: float
+    # Boolean (ng, ng) mask: True where the grid cell is a real surface sample
+    # (not inpainted). Retained for reporting / diagnostics.
+    covered: np.ndarray | None = None
+    # Real facet-centroid sample points (M, 3) of the region — the ground truth
+    # the fitted sheet must match. The grid (with inpainted skirt) undersamples
+    # the true error between grid nodes, so the accept/reject deviation gate
+    # projects THESE dense real points onto the surface. A region that wraps a
+    # corner (not a true height field) shows a large residual here and is
+    # rejected even though its own sparse grid nodes fit well.
+    sample_pts: np.ndarray | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -1979,17 +1989,28 @@ def fit_freeform_sheets(
     ng = int(config.freeform_grid)
     out: list[FreeformSheet] = []
     for region in regions:
-        sampled = sample_freeform_grid(vertices, faces, region, ng)
+        sampled = sample_freeform_grid(vertices, faces, region, ng,
+                                       inpaint=config.freeform_inpaint,
+                                       return_mask=True)
         if sampled is None:
             continue
-        grid, missing = sampled
-        # Too many footprint misses => a ragged / non-rectangular region whose
-        # grid is mostly fabricated; leave it faceted.
+        grid, missing, covered = sampled
+        # Too many footprint misses => the region is so sparse its grid is mostly
+        # fabricated even after inpainting; leave it faceted. Below the ceiling,
+        # the missing corners/notches are smoothly inpainted and the boolean cut
+        # trims the extrapolated skirt (see sample_freeform_grid).
         if missing > config.freeform_max_missing:
             continue
         edge = resolution.edge_for(region.face_indices)
         dev_tol = max(config.freeform_dev_tol_abs,
                       config.freeform_dev_tol_rel * edge)
+        # Dense real ground-truth: the region's facet centroids (downsampled to
+        # keep the builder's per-point OCC parameter search cheap).
+        fa = np.array(region.face_indices, dtype=int)
+        centroids = vertices[faces[fa]].mean(axis=1)
+        if len(centroids) > 400:
+            step = int(np.ceil(len(centroids) / 400.0))
+            centroids = centroids[::step]
         out.append(
             FreeformSheet(
                 grid=grid,
@@ -2000,6 +2021,8 @@ def fit_freeform_sheets(
                 foldover=region.foldover,
                 missing=missing,
                 dev_tol=dev_tol,
+                covered=covered,
+                sample_pts=centroids,
             )
         )
     return out
