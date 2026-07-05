@@ -405,10 +405,19 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
             try:
                 tessellate_typed(step, blob_file, meta_file, cfg.freecad_python,
                                  deflection=cfg.deflection)
-            except Exception as exc:  # noqa: BLE001 - clear reason, not a bare 500
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Surface-type analysis failed: {exc}") from exc
+            except Exception:  # noqa: BLE001
+                # Same transient-FreeCAD-init retry as _ensure_step_mesh.
+                import time as _time
+
+                _time.sleep(1.0)
+                try:
+                    tessellate_typed(step, blob_file, meta_file,
+                                     cfg.freecad_python, deflection=cfg.deflection)
+                except Exception as exc2:  # noqa: BLE001 - clear, actionable 500
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(f"Surface-type analysis failed: {exc2} "
+                                f"(interpreter: {cfg.freecad_python})")) from exc2
         try:
             meta = meta_file.read_text(encoding="utf-8")
             blob = blob_file.read_bytes()
@@ -454,10 +463,22 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
                                 deflection=cfg.deflection)
             except HTTPException:
                 raise
-            except Exception as exc:  # noqa: BLE001 - clear reason, not a bare 500
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"STEP tessellation failed: {exc}") from exc
+            except Exception:  # noqa: BLE001
+                # One retry: FreeCAD's .so init can fail transiently right
+                # after a heavy conversion (allocator pressure on small
+                # servers — surfaces as "Failed to load FreeCAD module!").
+                # A second attempt a moment later usually succeeds.
+                import time as _time
+
+                _time.sleep(1.0)
+                try:
+                    tessellate_step(step, mesh_file, cfg.freecad_python,
+                                    deflection=cfg.deflection)
+                except Exception as exc2:  # noqa: BLE001 - clear, actionable 500
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(f"STEP tessellation failed: {exc2} "
+                                f"(interpreter: {cfg.freecad_python})")) from exc2
         return mesh_file
 
     # ---- corpus ----------------------------------------------------------- #

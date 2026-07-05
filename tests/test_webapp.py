@@ -563,6 +563,71 @@ def test_completed_jobs_openable_by_id_after_restart(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# FreeCAD subprocess env parity                                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_all_freecad_spawns_share_worker_env(tmp_path, monkeypatch):
+    """Every FreeCAD subprocess the webapp launches — the conversion/tessellate
+    worker (``run_worker``) AND the typed tessellation (``tessellate_typed``) —
+    must build its environment through the same ``_worker_env`` helper. One
+    source of truth: the viewer's tessellation can never again diverge from the
+    conversion worker's env (the deployed 'Failed to load FreeCAD module!'
+    class of bug)."""
+    import os
+    import subprocess as _sp
+
+    from mesh2step.webapp import conversion
+
+    sentinel_env = {"M2S_ENV_SENTINEL": "1", "PATH": os.environ.get("PATH", "")}
+    monkeypatch.setattr(conversion, "_worker_env",
+                        lambda fc: dict(sentinel_env))
+    captured: list[tuple[str, dict | None]] = []
+
+    class _FakeProc:
+        pid = 4242
+        returncode = 0
+        stdout = iter(())
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(cmd, **kw):
+        captured.append(("run_worker", kw.get("env")))
+        res = Path(cmd[cmd.index("--result") + 1])
+        res.write_text('{"ok": true, "mode": "tessellate"}')
+        return _FakeProc()
+
+    def fake_run(cmd, **kw):
+        captured.append(("tessellate_typed", kw.get("env")))
+        Path(cmd[cmd.index("--out-blob") + 1]).write_bytes(b"M2SM")
+        Path(cmd[cmd.index("--out-meta") + 1]).write_text("{}")
+
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return _R()
+
+    monkeypatch.setattr(_sp, "Popen", fake_popen)
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    conversion.run_worker({"mode": "tessellate", "input": "x", "output": "y"},
+                          "/fake/python")
+    conversion.tessellate_typed("in.step", tmp_path / "b.m2sm",
+                                tmp_path / "m.json", "/fake/python")
+
+    assert [k for k, _ in captured] == ["run_worker", "tessellate_typed"]
+    for kind, env in captured:
+        assert env is not None and env.get("M2S_ENV_SENTINEL") == "1", \
+            f"{kind} spawn did not build its env via _worker_env"
+
+
+# --------------------------------------------------------------------------- #
 # cancel + active count                                                        #
 # --------------------------------------------------------------------------- #
 
