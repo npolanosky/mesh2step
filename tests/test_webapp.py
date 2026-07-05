@@ -563,6 +563,60 @@ def test_completed_jobs_openable_by_id_after_restart(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# unwritable data dir (Docker named-volume ownership)                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_readonly_data_dir_health_flag_and_503(tmp_path, monkeypatch):
+    """An unwritable data dir must not crash startup; /api/health reports it
+    and convert/rerun answer 503 with the chown guidance (the Docker
+    named-volume-ownership failure: `user:` changed after the volume existed)."""
+    import os as _os
+
+    if _os.name != "posix" or _os.geteuid() == 0:
+        pytest.skip("needs POSIX non-root for read-only dirs")
+
+    monkeypatch.setattr(app_module, "run_worker", _fake_run_worker_ok)
+    monkeypatch.setattr(app_module, "tessellate_step", _fake_tessellate)
+    monkeypatch.setattr(app_module, "tessellate_typed", _fake_tessellate_typed)
+    from mesh2step import provision
+
+    monkeypatch.setattr(provision, "ensure_prep_deps",
+                        lambda fc, log=None, force=False: tmp_path)
+
+    data = tmp_path / "web"
+    (data / "jobs").mkdir(parents=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _os.chmod(data / "jobs", 0o555)
+    _os.chmod(data, 0o555)
+    try:
+        cfg = WebConfig(data_dir=data, freecad_python="/fake/python",
+                        failures_dir=str(corpus))
+        client = TestClient(app_module.create_app(cfg))  # must NOT raise
+
+        h = client.get("/api/health").json()
+        assert h["data_writable"] is False
+        assert h["failures_writable"] is True  # corpus dir is fine
+        assert "PermissionError" in (h["write_error"] or "")
+        assert "chown" in (h["write_fix"] or "")
+
+        with open(CUBE, "rb") as fh:
+            r = client.post("/api/convert",
+                            files={"file": ("cube.stl", fh, "model/stl")})
+        assert r.status_code == 503
+        assert "not writable" in r.json()["detail"]
+        assert "chown" in r.json()["detail"]
+
+        r = client.post("/api/jobs/whatever/rerun")
+        assert r.status_code == 503
+        assert "chown" in r.json()["detail"]
+    finally:
+        _os.chmod(data, 0o755)
+        _os.chmod(data / "jobs", 0o755)
+
+
+# --------------------------------------------------------------------------- #
 # FreeCAD subprocess env parity                                                #
 # --------------------------------------------------------------------------- #
 

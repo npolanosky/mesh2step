@@ -93,7 +93,13 @@ class JobStore:
     def __init__(self, jobs_dir: Path, *, concurrency: int,
                  runner: Callable[[Job, Callable[[str, Any], None]], None]):
         self.jobs_dir = jobs_dir
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Unwritable data dir (e.g. Docker named volume owned by another
+            # uid). Don't kill startup: the app's write probe reports it and
+            # the write endpoints answer 503 with the fix; reads still work.
+            pass
         self._runner = runner
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}

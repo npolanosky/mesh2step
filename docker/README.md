@@ -68,6 +68,26 @@ Symptom of getting this wrong: conversions run but flagged/failed meshes never
 appear in the host dir, and the container log shows permission-denied writing to
 `/data/corpus`.
 
+### Pitfall: changing `user:` with an EXISTING named volume
+
+The `mesh2step-web-data` **named volume** is chowned to the *first* uid that
+used it. If you later add (or change) a `user:` override — e.g. switch to
+`user: "1000:1000"` after the volume was created by the default uid 10001 —
+the volume keeps its **old** ownership and every upload fails with
+`PermissionError: ... mkdir '/data/web/jobs'` (the app returns **503** on
+convert, logs a boxed `DATA DIRECTORY NOT WRITABLE` message at startup, shows
+a red banner in the UI, and reports `data_writable: false` in `/api/health`).
+
+Fix the volume's ownership **once** to match your `user:` line, then restart:
+
+```bash
+docker run --rm -v mesh2step-web-data:/data alpine chown -R 1000:1000 /data
+```
+
+(Replace `1000:1000` with the uid:gid from your `user:` override. The same
+one-liner works for any named volume; the corpus **bind mount** is a plain
+host directory — `sudo chown` it directly instead.)
+
 ---
 
 ## Deploy in Portainer

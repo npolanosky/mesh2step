@@ -72,6 +72,13 @@ main { flex: 1; overflow: hidden; }
 .page { display: none; height: 100%; }
 .page.active { display: block; height: 100%; }
 
+/* ---- storage problem banner ---- */
+.write-banner {
+  background: #fef2f2; border-bottom: 2px solid #fecaca; color: #7f1d1d;
+  padding: 10px 20px; font-size: 13px; line-height: 1.45; flex-shrink: 0;
+}
+.write-banner-detail { color: #991b1b; font-size: 12px; margin-top: 3px; word-break: break-word; }
+
 .convert-grid {
   display: grid;
   grid-template-columns: 420px 1fr;

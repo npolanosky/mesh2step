@@ -62,6 +62,22 @@
     if (h.freecad_ready) { fb.textContent = "FreeCAD ✓"; fb.classList.remove("pill-warn"); fb.classList.add("pill-ok"); fb.title = h.freecad; }
     else { fb.textContent = "FreeCAD ✗"; fb.title = "FreeCAD not found — conversions will fail"; }
     $("opt-savefail").checked = !!h.save_failures;
+    // Storage problem banner: unwritable data dir kills uploads (503); an
+    // unwritable corpus dir only breaks failure-saving/flagging.
+    if (h.data_writable === false || h.failures_writable === false) {
+      const b = $("write-banner");
+      const what = h.data_writable === false
+        ? "Server DATA directory is not writable — uploads and conversions will fail."
+        : "Failure-corpus directory is not writable — failure saving and flagging will fail.";
+      b.innerHTML = "";
+      const head = document.createElement("strong");
+      head.textContent = "⚠ " + what;
+      const detail = document.createElement("div");
+      detail.className = "write-banner-detail";
+      detail.textContent = (h.write_error ? h.write_error + " — " : "") + (h.write_fix || "");
+      b.appendChild(head); b.appendChild(detail);
+      b.hidden = false;
+    }
   }).catch(() => {});
 
   $("opt-savefail").addEventListener("change", (e) => {

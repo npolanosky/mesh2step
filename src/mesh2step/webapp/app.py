@@ -120,10 +120,39 @@ def _make_runner(cfg: WebConfig, store: JobStore, save_failures_flag):
     return runner
 
 
+def _probe_writable(path: Path) -> tuple[bool, str | None]:
+    """Can this process create files under ``path``? Returns (ok, reason).
+
+    Creates the directory if missing, writes a probe file, deletes it. Any
+    OSError (PermissionError being the classic Docker named-volume-ownership
+    case) is reported as the reason string instead of raised.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True, None
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+_CHOWN_FIX = (
+    "If this is Docker with a `user:` override and a NAMED VOLUME created by an "
+    "earlier run (owned by another uid, e.g. the default 10001), fix the volume "
+    "ownership once:  docker run --rm -v mesh2step-web-data:/data alpine "
+    "chown -R <uid>:<gid> /data  (use the uid:gid from your `user:` line), "
+    "then restart the stack. See docker/README.md."
+)
+
+
 def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
     """Build the FastAPI app. ``runner`` overrides the conversion runner (tests)."""
     cfg = config or WebConfig()
-    cfg.ensure_dirs()
+    try:
+        cfg.ensure_dirs()
+    except OSError:
+        pass  # reported by the write probe below; the app must still serve
     if cfg.freecad_python is None:
         try:
             from ..freecad_env import find_freecad_python
@@ -158,9 +187,40 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
     if runner is None:
         store._runner = _make_runner(cfg, store, save_failures)
 
+    # ---- startup write probes --------------------------------------------- #
+    # The classic failure: a Docker named volume owned by a different uid than
+    # the container user (e.g. `user: 1000` added after the volume was chowned
+    # to the image default 10001) -> every upload dies with PermissionError.
+    # Probe once at startup, shout the exact fix, expose it via /api/health
+    # (UI banner) and return clear 503s from the write endpoints.
+    from .. import failstore
+
+    try:
+        failures_dest = Path(failstore.resolve_dest(cfg.failures_dir))
+    except Exception:  # noqa: BLE001 - resolution itself must not kill startup
+        failures_dest = Path(cfg.failures_dir) if cfg.failures_dir else cfg.data_dir / "corpus"
+    write_status = {
+        "data": _probe_writable(cfg.jobs_dir),
+        "failures": _probe_writable(failures_dest),
+    }
+    for name, (ok, reason), path, impact in (
+        ("data", write_status["data"], cfg.jobs_dir,
+         "uploads and conversions WILL FAIL (503)"),
+        ("failures", write_status["failures"], failures_dest,
+         "failure-corpus saving and flagging WILL FAIL"),
+    ):
+        if not ok:
+            print("=" * 72)
+            print(f"!! {name.upper()} DIRECTORY NOT WRITABLE — {impact}")
+            print(f"!!   dir    : {path}")
+            print(f"!!   error  : {reason}")
+            print(f"!!   fix    : {_CHOWN_FIX}")
+            print("=" * 72)
+
     app.state.cfg = cfg
     app.state.store = store
     app.state.save_failures = save_failures
+    app.state.write_status = write_status
 
     # ---- meta ------------------------------------------------------------- #
     @app.get("/healthz")
@@ -178,6 +238,8 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
     def health() -> dict:
         from .. import DISPLAY_VERSION
 
+        data_ok, data_err = write_status["data"]
+        fail_ok, fail_err = write_status["failures"]
         return {
             "ok": True,
             "version": DISPLAY_VERSION,
@@ -185,6 +247,10 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
             "freecad_ready": bool(cfg.freecad_python),
             "concurrency": cfg.concurrency,
             "save_failures": save_failures[0],
+            "data_writable": data_ok,
+            "failures_writable": fail_ok,
+            "write_error": data_err or fail_err,
+            "write_fix": None if (data_ok and fail_ok) else _CHOWN_FIX,
         }
 
     @app.post("/api/settings")
@@ -196,8 +262,18 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
         return {"save_failures": save_failures[0]}
 
     # ---- convert ---------------------------------------------------------- #
+    def _require_writable_store() -> None:
+        """503 with the exact fix when the data dir can't be written."""
+        ok, reason = write_status["data"]
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail=(f"Server data directory is not writable "
+                        f"({reason}). {_CHOWN_FIX}"))
+
     @app.post("/api/convert")
     async def convert(request: Request, file: UploadFile) -> JSONResponse:
+        _require_writable_store()
         data = await file.read()
         if len(data) > cfg.max_upload_bytes:
             raise HTTPException(status_code=413, detail="Upload too large.")
@@ -210,7 +286,14 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
                 raw_opts = json.loads(form["options"])
             except (ValueError, TypeError):
                 raw_opts = {}
-        job = store.create(file.filename, _clean_options(raw_opts), data)
+        try:
+            job = store.create(file.filename, _clean_options(raw_opts), data)
+        except OSError as exc:
+            # The dir turned unwritable after startup (volume remounted, disk
+            # full...): update the health flag and answer with guidance.
+            write_status["data"] = (False, f"{type(exc).__name__}: {exc}")
+            _require_writable_store()
+            raise  # unreachable; _require_writable_store raised
         return JSONResponse({"id": job.id})
 
     # ---- job state -------------------------------------------------------- #
@@ -259,7 +342,13 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
 
     @app.post("/api/jobs/{job_id}/rerun")
     def rerun(job_id: str) -> dict:
-        job = store.requeue(job_id)
+        _require_writable_store()
+        try:
+            job = store.requeue(job_id)
+        except OSError as exc:
+            write_status["data"] = (False, f"{type(exc).__name__}: {exc}")
+            _require_writable_store()
+            raise  # unreachable
         if job is None:
             raise HTTPException(status_code=404, detail="Cannot re-run this job.")
         return {"id": job.id}
