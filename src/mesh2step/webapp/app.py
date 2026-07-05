@@ -272,9 +272,15 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="No finished job to flag.")
         from .. import failstore
 
-        action = failstore.record_flag(
-            str(store.input_path(job_id)), job.result, dest=cfg.failures_dir)
+        try:
+            action = failstore.record_flag(
+                str(store.input_path(job_id)), job.result, dest=cfg.failures_dir)
+        except Exception as exc:  # noqa: BLE001 - surface a clear reason to the UI
+            raise HTTPException(status_code=500,
+                                detail=f"Flagging failed: {exc}") from exc
         job.corpus_action = action
+        # Persist so a reopened (or post-restart) job still shows as flagged.
+        store._persist(job)
         return {"action": action}
 
     # ---- streaming progress (SSE) ---------------------------------------- #

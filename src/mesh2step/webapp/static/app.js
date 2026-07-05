@@ -386,6 +386,7 @@
     $("verdict").hidden = true;
     $("result-badges").hidden = true;
     $("result-actions").hidden = true;
+    resetFlagButton();
     $("log").textContent = "";
     $("scalebar").hidden = true;
     $("dev-stats").hidden = true;
@@ -555,19 +556,65 @@
       a.title = name;
       dlc.appendChild(a);
     });
-    $("flag-btn").disabled = !s.is_solid;
-    $("flag-btn").onclick = () => {
-      $("flag-btn").disabled = true;
-      api("/api/jobs/" + job.id + "/flag", { method: "POST" })
-        .then(() => appendLog("Flagged for improvement (faceted_improvable).", "l-ok"))
-        .catch((e) => appendLog("flag failed: " + e.message, "l-err"));
-    };
+    setFlagState(job);
 
     // Enable STEP + heatmap viewer tabs.
     $("view-tabs").querySelectorAll(".seg-btn").forEach((b) => b.disabled = false);
     loadView("step");  // auto-jump to the converted result
   }
   function bdg(text, cls) { const s = document.createElement("span"); s.className = "badge " + (cls||""); s.textContent = text; return s; }
+
+  // ---- flag-for-improvement button state --------------------------------- //
+  // Explicit lifecycle so every click has visible feedback:
+  //   default -> "Flagging…" (disabled) -> "✓ Flagged — saved to corpus"
+  //   (stays disabled + green for that job), or an inline error + re-enabled.
+  // A job flagged earlier (server persists corpus_action) reopens as flagged.
+  function resetFlagButton() {
+    const btn = $("flag-btn");
+    btn.textContent = "Flag for improvement";
+    btn.classList.remove("btn-flagged");
+    btn.disabled = true;
+    btn.onclick = null;
+    const st = $("flag-status");
+    st.textContent = "";
+    st.className = "flag-status";
+  }
+
+  function setFlagState(job) {
+    const btn = $("flag-btn");
+    const st = $("flag-status");
+    resetFlagButton();
+    const s = (job.result && job.result.stats) || {};
+    const flagged = job.corpus_action &&
+                    job.corpus_action.category === "faceted_improvable";
+    if (flagged) {
+      btn.textContent = "✓ Flagged — saved to corpus";
+      btn.classList.add("btn-flagged");
+      btn.disabled = true;
+      return;
+    }
+    btn.disabled = !s.is_solid;
+    btn.onclick = () => {
+      btn.disabled = true;
+      btn.textContent = "Flagging…";
+      st.textContent = "";
+      st.className = "flag-status";
+      api("/api/jobs/" + job.id + "/flag", { method: "POST" })
+        .then((r) => r.json())
+        .then(() => {
+          btn.textContent = "✓ Flagged — saved to corpus";
+          btn.classList.add("btn-flagged");
+          appendLog("Flagged for improvement (faceted_improvable).", "l-ok");
+        })
+        .catch((e) => {
+          btn.disabled = false;
+          btn.textContent = "Flag for improvement";
+          st.textContent = "✖ Flag failed: " + e.message;
+          st.className = "flag-status flag-err";
+          appendLog("flag failed: " + e.message, "l-err");
+        });
+    };
+  }
 
   // ---- viewer tabs ------------------------------------------------------ //
   $("view-tabs").addEventListener("click", (e) => {

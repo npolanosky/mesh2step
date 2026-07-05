@@ -199,6 +199,14 @@ select {
 .result-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
 .dl-links { display: flex; gap: 8px; flex-wrap: wrap; }
 
+/* flag-for-improvement feedback states */
+#flag-btn.btn-flagged {
+  background: #dcfce7; border-color: #bbf7d0; color: #166534;
+  opacity: 1; cursor: default;
+}
+.flag-status { font-size: 12px; }
+.flag-status.flag-err { color: var(--err); font-weight: 600; }
+
 /* ---- log ---- */
 .log-card summary { cursor: pointer; font-weight: 600; }
 .log {

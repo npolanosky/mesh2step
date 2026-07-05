@@ -410,6 +410,17 @@ def test_flag_for_improvement(tmp_path, monkeypatch):
     assert entry["category"] == "faceted_improvable"
     assert entry["history"][0]["outcome"] == "flagged"
 
+    # The flagged state is on the job record (what the UI's "already flagged"
+    # button state reads on reopen)...
+    d = client.get(f"/api/jobs/{job_id}").json()
+    assert d["corpus_action"]["category"] == "faceted_improvable"
+    # ...and survives a server restart (persisted to job.json).
+    cfg = WebConfig(data_dir=tmp_path / "web", freecad_python="/fake/python",
+                    failures_dir=str(tmp_path / "corpus"))
+    client2 = TestClient(app_module.create_app(cfg))
+    d2 = client2.get(f"/api/jobs/{job_id}").json()
+    assert d2["corpus_action"]["category"] == "faceted_improvable"
+
 
 def test_queueing_two_jobs(tmp_path, monkeypatch):
     """A second conversion submitted while the first runs must queue, not crash."""
