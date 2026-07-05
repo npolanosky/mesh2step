@@ -228,7 +228,8 @@ def _colormap(t: np.ndarray) -> np.ndarray:
 
 
 def deviation_payload(stl_path: str | Path, step_mesh_path: str | Path,
-                      *, clamp: float | None = None) -> tuple[bytes, dict]:
+                      *, clamp: float | None = None,
+                      max_pairs: float = 1.5e8) -> tuple[bytes, dict]:
     """Build the coloured ``M2SM`` blob + deviation stats for the heatmap tab.
 
     ``step_mesh_path`` is the STEP already tessellated to an STL by the worker.
@@ -236,11 +237,26 @@ def deviation_payload(stl_path: str | Path, step_mesh_path: str | Path,
     STL surface, normalise against ``clamp`` (default: max(p95, max/2)) and map
     to a jet colour. Returns ``(blob, stats)`` where stats has max/rms/p95/mean
     (mm) and the colour-scale ``clamp`` used for the scalar bar.
+
+    Big-model budget: the nearest-triangle search is brute force
+    (points x triangles). Above ``max_pairs`` evaluated pairs the reference STL
+    triangle set is uniformly subsampled to fit the budget, so the heatmap
+    stays interactive (seconds, not minutes) on community-scale meshes at the
+    cost of a slight deviation OVER-estimate where the true nearest triangle
+    was dropped (bounded by local triangle size). ``stats["approx"]`` flags it.
     """
     step_tri = load_triangles(step_mesh_path)
     stl_tri = load_triangles(stl_path)
 
     step_verts = step_tri.reshape(-1, 3)
+    approx = False
+    npts, ntri = step_verts.shape[0], stl_tri.shape[0]
+    if npts and ntri and npts * ntri > max_pairs:
+        keep = max(2000, int(max_pairs / npts))
+        if keep < ntri:
+            idx = np.linspace(0, ntri - 1, keep).astype(np.int64)
+            stl_tri = np.ascontiguousarray(stl_tri[idx])
+            approx = True
     dev = _nearest_distance(step_verts, stl_tri)
 
     stats = {
@@ -248,6 +264,7 @@ def deviation_payload(stl_path: str | Path, step_mesh_path: str | Path,
         "rms": float(np.sqrt(np.mean(dev ** 2))) if dev.size else 0.0,
         "p95": float(np.percentile(dev, 95)) if dev.size else 0.0,
         "mean": float(dev.mean()) if dev.size else 0.0,
+        "approx": approx,
     }
     hi = clamp if clamp is not None else max(stats["p95"], stats["max"] * 0.5, 1e-6)
     stats["clamp"] = float(hi)

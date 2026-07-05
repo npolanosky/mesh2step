@@ -138,3 +138,27 @@ def tessellate_step(step_path: str | Path, out_mesh: str | Path,
     if not result.get("ok"):
         raise WorkerError(result.get("error", "tessellation failed"))
     return result
+
+
+def tessellate_typed(step_path: str | Path, out_blob: str | Path,
+                     out_meta: str | Path, freecad_python: str, *,
+                     deflection: float = 0.1, timeout: float = 600) -> None:
+    """Per-face typed tessellation for the surface-provenance viewer overlay.
+
+    Runs :mod:`mesh2step.webapp.stepmesh` under FreeCAD's Python (same env
+    wiring as the conversion worker) to write an M2SM blob whose vertex
+    colours encode each face's surface category, plus a JSON legend sidecar.
+    Raises :class:`WorkerError` with the script's stderr on failure.
+    """
+    proc = subprocess.run(
+        [freecad_python, "-m", "mesh2step.webapp.stepmesh",
+         "--step", str(step_path), "--out-blob", str(out_blob),
+         "--out-meta", str(out_meta), "--deflection", str(float(deflection))],
+        env=_worker_env(freecad_python),
+        capture_output=True, text=True, timeout=timeout,
+        creationflags=_NO_WINDOW,
+    )
+    if proc.returncode != 0 or not Path(out_blob).is_file():
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1] if tail else f"exit {proc.returncode}"
+        raise WorkerError(f"typed tessellation failed: {detail}")

@@ -159,7 +159,7 @@
     if (this.edges) { this.scene.remove(this.edges); this.edges.geometry.dispose(); this.edges.material.dispose(); this.edges = null; }
   };
 
-  // kind: "stl" | "step" | "heatmap"
+  // kind: "stl" | "step" | "heatmap" | "types" (STEP coloured by surface type)
   Viewer.prototype.load = function (buffer, kind, keepCamera) {
     this.clear();
     const parsed = parseM2SM(buffer);
@@ -169,7 +169,7 @@
     else geo.computeVertexNormals();
 
     const opts = { flatShading: true, side: THREE.DoubleSide, roughness: 0.72, metalness: 0.02 };
-    if (kind === "heatmap" && parsed.colors) {
+    if ((kind === "heatmap" || kind === "types") && parsed.colors) {
       const f = new Float32Array(parsed.colors.length);
       for (let i = 0; i < f.length; i++) f[i] = parsed.colors[i] / 255;
       geo.setAttribute("color", new THREE.BufferAttribute(f, 3));

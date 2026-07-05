@@ -20,6 +20,15 @@
   let clockSkew = 0;             // client_seconds - server_seconds
   let jobStarted = null;         // server epoch when the watched job started
   const meshCache = {};          // view -> ArrayBuffer for the current job
+  // Camera persistence: reframe ONLY when a genuinely new part is shown (new
+  // file picked / different job opened). Tab switches (STL/STEP/Deviation) and
+  // convert-of-the-previewed-file keep the user's rotation/zoom/target.
+  let cameraFresh = true;        // true -> next mesh load reframes the camera
+  // Stale-fetch guard: every context switch (open job B, new conversion, new
+  // files) bumps the token; in-flight payload fetches from the previous
+  // context see a mismatched token and drop their result instead of rendering
+  // the previous part over the new one.
+  let viewToken = 0;
 
   // ---- viewer init (lazy, needs a sized container) ---------------------- //
   function ensureViewer() {
@@ -174,6 +183,8 @@
     }
     renderFileList();
     // Reset any prior result view and preview the first file client-side.
+    viewToken++;          // drop any in-flight payloads from a previous context
+    cameraFresh = true;   // new part -> reframe once
     resetResult();
     previewLocalStl(selectedFiles[0]);
   }
@@ -211,12 +222,15 @@
 
   // Parse a binary/ascii STL in the browser for instant input preview.
   function previewLocalStl(file) {
+    const tok = viewToken;
     const reader = new FileReader();
     reader.onload = () => {
+      if (tok !== viewToken) return;  // superseded by a newer context
       try {
         const blob = stlToM2SM(reader.result);
         $("viewer-empty").hidden = true;
-        ensureViewer().load(blob, "stl", false);
+        ensureViewer().load(blob, "stl", !cameraFresh);
+        cameraFresh = false;
         setViewTab("stl");
         viewer._resize();
       } catch (err) { console.warn("local STL preview failed:", err); }
@@ -345,6 +359,8 @@
   function newConversion() {
     if (evtSource) { evtSource.close(); evtSource = null; }
     clearInterval(timer);
+    viewToken++;          // invalidate any in-flight payload fetches
+    cameraFresh = true;
     currentJob = null;
     jobDone = false;
     jobStarted = null;
@@ -456,15 +472,20 @@
 
     selectedFiles = [];
     renderFileList();
+    const tok = ++viewToken;  // invalidate any in-flight fetch for a prior part
+    cameraFresh = true;       // different part -> reframe once
     resetResult();
     $("progress-card").hidden = false;
     $("convert-btn").disabled = true;
     setStatus("Attaching…", 2);
     // Preview the job's input STL in the viewer.
     $("viewer-empty").hidden = true;
+    currentJob = id;
     fetch("/api/jobs/" + id + "/mesh/stl").then((r) => r.arrayBuffer()).then((buf) => {
+      if (tok !== viewToken) return;  // user opened another job meanwhile
       meshCache["stl"] = { buf, stats: null };
-      ensureViewer().load(buf, "stl", false); setViewTab("stl"); viewer._resize();
+      renderMesh(buf, "stl", null);
+      setViewTab("stl");
     }).catch(() => {});
     watchJob(id);
   }
@@ -474,7 +495,11 @@
     showCancel(false);
     $("convert-btn").disabled = !selectedFiles.length;
     refreshActive();
+    const tok = viewToken;
     fetch("/api/jobs/" + id).then((r) => r.json()).then((job) => {
+      // Stale guard: the user may have opened a different job while this
+      // detail fetch was in flight — don't render the previous part's result.
+      if (tok !== viewToken || currentJob !== id) return;
       // Final elapsed comes from the server (finished - started), never the
       // page-load clock.
       if (job.elapsed) $("elapsed").textContent = job.elapsed.toFixed(1) + "s";
@@ -585,15 +610,64 @@
     el.hidden = false;
   }
 
+  // ---- STEP colour mode (plain vs by-surface-type) ----------------------- //
+  let stepColorMode = "plain";
+  $("color-tabs").addEventListener("click", (e) => {
+    const b = e.target.closest(".seg-btn"); if (!b) return;
+    if (b.dataset.color === stepColorMode) return;
+    stepColorMode = b.dataset.color;
+    $("color-tabs").querySelectorAll(".seg-btn").forEach((x) =>
+      x.classList.toggle("active", x.dataset.color === stepColorMode));
+    loadView("step");  // re-render the STEP tab in the new mode
+  });
+
+  function renderLegend(meta) {
+    const el = $("type-legend");
+    el.innerHTML = "";
+    const order = ["plane", "cylinder", "sphere", "freeform", "residual"];
+    for (const c of order) {
+      const e = meta && meta.legend && meta.legend[c];
+      if (!e) continue;
+      const row = document.createElement("div");
+      row.className = "legend-row";
+      const sw = document.createElement("span");
+      sw.className = "legend-swatch";
+      sw.style.background = "rgb(" + e.color.join(",") + ")";
+      const label = document.createElement("span");
+      label.className = "legend-label";
+      label.textContent = e.label;
+      const count = document.createElement("span");
+      count.className = "legend-count";
+      count.textContent = e.faces + (e.faces === 1 ? " face" : " faces") +
+        (e.area_frac != null ? " · " + (e.area_frac * 100).toFixed(1) + "%" : "");
+      row.appendChild(sw); row.appendChild(label); row.appendChild(count);
+      el.appendChild(row);
+    }
+    el.hidden = el.childElementCount === 0;
+  }
+
   function loadView(view) {
     setViewTab(view);
     $("scalebar").hidden = view !== "heatmap";
     $("dev-stats").hidden = view !== "heatmap";
+    // The colour-mode toggle only applies to the STEP tab; the legend only to
+    // its "by surface" mode.
+    const isTypes = view === "step" && stepColorMode === "types";
+    $("color-tabs").hidden = view !== "step";
+    if (!isTypes) $("type-legend").hidden = true;
     if (view === "stl" && selectedFiles.length && !currentJob) return; // already local-previewed
-    const url = "/api/jobs/" + currentJob + "/mesh/" + view;
-    if (meshCache[view]) { renderMesh(meshCache[view].buf, view, meshCache[view].stats); return; }
+    const key = isTypes ? "steptypes" : view;          // cache key
+    const kind = isTypes ? "types" : view;             // viewer render kind
+    const url = "/api/jobs/" + currentJob + "/mesh/" + (isTypes ? "steptypes" : view);
+    if (meshCache[key]) {
+      renderMesh(meshCache[key].buf, kind, meshCache[key].stats);
+      if (isTypes) renderLegend(meshCache[key].meta);
+      return;
+    }
+    const tok = viewToken;  // drop the result if the context changes mid-fetch
     $("viewer-empty").hidden = true;
     if (view === "heatmap") viewerMessage("Computing deviation heatmap…"), $("viewer-empty").hidden = false;
+    if (isTypes) viewerMessage("Analysing face types…"), $("viewer-empty").hidden = false;
     fetch(url).then((r) => {
       // A non-2xx response is a JSON error body, NOT an M2SM blob. Parse it and
       // surface the detail rather than feeding error bytes to the mesh parser
@@ -604,28 +678,45 @@
         });
       }
       const stats = r.headers.get("X-Deviation-Stats");
-      return r.arrayBuffer().then((buf) => ({ buf, stats: stats ? JSON.parse(stats) : null }));
-    }).then(({ buf, stats }) => {
-      meshCache[view] = { buf, stats };
-      renderMesh(buf, view, stats);
+      const types = r.headers.get("X-Face-Types");
+      return r.arrayBuffer().then((buf) => ({
+        buf,
+        stats: stats ? JSON.parse(stats) : null,
+        meta: types ? JSON.parse(types) : null,
+      }));
+    }).then(({ buf, stats, meta }) => {
+      if (tok !== viewToken) return;  // stale: a different part is now shown
+      meshCache[key] = { buf, stats, meta };
+      renderMesh(buf, kind, stats);
+      if (isTypes) renderLegend(meta);
       $("viewer-empty").hidden = true;
     }).catch((err) => {
-      const label = view === "heatmap" ? "Deviation heatmap unavailable" :
+      if (tok !== viewToken) return;
+      const label = isTypes ? "Surface-type analysis unavailable" :
+                    view === "heatmap" ? "Deviation heatmap unavailable" :
                     view === "step" ? "STEP preview unavailable" : "Preview unavailable";
-      appendLog("viewer load failed (" + view + "): " + err.message, "l-err");
+      appendLog("viewer load failed (" + key + "): " + err.message, "l-err");
       viewerMessage(label + ": " + err.message);
     });
   }
 
   function renderMesh(buf, view, stats) {
-    ensureViewer().load(buf, view, false);
+    // Keep the user's camera when switching tabs of the same part; only a new
+    // part (cameraFresh) reframes. Applies in both orbit modes — the camera
+    // object and controls are untouched when keepCamera=true.
+    ensureViewer().load(buf, view, !cameraFresh);
+    cameraFresh = false;
+    // Expose what's rendered for state verification (job id + view).
+    $("viewer").dataset.job = currentJob || "";
+    $("viewer").dataset.view = view;
     viewer._resize();
     if (view === "heatmap" && stats) {
       $("sb-hi").textContent = stats.clamp.toFixed(3);
       $("dev-stats").innerHTML =
         "max " + stats.max.toFixed(4) + " mm<br>" +
         "rms " + stats.rms.toFixed(4) + " mm<br>" +
-        "p95 " + stats.p95.toFixed(4) + " mm";
+        "p95 " + stats.p95.toFixed(4) + " mm" +
+        (stats.approx ? "<br>≈ subsampled (large mesh)" : "");
       $("dev-stats").hidden = false;
     }
   }

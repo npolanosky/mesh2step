@@ -28,7 +28,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from .config import WebConfig
-from .conversion import run_worker, tessellate_step
+from .conversion import run_worker, tessellate_step, tessellate_typed
 from .jobs import DONE, Job, JobStore
 
 _STATIC = Path(__file__).resolve().parent / "static"
@@ -133,7 +133,24 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
             cfg.freecad_python = None
 
     app = FastAPI(title="mesh2step-web")
-    save_failures = [False]
+
+    # "Save failing models" defaults ON and persists across restarts
+    # (data_dir/settings.json), so the failure corpus keeps growing unless the
+    # user explicitly turns it off.
+    settings_path = cfg.data_dir / "settings.json"
+    save_failures = [True]
+    try:
+        persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+        save_failures[0] = bool(persisted.get("save_failures", True))
+    except (OSError, ValueError):
+        pass
+
+    def _persist_settings() -> None:
+        try:
+            settings_path.write_text(
+                json.dumps({"save_failures": save_failures[0]}), encoding="utf-8")
+        except OSError:
+            pass
 
     store = JobStore(cfg.jobs_dir, concurrency=cfg.concurrency,
                      runner=runner or _make_runner(cfg, None, save_failures))
@@ -175,6 +192,7 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
         body = await request.json()
         if "save_failures" in body:
             save_failures[0] = bool(body["save_failures"])
+            _persist_settings()
         return {"save_failures": save_failures[0]}
 
     # ---- convert ---------------------------------------------------------- #
@@ -359,6 +377,40 @@ def create_app(config: WebConfig | None = None, *, runner=None) -> FastAPI:
             raise HTTPException(status_code=500,
                                 detail=f"STEP mesh failed: {exc}") from exc
         return Response(blob, media_type="application/octet-stream")
+
+    @app.get("/api/jobs/{job_id}/mesh/steptypes")
+    def mesh_steptypes(job_id: str) -> Response:
+        """STEP tessellation coloured by surface provenance (analytic planes,
+        cylinders/cones, spheres, freeform, residual RTAF strips). Cached in
+        the job dir; the legend rides in the ``X-Face-Types`` header."""
+        job = store.get(job_id)
+        if job is None or job.state != DONE:
+            raise HTTPException(status_code=404, detail="No converted STEP.")
+        step = _first_output(job)
+        if step is None:
+            raise HTTPException(status_code=404, detail="No output file.")
+        blob_file = store.job_dir(job_id) / (step.stem + "_types.m2sm")
+        meta_file = store.job_dir(job_id) / (step.stem + "_types.json")
+        if not (blob_file.is_file() and meta_file.is_file()):
+            if not cfg.freecad_python:
+                raise HTTPException(status_code=503,
+                                    detail="FreeCAD not available on the server; "
+                                           "cannot analyse the STEP's faces.")
+            try:
+                tessellate_typed(step, blob_file, meta_file, cfg.freecad_python,
+                                 deflection=cfg.deflection)
+            except Exception as exc:  # noqa: BLE001 - clear reason, not a bare 500
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Surface-type analysis failed: {exc}") from exc
+        try:
+            meta = meta_file.read_text(encoding="utf-8")
+            blob = blob_file.read_bytes()
+        except OSError as exc:
+            raise HTTPException(status_code=500,
+                                detail=f"Surface-type payload unreadable: {exc}") from exc
+        return Response(blob, media_type="application/octet-stream",
+                        headers={"X-Face-Types": meta})
 
     @app.get("/api/jobs/{job_id}/mesh/heatmap")
     def mesh_heatmap(job_id: str) -> Response:

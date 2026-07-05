@@ -75,6 +75,30 @@ def _fake_tessellate(step_path, out_mesh, freecad_python, *, deflection=0.1,
     return {"ok": True, "facets": 12}
 
 
+def _fake_tessellate_typed(step_path, out_blob, out_meta, freecad_python, *,
+                           deflection=0.1, timeout=0):
+    """Fake typed tessellation: one gray plane triangle + one orange residual."""
+    import numpy as np
+
+    from mesh2step.webapp.meshdata import _pack
+
+    pos = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0],
+                    [0, 0, 1], [1, 0, 1], [0, 1, 1]], dtype=np.float64)
+    normals = np.tile([0.0, 0.0, 1.0], (6, 1))
+    colors = np.array([[203, 208, 215]] * 3 + [[249, 115, 22]] * 3,
+                      dtype=np.uint8)
+    Path(out_blob).write_bytes(_pack(pos, normals, colors))
+    Path(out_meta).write_text(json.dumps({
+        "legend": {
+            "plane": {"color": [203, 208, 215], "label": "Planar (analytic)",
+                      "faces": 1, "tris": 1, "area_mm2": 0.5, "area_frac": 0.5},
+            "residual": {"color": [249, 115, 22], "label": "Residual tessellation",
+                         "faces": 1, "tris": 1, "area_mm2": 0.5, "area_frac": 0.5},
+        },
+        "faces": 2, "tris": 2, "residual_faces": 1,
+    }), encoding="utf-8")
+
+
 # --------------------------------------------------------------------------- #
 # helpers                                                                      #
 # --------------------------------------------------------------------------- #
@@ -83,6 +107,7 @@ def _fake_tessellate(step_path, out_mesh, freecad_python, *, deflection=0.1,
 def _client(tmp_path, monkeypatch, worker=_fake_run_worker_ok) -> TestClient:
     monkeypatch.setattr(app_module, "run_worker", worker)
     monkeypatch.setattr(app_module, "tessellate_step", _fake_tessellate)
+    monkeypatch.setattr(app_module, "tessellate_typed", _fake_tessellate_typed)
     # Keep tests hermetic: never provision real prep deps from a test run.
     from mesh2step import provision
 
@@ -317,10 +342,59 @@ def test_failing_mesh_records_to_failstore(tmp_path, monkeypatch):
 
 def test_failstore_not_recorded_when_toggle_off(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch, worker=_fake_run_worker_not_watertight)
+    # Saving now defaults ON — turn it off explicitly for this test.
+    client.post("/api/settings", json={"save_failures": False})
     job_id = _convert(client)
     d = _wait_done(client, job_id)
     assert d["corpus_action"] is None
     assert not (tmp_path / "corpus" / "manifest.json").exists()
+
+
+def test_save_failures_defaults_on_and_persists(tmp_path, monkeypatch):
+    """'Save failing models' defaults ON and the toggle survives a restart."""
+    client = _client(tmp_path, monkeypatch, worker=_fake_run_worker_not_watertight)
+    assert client.get("/api/health").json()["save_failures"] is True
+
+    # Default ON: a non-watertight result lands in the corpus with no toggling.
+    job_id = _convert(client)
+    d = _wait_done(client, job_id)
+    assert d["corpus_action"] is not None and d["corpus_action"]["action"] == "saved"
+
+    # Turn it off; a fresh app over the same data dir (restart) must still be off.
+    client.post("/api/settings", json={"save_failures": False})
+    cfg = WebConfig(data_dir=tmp_path / "web", freecad_python="/fake/python",
+                    failures_dir=str(tmp_path / "corpus"))
+    client2 = TestClient(app_module.create_app(cfg))
+    assert client2.get("/api/health").json()["save_failures"] is False
+
+
+def test_steptypes_endpoint(tmp_path, monkeypatch):
+    """/mesh/steptypes serves a colour-coded M2SM + X-Face-Types legend."""
+    client = _client(tmp_path, monkeypatch)
+    job_id = _convert(client)
+    _wait_done(client, job_id)
+
+    r = client.get(f"/api/jobs/{job_id}/mesh/steptypes")
+    assert r.status_code == 200
+    m = _parse_m2sm(r.content)
+    assert m["flags"] & 2, "typed payload must carry vertex colours"
+    assert m["nverts"] == 6
+    # First triangle gray (plane), second orange (residual).
+    assert m["colors"][0:3] == bytes([203, 208, 215])
+    assert m["colors"][9:12] == bytes([249, 115, 22])
+    meta = json.loads(r.headers["X-Face-Types"])
+    assert meta["legend"]["plane"]["faces"] == 1
+    assert meta["legend"]["residual"]["area_frac"] == 0.5
+    assert meta["residual_faces"] == 1
+
+    # Cached on disk: a second request works even with typed tess broken.
+    monkeypatch.setattr(app_module, "tessellate_typed",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    r2 = client.get(f"/api/jobs/{job_id}/mesh/steptypes")
+    assert r2.status_code == 200 and r2.content == r.content
+
+    # Unfinished/unknown job -> 404 with a JSON detail (the UI shows it).
+    assert client.get("/api/jobs/nope/mesh/steptypes").status_code == 404
 
 
 def test_flag_for_improvement(tmp_path, monkeypatch):

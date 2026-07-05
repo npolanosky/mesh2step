@@ -110,9 +110,14 @@
               <button class="seg-btn active" data-orbit="constrained">Constrained orbit</button>
               <button class="seg-btn" data-orbit="free">Free orbit</button>
             </div>
+            <div class="seg" id="color-tabs" title="Colour STEP faces by surface type — see what was truly converted vs left faceted" hidden>
+              <button class="seg-btn active" data-color="plain">Plain</button>
+              <button class="seg-btn" data-color="types">By surface</button>
+            </div>
           </div>
           <div id="viewer" class="viewer">
             <div id="viewer-empty" class="viewer-empty">Select an STL to preview it here.</div>
+            <div id="type-legend" class="type-legend" hidden></div>
             <div id="scalebar" class="scalebar" hidden>
               <div class="scalebar-grad"></div>
               <div class="scalebar-labels"><span id="sb-hi">—</span><span>deviation (mm)</span><span>0</span></div>
