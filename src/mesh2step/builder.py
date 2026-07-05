@@ -311,7 +311,8 @@ def _arc_mid_point2(seg) -> np.ndarray:
 
 
 def _apply_sphere_ball_ops(solid, spheres, Part, progress, *, bbox_guard,
-                           config: ConversionConfig | None = None) -> tuple:
+                           config: ConversionConfig | None = None,
+                           mesh_tree=None, resolution=None) -> tuple:
     """Apply the analytic-sphere cut/fuse ops with a cost budget + per-op revert.
 
     Shared by both tiers. Each op is a boolean against ``solid`` (cost
@@ -362,6 +363,25 @@ def _apply_sphere_ball_ops(solid, spheres, Part, progress, *, bbox_guard,
             max_bbox_growth=bbox_guard)
         if not ok:
             continue
+        # Local deviation guard (task §3): a bulging cap next to a fillet — the
+        # exact port_cover/patton artifact — barely moves the global RTAF but
+        # plants a surface mm off the mesh right at the cap. Revert any op whose
+        # cap surface deviates from the input mesh more than the region did
+        # before. The cap's affected ball is (center, ~radius); use a generous
+        # pad so the whole cap + its rim is sampled.
+        if mesh_tree is not None and config is not None:
+            edge = None
+            if resolution is not None:
+                try:
+                    edge = resolution.edge_for(sph.face_indices)
+                except Exception:  # noqa: BLE001
+                    edge = None
+            reg_r = float(sph.radius) * 1.2 + (edge or 0.0)
+            if not _local_deviation_ok(solid, candidate, mesh_tree, sph.center,
+                                       reg_r, Part, config, edge=edge):
+                progress(f"  sphere reverted: local deviation worsened near "
+                         f"cap @ R={sph.radius:.1f} (artifact guard)")
+                continue
         if rtaf_gate and rtaf_before is not None:
             try:
                 rtaf_after = compute_rtaf(candidate, config).get("rtaf")
@@ -1099,7 +1119,7 @@ def _refit_subsheet(vertices, faces, region, config, resolution):
 
 
 def _apply_freeform_sheets(solid, sheets, config, Part, progress,
-                           vertices=None, faces=None):
+                           vertices=None, faces=None, bore_guards=None):
     """Integrate freeform B-spline sheets into a valid solid, adopting each only
     when it validates, stays bbox-stable, and LOWERS the RTAF (never trades a
     faceted strip fan for something worse). Returns ``(solid, attempted, built)``.
@@ -1130,11 +1150,13 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress,
     can_split = (vertices is not None and faces is not None
                  and config.freeform_max_split_depth > 0)
     resolution = None
-    if can_split:
+    if vertices is not None and faces is not None:
         try:
             resolution = mesh_resolution(vertices, faces, config)
         except Exception:  # noqa: BLE001
-            can_split = False
+            resolution = None
+    if can_split and resolution is None:
+        can_split = False
     bbox_guard = config.boolean_max_bbox_growth
     built = 0
     attempted = 0
@@ -1194,7 +1216,7 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress,
         candidate, ok = _try_boolean_step(
             solid,
             lambda s, sh=sheet, sf=surf: _boolean_clean_freeform(s, sh, sf, Part, config),
-            max_bbox_growth=bbox_guard)
+            max_bbox_growth=bbox_guard, bore_guards=bore_guards, Part=Part)
         if not ok:
             continue
         # RTAF-improvement gate: adopt only if the sheet actually de-facets.
@@ -1208,6 +1230,13 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress,
                 progress(f"  freeform sheet reverted: RTAF {rtaf_before:.3f} -> "
                          f"{rtaf_after:.3f} (no improvement)")
                 continue
+        # NOTE: freeform sheets are NOT re-checked by the local-deviation guard —
+        # the pass already gates each fitted B-spline on its true surface-to-mesh
+        # deviation (``_freeform_sheet_deviation`` vs ``sheet.dev_tol``) BEFORE the
+        # boolean, so an off-mesh bulge is rejected up front. A redundant post-op
+        # resample of the oversized sheet's boundary (which lands slightly past the
+        # footprint by design) only produced false reverts. The guard is reserved
+        # for spheres (no deviation gate) + organic regions (insurance).
         solid = candidate
         if rtaf_after is not None:
             rtaf_before = rtaf_after
@@ -1217,7 +1246,8 @@ def _apply_freeform_sheets(solid, sheets, config, Part, progress,
     return solid, attempted, built
 
 
-def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progress):
+def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progress,
+                           bore_guards=None):
     """Rebuild residual organic regions as Catmull-Clark patch shells and integrate
     each by a guarded extrude+cut boolean (Candidate A, region-level).
 
@@ -1311,7 +1341,7 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
         candidate, ok = _try_boolean_step(
             state["solid"],
             lambda s, sf=surf, r=rg: oreg.boolean_clean_region(s, sf, r, Part, config),
-            max_bbox_growth=bbox_guard)
+            max_bbox_growth=bbox_guard, bore_guards=bore_guards, Part=Part)
         if not ok:
             detail["reason"] = "boolean invalid/bbox"
             progress(f"  organic {label} reverted: boolean invalid/bbox "
@@ -1328,6 +1358,10 @@ def _apply_organic_regions(solid, vertices, faces, claimed, config, Part, progre
                 progress(f"  organic {label} reverted: RTAF {state['rtaf']:.3f} -> "
                          f"{rtaf_after:.3f} (no improvement)")
                 return False, detail
+        # NOTE: organic regions already gate on the fitted surface's true
+        # deviation from the mesh (the ``deviation_mm`` check above), so — like
+        # freeform sheets — they are not re-checked by the local-deviation guard.
+        # That guard is reserved for spheres, which have no deviation gate.
         state["solid"] = candidate
         if rtaf_after is not None:
             state["rtaf"] = rtaf_after
@@ -1607,6 +1641,12 @@ def build_reconstructed_solid(
     # then sphere ball ops: a sphere fuse reshapes the wall geometry a later swept
     # lens op keys off, so doing spheres first can make the swept ops miss (seen
     # on the tweezer: 8 swept walls -> 0). Each op reverts on invalidity.
+    # Hole-coverage gate (task §1b): protect round bores from chord-clipping by
+    # the swept / freeform cuts below (same guard as the boolean tier).
+    try:
+        sew_bore_guards = _bore_guards(cylinders, Part)
+    except Exception:  # noqa: BLE001
+        sew_bore_guards = []
     swept_ops = 0
     swept_arcs_ok = 0
     swept_built = 0
@@ -1628,8 +1668,16 @@ def build_reconstructed_solid(
     sphere_ok = 0
     if is_solid and spheres:
         bbox_guard = config.boolean_max_bbox_growth
+        sew_tree = (_mesh_kdtree(vertices, faces)
+                    if getattr(config, "local_deviation_guard", True) else None)
+        sew_res = None
+        try:
+            sew_res = mesh_resolution(vertices, faces, config)
+        except Exception:  # noqa: BLE001
+            sew_res = None
         shape, sphere_ok = _apply_sphere_ball_ops(
-            shape, spheres, Part, progress, bbox_guard=bbox_guard, config=config)
+            shape, spheres, Part, progress, bbox_guard=bbox_guard, config=config,
+            mesh_tree=sew_tree, resolution=sew_res)
         if sphere_ok:
             progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
             solids = getattr(shape, "Solids", [])
@@ -1641,7 +1689,7 @@ def build_reconstructed_solid(
     if is_solid and freeform_sheets:
         shape, freeform_ops, freeform_ok = _apply_freeform_sheets(
             shape, freeform_sheets, config, Part, progress,
-            vertices=vertices, faces=faces)
+            vertices=vertices, faces=faces, bore_guards=sew_bore_guards)
         if freeform_ok:
             backup = shape.copy()
             simplified = _safe_remove_splitter(shape, Part)
@@ -1660,7 +1708,8 @@ def build_reconstructed_solid(
     if config.organic_region_patches and is_solid:
         (shape, organic_regions_detected, organic_regions_built,
          organic_region_detail) = _apply_organic_regions(
-            shape, vertices, faces, hard_claimed, config, Part, progress)
+            shape, vertices, faces, hard_claimed, config, Part, progress,
+            bore_guards=sew_bore_guards)
         if organic_regions_built:
             backup = shape.copy()
             simplified = _safe_remove_splitter(shape, Part)
@@ -2476,20 +2525,154 @@ def _bbox_collapsed(before, after) -> bool:
     return b0 > 1e-6 and a0 < _BBOX_COLLAPSE_FRAC * b0
 
 
+def _boolean_worker_env(Part) -> dict:
+    """PYTHONPATH env for the boolean worker subprocess (one-shot or server).
+
+    The child imports FreeCAD + Part; it needs the package root AND FreeCAD's lib
+    dir on its path. The parent has FreeCAD loaded already, so derive its lib dir
+    from the live ``Part`` module (its .so lives there) and inject it — the parent
+    may have added it via ``sys.path`` (not ``PYTHONPATH``), which the child can't
+    inherit."""
+    import os
+
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        fc_lib = os.path.dirname(os.path.abspath(Part.__file__))
+    except Exception:  # noqa: BLE001
+        fc_lib = None
+    env = dict(os.environ)
+    parts = [p for p in (pkg_root, fc_lib, env.get("PYTHONPATH", "")) if p]
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+
+class _BooleanServer:
+    """A warm, persistent ``boolean_runner --serve`` subprocess.
+
+    Amortises FreeCAD's ~2-5 s cold import across every isolated cut of a run
+    instead of paying it per op (a dense part does dozens of isolated cuts, which
+    dominated the server's ~30 min timings). Modelled on the embedded viewer's
+    render server: one long-lived worker, (re)spawned on demand, a unique id per
+    request, and a per-request wall-clock timeout enforced by a reader thread —
+    on timeout (or any protocol/death failure) the worker is killed so the NEXT
+    request spins up a fresh one, and the caller's guard reverts the op. A single
+    pathological cut is therefore still bounded and reverted, never hanging."""
+
+    def __init__(self, Part):
+        self._Part = Part
+        self._proc = None
+        self._req_id = 0
+        import threading
+
+        self._lock = threading.Lock()
+
+    def _spawn(self):
+        import atexit
+        import subprocess
+        import sys
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mesh2step.boolean_runner", "--serve"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            env=_boolean_worker_env(self._Part))
+        self._proc = proc
+        atexit.register(self.kill)
+        return proc
+
+    def _ensure(self):
+        p = self._proc
+        if p is not None and p.poll() is None:
+            return p
+        return self._spawn()
+
+    def kill(self):
+        p = self._proc
+        self._proc = None
+        if p is None:
+            return
+        try:
+            p.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _read_line(self, proc, timeout: float):
+        """Read one stdout line under a wall-clock deadline, in a helper thread.
+
+        Popen stdout has no timed read, and the cut is uninterruptible, so we
+        block a daemon thread on ``readline`` and join it with the deadline. On
+        expiry the worker is killed (unblocking the thread) and the caller sees a
+        TimeoutError. Returns the line, or raises TimeoutError."""
+        import threading
+
+        box: dict = {}
+
+        def _rd():
+            try:
+                box["line"] = proc.stdout.readline()
+            except Exception as exc:  # noqa: BLE001
+                box["err"] = exc
+
+        t = threading.Thread(target=_rd, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            self.kill()          # frees the blocked readline thread
+            raise TimeoutError("boolean server read timed out")
+        if "err" in box:
+            raise RuntimeError(str(box["err"]))
+        return box.get("line", "")
+
+    def cut(self, bp: str, tp: str, op: str, timeout: float):
+        """Run one cut via the warm worker; raise on timeout/failure/death."""
+        import json
+
+        with self._lock:
+            self._req_id += 1
+            rid = self._req_id
+            req = json.dumps({"base": bp, "tool": tp, "out": op, "id": rid})
+            proc = self._ensure()
+            try:
+                proc.stdin.write(req + "\n")
+                proc.stdin.flush()
+            except Exception as exc:  # noqa: BLE001 - dead pipe -> respawn next call
+                self.kill()
+                raise RuntimeError(f"boolean server write failed: {exc}") from exc
+            line = self._read_line(proc, float(timeout))
+            if not line:
+                self.kill()
+                raise RuntimeError("boolean server closed unexpectedly")
+            resp = json.loads(line)
+            if not resp.get("ok"):
+                raise RuntimeError(
+                    f"boolean cut failed: {resp.get('error', 'unknown')}")
+            return resp["out"]
+
+
+# Module-level warm boolean worker, created lazily on first isolated cut and
+# reused for the rest of the process (respawned internally on death/timeout).
+_BOOLEAN_SERVER: _BooleanServer | None = None
+
+
 def isolated_cut(base, tool, Part, timeout: float):
-    """Run ``base.cut(tool)`` in a separate process under a hard ``timeout``.
+    """Run ``base.cut(tool)`` out-of-process under a hard ``timeout``.
 
     An OCC boolean cut of a B-spline tool against a faceted base can grind for
     minutes (uninterruptible ``PerformFF``); isolation is the only way to bound
-    it. Serialises both shapes to BREP, runs ``boolean_runner`` (FreeCAD-first so
-    ``import Part`` is safe), and reads the result back. Returns the result shape,
-    or raises ``TimeoutError`` on timeout / ``RuntimeError`` on child failure so
-    the caller's guard reverts. Best-effort: any serialisation error falls back to
-    an in-process cut (never worse than before)."""
+    it. Serialises both shapes to BREP and dispatches the cut to a WARM,
+    persistent ``boolean_runner --serve`` worker (one FreeCAD import per run, not
+    per op — the fix for the ~30 min server timings). Returns the result shape,
+    or raises ``TimeoutError`` on timeout / ``RuntimeError`` on worker failure so
+    the caller's guard reverts. Any serialisation error falls back to an
+    in-process cut (never worse than before)."""
     import os
-    import subprocess
-    import sys
     import tempfile
+
+    global _BOOLEAN_SERVER
 
     with tempfile.TemporaryDirectory(prefix="m2s_bool_") as tmp:
         bp = os.path.join(tmp, "base.brep")
@@ -2500,31 +2683,11 @@ def isolated_cut(base, tool, Part, timeout: float):
             tool.exportBrep(tp)
         except Exception:  # noqa: BLE001 - can't serialise -> in-process fallback
             return base.cut(tool)
-        pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        # The child imports FreeCAD + Part; it needs FreeCAD's lib dir on its path.
-        # The parent has it loaded already, so derive it from the live Part module
-        # (its .so lives in FreeCAD's lib dir) and inject it — the parent may have
-        # added it via sys.path (not PYTHONPATH), so the child can't inherit it.
-        fc_lib = None
-        try:
-            fc_lib = os.path.dirname(os.path.abspath(Part.__file__))
-        except Exception:  # noqa: BLE001
-            fc_lib = None
-        env = dict(os.environ)
-        parts = [p for p in (pkg_root, fc_lib, env.get("PYTHONPATH", "")) if p]
-        env["PYTHONPATH"] = os.pathsep.join(parts)
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "mesh2step.boolean_runner", bp, tp, op],
-                capture_output=True, text=True, timeout=float(timeout), env=env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(
-                f"organic boolean cut exceeded {timeout:g}s (killed)") from exc
-        if proc.returncode != 0 or not os.path.exists(op):
-            raise RuntimeError(
-                f"organic boolean cut subprocess failed: "
-                f"{(proc.stderr or '').strip()[:300]}")
+        if _BOOLEAN_SERVER is None:
+            _BOOLEAN_SERVER = _BooleanServer(Part)
+        _BOOLEAN_SERVER.cut(bp, tp, op, timeout)
+        if not os.path.exists(op):
+            raise RuntimeError("boolean cut produced no output")
         result = Part.Shape()
         result.importBrep(op)
     return result
@@ -2554,7 +2717,84 @@ def _maybe_isolated_cut(base, tool, Part, config):
     return isolated_cut(base, tool, Part, to)
 
 
-def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None):
+def _bore_guards(cylinders, Part):
+    """Descriptors for the round hole bores whose walls later ops must not clip.
+
+    A detected hole (``outward=False`` cylinder) is a round bore; a downstream
+    freeform / organic / swept CUT whose tool reaches across it can slice a chord
+    face through the wall, turning the round hole into a D-shape (the port_cover
+    P0). We snapshot each bore as sample points ON its cylindrical wall (rings up
+    the axial extent) so any op that later buries part of that wall inside solid
+    material — the chord signature — is detected and reverted. Returns a list of
+    ``(points (M,3), inward_normals (M,3))``; empty when there are no bores."""
+    guards = []
+    for cyl in cylinders:
+        if getattr(cyl, "outward", False):
+            continue                              # a boss, not a bore
+        # Only protect near-full-circle bores — a real round hole. A partial arc
+        # (a counterbore lip, a fillet section) is not a closed wall to preserve,
+        # and guarding it would mis-fire (its "outward" probes legitimately sit in
+        # material). coverage is the fraction of the circle the facets span.
+        if float(getattr(cyl, "coverage", 1.0)) < 0.85:
+            continue
+        try:
+            R = float(cyl.radius)
+            axis = np.asarray(cyl.axis_dir, float)
+            axis /= np.linalg.norm(axis) or 1.0
+            ctr = np.asarray(cyl.axis_point, float)
+            zmin, zmax = float(cyl.axial_min), float(cyl.axial_max)
+        except Exception:  # noqa: BLE001
+            continue
+        if R <= 0.2 or zmax - zmin <= 1e-6:
+            continue
+        u, v = _plane_basis(axis)
+        n_ang, n_ax = 24, 3
+        pts, void_dirs = [], []
+        for iz in range(n_ax):
+            z = zmin + (zmax - zmin) * (iz + 0.5) / n_ax
+            base = ctr + z * axis
+            for ia in range(n_ang):
+                a = 2.0 * math.pi * ia / n_ang
+                radial = math.cos(a) * u + math.sin(a) * v
+                pts.append(base + R * radial)
+                # Unit direction pointing INTO THE BORE VOID (toward the axis).
+                # A clean hole has empty space here; a chord cut fills it with
+                # material, so a void probe landing inside the solid = clipped.
+                void_dirs.append(-radial)
+        if pts:
+            guards.append((np.asarray(pts), np.asarray(void_dirs), R))
+    return guards
+
+
+def _bore_intact(candidate, guards, Part) -> bool:
+    """True if every guarded bore wall is still a clean round wall in ``candidate``.
+
+    For each bore-wall sample we step a short distance INTO THE BORE VOID (toward
+    the axis) and test whether that point is inside the candidate solid. A clean
+    round hole leaves the whole void empty, so no void probe is inside. A chord
+    cut across the bore fills a contiguous arc of the void with solid — those void
+    probes land INSIDE. If a material fraction of a bore's void probes are solid,
+    that bore was clipped into a D-shape and the op is rejected."""
+    if not guards:
+        return True
+    for pts, void_dirs, R in guards:
+        step = min(0.4, 0.15 * R)
+        void_pts = pts + step * void_dirs         # a hair into the bore void
+        try:
+            inside_hits = sum(
+                1 for p in void_pts
+                if candidate.isInside(_vec(p), 1e-4, True))
+        except Exception:  # noqa: BLE001 - probe failure -> don't block the op
+            continue
+        # A round wall leaves all void probes empty. Tolerate a couple of FP hits
+        # near the bore's end circles; a chord fills a large contiguous arc.
+        if inside_hits > max(2, int(0.12 * len(void_pts))):
+            return False
+    return True
+
+
+def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None,
+                      bore_guards=None, Part=None):
     """Apply one boolean cleanup step; revert if it breaks solid validity.
 
     Never lets a single bad feature corrupt or abort the whole result — later
@@ -2567,6 +2807,10 @@ def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None
     collapses the bounding box (a degenerate OCC boolean returning a tiny valid
     fragment — gridfinity_base_lid's 210mm→6mm sphere fuse). Collapse is never a
     legitimate outcome, so this net applies to every op in both tiers.
+
+    When ``bore_guards`` is given (from ``_bore_guards``), revert any op that
+    clips a detected round hole's wall into a D-shape — the hole-coverage gate,
+    now applied to freeform/organic/swept CUTS, not just fuses.
     """
     try:
         candidate = fn(current_solid)
@@ -2587,7 +2831,125 @@ def _try_boolean_step(current_solid, fn, *, max_bbox_growth: float | None = None
                 return current_solid, False
         except Exception:  # noqa: BLE001 - bbox read must not break the step
             pass
+    if bore_guards and Part is not None:
+        try:
+            if not _bore_intact(candidate, bore_guards, Part):
+                return current_solid, False
+        except Exception:  # noqa: BLE001 - bore probe must not break the step
+            pass
     return candidate, True
+
+
+def _mesh_kdtree(vertices: np.ndarray, faces: np.ndarray):
+    """Build a KD-tree over the input mesh's triangle vertices + centroids.
+
+    Shared once per ``build_boolean_clean_solid`` run by the local deviation
+    guard. Points to query against are drawn on freshly-built analytic op
+    surfaces; the nearest tree point is a cheap proxy for the true point-to-mesh
+    distance (vertices + centroids sample the surface densely enough that a
+    genuine mm-scale bulge reads clearly, while a correctly-inscribed cap reads
+    near zero). Returns ``(tree, None)`` or ``(None, None)`` if scipy is absent.
+    """
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:  # noqa: BLE001 - guard degrades to a no-op without scipy
+        return None
+    try:
+        tri = vertices[faces]                       # (F,3,3)
+        cent = tri.mean(axis=1)                      # (F,3)
+        pts = np.vstack((vertices, cent))
+        return cKDTree(pts)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _region_surface_points(shape, center, radius, Part, *, n: int):
+    """Sample up to ``n`` points ON ``shape``'s surface within ``radius`` of
+    ``center`` — i.e. on the geometry a local op just touched.
+
+    Tessellates each face whose bbox reaches the region ball and keeps the mesh
+    vertices inside the ball. Tessellating (not just ``f.Vertexes``) is essential
+    for the sphere guard: an analytic cap face has only pole vertices, so vertex
+    sampling would miss the very bulge we must measure. Returns an (M,3) array
+    (possibly empty)."""
+    c = np.asarray(center, dtype=float)
+    r2 = float(radius) ** 2
+    out: list = []
+    try:
+        faces = shape.Faces
+    except Exception:  # noqa: BLE001
+        return np.empty((0, 3))
+    # Tessellation deflection scaled to the region so a small cap still yields
+    # several sample points across its span.
+    defl = max(0.05, 0.05 * float(radius))
+    for f in faces:
+        try:
+            bb = f.BoundBox
+            fc = np.array([bb.Center.x, bb.Center.y, bb.Center.z])
+            if np.dot(fc - c, fc - c) > (radius + bb.DiagonalLength) ** 2:
+                continue                          # face bbox nowhere near the ball
+            pts, _tris = f.tessellate(defl)
+            for vp in pts:
+                p = np.array([vp.x, vp.y, vp.z])
+                if np.dot(p - c, p - c) <= r2:
+                    out.append(p)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(out) >= 4 * n:
+            break
+    if not out:
+        return np.empty((0, 3))
+    arr = np.asarray(out, dtype=float)
+    if len(arr) > n:
+        arr = arr[np.linspace(0, len(arr) - 1, n).astype(int)]
+    return arr
+
+
+def _local_max_deviation(shape, tree, center, radius, Part, *, n: int) -> float | None:
+    """Max distance from ``shape``'s surface near (center, radius) to the mesh.
+
+    ``tree`` is a KD-tree of the input mesh points (see ``_mesh_kdtree``).
+    Returns the worst nearest-neighbour distance over the sampled region points,
+    or ``None`` if nothing could be sampled (guard treated as pass)."""
+    if tree is None:
+        return None
+    pts = _region_surface_points(shape, center, radius, Part, n=n)
+    if pts.shape[0] == 0:
+        return None
+    try:
+        d, _ = tree.query(pts, k=1)
+        return float(np.max(d))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _local_deviation_ok(prev_solid, candidate, tree, center, radius, Part,
+                        config, *, edge: float | None = None) -> bool:
+    """True if ``candidate``'s surface near (center, radius) does not deviate from
+    the input mesh materially MORE than ``prev_solid``'s did there.
+
+    The permanent local-artifact net (task §3): a sphere cap op that plants an
+    analytic surface bulging out of (or into) the real part shows up as a big
+    surface-to-mesh distance exactly in the region it touched, while leaving the
+    global RTAF almost unchanged (the port_cover / patton P0s). We compare the
+    candidate's local worst deviation to the previous solid's and to a resolution-
+    scaled ceiling; an op that WORSENS local fidelity beyond the ceiling is
+    rejected (the cap stays faceted). Degrades to a pass whenever the metric can't
+    be computed (no scipy, nothing sampled) so it can never block a legitimate op.
+    (Freeform / organic ops gate on their own pre-boolean deviation instead.)
+    """
+    if not getattr(config, "local_deviation_guard", True) or tree is None:
+        return True
+    n = int(getattr(config, "local_deviation_samples", 200))
+    dev_after = _local_max_deviation(candidate, tree, center, radius, Part, n=n)
+    if dev_after is None:
+        return True
+    e = float(edge) if edge else 0.0
+    tol = max(config.local_deviation_max_abs,
+              config.local_deviation_max_rel * e)
+    dev_before = _local_max_deviation(prev_solid, tree, center, radius, Part, n=n)
+    ceiling = tol if dev_before is None else max(tol, dev_before)
+    return dev_after <= ceiling
 
 
 def build_boolean_clean_solid(
@@ -2819,6 +3181,33 @@ def build_boolean_clean_solid(
     # cylinder — otherwise distorts the exported dimensions by 10-30%).
     bbox_guard = config.boolean_max_bbox_growth
 
+    # Local deviation guard (task §3): a KD-tree over the input mesh, shared by
+    # every sphere/freeform/organic op below so a bulging cap/patch that leaves
+    # the global RTAF flat but plants a mm-off surface locally is reverted. Built
+    # once (O(faces)); None (no scipy) makes the guard a no-op. A shared mesh
+    # resolution gives each op its region-local edge length for the tolerance.
+    mesh_tree = None
+    dev_resolution = None
+    if getattr(config, "local_deviation_guard", True):
+        mesh_tree = _mesh_kdtree(vertices, faces)
+        try:
+            dev_resolution = mesh_resolution(vertices, faces, config)
+        except Exception:  # noqa: BLE001
+            dev_resolution = None
+
+    # Hole-coverage gate (task §1b): sample points on every round bore wall so a
+    # later freeform / organic CUT — whose oversized B-spline / patch tool can
+    # reach across a hole and slice a chord (D-shape) through the wall — is
+    # reverted if it does. Extends the existing fuse-only hole gate to those big
+    # cuts. Built from the DETECTED bores (not the current solid) so it protects
+    # each round hole regardless of which op runs. Not applied to the many small
+    # swept lens ops: those are local wall-trues that never reach a bore, and the
+    # per-op ``isInside`` probe would dominate the runtime for no protective gain.
+    try:
+        bore_guards = _bore_guards(cylinders, Part)
+    except Exception:  # noqa: BLE001 - guard construction must not break the build
+        bore_guards = []
+
     cyl_ok = 0
     for i, cyl in enumerate(cylinders):
         r_cut = _design_radius(vertices, faces, cyl.axis_dir, cyl.axis_point,
@@ -2940,7 +3329,8 @@ def build_boolean_clean_solid(
     sphere_ok = 0
     if spheres and _is_valid_solid(solid):
         solid, sphere_ok = _apply_sphere_ball_ops(
-            solid, spheres, Part, progress, bbox_guard=bbox_guard, config=config)
+            solid, spheres, Part, progress, bbox_guard=bbox_guard, config=config,
+            mesh_tree=mesh_tree, resolution=dev_resolution)
         progress(f"  spheres cleaned {sphere_ok}/{len(spheres)}")
 
     # Freeform B-spline sheets (Candidate B): last, on a valid solid, each
@@ -2950,7 +3340,7 @@ def build_boolean_clean_solid(
     if freeform_sheets and _is_valid_solid(solid):
         solid, freeform_ops, freeform_ok = _apply_freeform_sheets(
             solid, freeform_sheets, config, Part, progress,
-            vertices=vertices, faces=faces)
+            vertices=vertices, faces=faces, bore_guards=bore_guards)
         if freeform_ok:
             backup = solid.copy()
             simplified = _safe_remove_splitter(solid, Part)
@@ -2968,7 +3358,8 @@ def build_boolean_clean_solid(
     if config.organic_region_patches and _is_valid_solid(solid):
         (solid, organic_regions_detected, organic_regions_built,
          organic_region_detail) = _apply_organic_regions(
-            solid, vertices, faces, hard_claimed, config, Part, progress)
+            solid, vertices, faces, hard_claimed, config, Part, progress,
+            bore_guards=bore_guards)
         if organic_regions_built:
             backup = solid.copy()
             simplified = _safe_remove_splitter(solid, Part)

@@ -1045,6 +1045,34 @@ class ConversionConfig:
     # surface is reverted, so only genuine caps are adopted.
     sphere_rtaf_gate: bool = True
 
+    # --- Local deviation guard (task §3): a permanent net for the "visual
+    # artifact" sphere ops. RTAF is a GLOBAL area metric — a small bogus cap next
+    # to a fillet, or a dome bulging a few mm out of a large flat, barely moves the
+    # aggregate RTAF yet is a glaring wrong bump on the real part (the port_cover /
+    # patton P0s: the worst deviation outliers were all next to freshly-built
+    # spheres). After each sphere boolean op we therefore sample points ON the
+    # candidate's newly-built cap surface near the op's affected region and measure
+    # their distance to the INPUT mesh (point-to-triangle, the webapp meshdata
+    # pattern). An op whose surface deviates from the mesh by more than a
+    # resolution-scaled threshold — i.e. it introduced geometry the mesh never had
+    # — is reverted, leaving the cap faceted (Nick's principle: better faceted than
+    # a wrong bump). This localises what the global RTAF gate cannot see. Freeform
+    # sheets and organic regions are NOT re-checked here: they already gate each
+    # fit on its true surface-to-mesh deviation before the boolean; spheres do not.
+    local_deviation_guard: bool = True
+    # Absolute floor (mm) and edge-relative slope for the allowed surface-to-mesh
+    # deviation of a freshly-built analytic op. The tool surface (sphere cap /
+    # B-spline sheet) is inscribed in / snapped to the faceted mesh, so a correct
+    # op lands within a fraction of the local chord sagitta; a bulging false
+    # positive lands mm off. tol = max(abs, rel * local_edge), then the op must not
+    # exceed max(tol, prior_local_deviation) — never punished for pre-existing
+    # facet error, only for making the surface WORSE than the mesh it replaced.
+    local_deviation_max_abs: float = 0.6
+    local_deviation_max_rel: float = 1.5
+    # Number of sample points drawn on the candidate op surface for the check
+    # (kept small — this runs per successful op; the KD-tree query dominates).
+    local_deviation_samples: int = 200
+
     # Minimum facets a compact smooth region must have to attempt a sphere fit.
     min_sphere_facets: int = 8
 
