@@ -62,6 +62,42 @@ def plate_with_holes():
     )
 
 
+def hex_and_round_plate():
+    # Ground truth for the designed-polygon guard (P0): a plate with ONE regular
+    # hexagonal through-hole and ONE round through-hole of the SAME nominal size
+    # (both circum/hole radius 6). The hexagon must stay 6 flat planes (never be
+    # replaced by an analytic cylinder); the round hole must fit a cylinder.
+    plate = Part.makeBox(60, 30, 10)
+    # Round hole (r=6) at (18, 15).
+    rnd = Part.makeCylinder(6, 10, App.Vector(18, 15, 0))
+    # Regular hexagon (circumradius 6) at (42, 15), extruded through the plate.
+    import math as _m
+    cx, cy, R = 42.0, 15.0, 6.0
+    hpts = [App.Vector(cx + R * _m.cos(_m.radians(60 * k)),
+                       cy + R * _m.sin(_m.radians(60 * k)), 0.0) for k in range(6)]
+    hpts.append(hpts[0])
+    hexwire = Part.makePolygon(hpts)
+    hexprism = Part.Face(hexwire).extrude(App.Vector(0, 0, 10))
+    part = plate.cut(rnd).cut(hexprism)
+    return save(
+        part,
+        "hex_and_round_plate",
+        {
+            "kind": "hex_and_round_plate",
+            "dims_mm": [60, 30, 10],
+            # Only the ROUND hole is a true cylinder; the hexagon is a designed
+            # polygon and is intentionally NOT listed (it must stay planar).
+            "cylinders": [
+                {"radius": 6.0, "axis": [0, 0, 1], "through": True},
+            ],
+            "hexagons": [
+                {"circumradius": 6.0, "sides": 6, "axis": [0, 0, 1],
+                 "center": [cx, cy], "through": True},
+            ],
+        },
+    )
+
+
 def cylinder():
     cyl = Part.makeCylinder(8, 20)
     return save(
@@ -466,7 +502,8 @@ def spur_gear():
 
 def main():
     print(f"Writing samples to {OUT} (deflection={DEFLECTION} mm)")
-    truths = [cube(), plate_with_holes(), cylinder(), l_bracket(), flanged_pipe(),
+    truths = [cube(), plate_with_holes(), hex_and_round_plate(),
+              cylinder(), l_bracket(), flanged_pipe(),
               countersink_plate(), angled_hole_plate(), fillet_chamfer_plate(),
               swept_wavy_wall(), domed_plate(), freeform_bump(),
               threaded_rod(), knurled_band(), spur_gear()]

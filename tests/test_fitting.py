@@ -44,6 +44,51 @@ def test_no_false_cylinders_on_prismatic_parts():
         assert detect_cylinders(vertices, faces, ConversionConfig()) == []
 
 
+@pytest.mark.skipif(
+    not (DATA / "hex_and_round_plate.stl").exists(),
+    reason="hex_and_round_plate sample not generated",
+)
+def test_hexagon_stays_planar_round_hole_becomes_cylinder():
+    """P0: a designed hexagonal bore must NOT be replaced by a circular cylinder.
+
+    The ground-truth plate has one regular hexagonal hole and one round hole of
+    the SAME nominal radius (6). A hexagon fits a circle *perfectly* (its vertices
+    lie on the circumscribed circle, RMS ~ 0) and used to slip through as a round
+    hole — a shape-changing correctness bug. The designed-polygon guard must reject
+    the hexagon (it stays 6 flat planes) while still recovering the round hole as a
+    cylinder, so exactly ONE cylinder of radius ~6 is detected.
+    """
+    from mesh2step.fitting import detect_cones
+
+    vertices, faces = load_stl(DATA / "hex_and_round_plate.stl")
+    cfg = ConversionConfig()
+    cyls = detect_cylinders(vertices, faces, cfg)
+    radii = sorted(round(c.radius, 2) for c in cyls)
+    # Exactly the round hole — the hexagon is rejected, not fit as a second r=6.
+    assert radii == [6.0], f"expected only the round hole, got radii {radii}"
+    # The hexagon must not spawn a spurious coaxial countersink cone either.
+    assert detect_cones(vertices, faces, cyls, cfg) == []
+
+
+@pytest.mark.skipif(
+    not (DATA / "hex_and_round_plate.stl").exists(),
+    reason="hex_and_round_plate sample not generated",
+)
+def test_designed_polygon_guard_can_be_disabled():
+    """With ``detect_polygons=False`` the hexagon fits a circle again (guard off).
+
+    Documents that the guard is the ONLY thing rejecting the hexagon: turning it
+    off restores the old (buggy) behaviour where the hexagon reads as a second
+    r~6 cylinder. This pins the guard as the cause of the fix.
+    """
+    import dataclasses
+
+    vertices, faces = load_stl(DATA / "hex_and_round_plate.stl")
+    off = dataclasses.replace(ConversionConfig(), detect_polygons=False)
+    radii = sorted(round(c.radius, 2) for c in detect_cylinders(vertices, faces, off))
+    assert radii == [6.0, 6.0], f"guard-off should re-admit the hexagon, got {radii}"
+
+
 @pytest.mark.skipif(not SAMPLES, reason="samples not generated")
 def test_hole_vs_boss_classification():
     vertices, faces = load_stl(DATA / "flanged_pipe.stl")

@@ -394,6 +394,135 @@ def _local_tol(config: ConversionConfig, local_edge: float) -> float:
     return max(scaled, config.cylinder_tol)
 
 
+def _distinct_normal_steps(
+    face_normals: np.ndarray, axis: np.ndarray, merge_deg: float,
+) -> tuple[int, np.ndarray]:
+    """Distinct wall-facet normal directions about ``axis`` and their angular gaps.
+
+    Projects each facet normal into the plane perpendicular to ``axis`` (its
+    radial-facing component), bins them by azimuth, merges directions within
+    ``merge_deg`` (a single flat panel's triangles share one normal), and returns
+    ``(n_distinct, sorted_gaps_deg)`` where ``sorted_gaps_deg`` are the angular
+    steps between consecutive distinct directions around the circle (they sum to
+    360). A regular N-gon yields exactly N directions with uniform 360/N gaps; a
+    tessellated circle yields many directions with small gaps that track mesh
+    density. Both are computed from the normals alone — no edge adjacency needed.
+    """
+    u, v = _plane_basis(axis)
+    # Radial-facing azimuth of each facet normal (drop any axial component).
+    nu = face_normals @ u
+    nv = face_normals @ v
+    mag = np.hypot(nu, nv)
+    ok = mag > 1e-6
+    if ok.sum() < 2:
+        return 0, np.array([])
+    ang = np.sort(np.arctan2(nv[ok], nu[ok]))
+    # Merge azimuths closer than merge_deg into one representative direction.
+    merge = np.radians(merge_deg)
+    reps = [ang[0]]
+    for a in ang[1:]:
+        if a - reps[-1] > merge:
+            reps.append(a)
+    # Fold the wrap-around: if the last rep is within merge of the first (+2pi).
+    if len(reps) > 1 and (reps[0] + 2 * np.pi) - reps[-1] <= merge:
+        reps.pop()
+    reps = np.asarray(reps)
+    n = len(reps)
+    if n < 2:
+        return n, np.array([])
+    gaps = np.diff(reps)
+    wrap = (reps[0] + 2 * np.pi) - reps[-1]
+    gaps = np.degrees(np.append(gaps, wrap))
+    return n, np.sort(gaps)
+
+
+def _looks_like_designed_polygon(
+    fcent_radius_mean: float,
+    fit_radius: float,
+    face_normals: np.ndarray,
+    axis: np.ndarray,
+    curve_step_deg: float,
+    config: ConversionConfig,
+) -> bool:
+    """True when a circle-fitting facet band is really a designed regular polygon.
+
+    A hexagonal (or pentagonal/octagonal...) bore fits a circle *perfectly* — its
+    vertices lie on the circumscribed circle, so RMS ~ 0 and the resolution-scaled
+    centroid guard (sized for a coarse curved surface) admits it. It must NOT be
+    replaced by an analytic cylinder: it is already ideal as N flat planes. This
+    discriminates it from a genuine coarse circle by three signals
+    (see config.detect_polygons):
+      (a) the wall facets meet at a FEW distinct normal directions separated by
+          LARGE, roughly UNIFORM angular steps (a hexagon: 6 dirs, 60 deg each) —
+          far above the smooth-curvature ceiling.
+      (b) the facet centroids sit at the polygon apothem = R * cos(180/N), a
+          deficit set by the side count implied by (a) (hex = 0.866 R, 13.4%).
+      (c) the decisive one — the facets are far COARSER than the local mesh would
+          tessellate a real curve into. A designed polygon keeps its FIXED small
+          side count however finely the part is meshed; a genuine coarse circle's
+          facet count TRACKS the mesh (per-facet step ~ local_edge / radius). A
+          hexagon steps 60 deg where a same-mesh circle steps a few — so a step
+          well above the circle-at-this-resolution step marks a designed polygon.
+    (a) and (b) together identify a geometric N-gon; a coarse F-facet circle also
+    reads as an F-gon, so (c) is what separates "designed polygon" from "curve
+    tessellated coarsely". Best-effort; returns False on any ambiguity so genuine
+    coarse circles are never rejected.
+    """
+    if not config.detect_polygons or fit_radius <= 1e-9:
+        return False
+    n_dirs, gaps = _distinct_normal_steps(
+        face_normals, axis, config.polygon_normal_merge_deg)
+    if n_dirs < 3 or n_dirs > config.polygon_max_sides or gaps.size == 0:
+        return False
+    # (a) The distinct normals must step by SHARP, roughly-uniform angles: a
+    # designed polygon edge, not a curvature step. Use the median gap (robust to
+    # a partial-arc bore's one big wrap gap where facets are missing).
+    median_step = float(np.median(gaps))
+    if median_step < config.polygon_min_facet_step_deg:
+        return False  # small steps -> genuine tessellated curvature
+    # Implied side count from the step (a full regular N-gon: step = 360/N). Round
+    # to the nearest integer side count and sanity-check it against the ideal.
+    n_sides = int(round(360.0 / median_step))
+    if n_sides < 3 or n_sides > config.polygon_max_sides:
+        return False
+    ideal_step = 360.0 / n_sides
+    # The steps must be uniform (a regular polygon), within a merge tolerance:
+    # keep only the gaps that are real edges (drop the wrap gap of a partial arc,
+    # which is larger). A regular polygon's edge steps cluster tightly at ideal.
+    edge_gaps = gaps[gaps <= 1.5 * ideal_step]
+    if edge_gaps.size < 2:
+        return False
+    if float(np.std(edge_gaps)) > 0.35 * ideal_step:
+        return False  # irregular -> not a designed regular polygon
+    # (b) Apothem-deficit corroboration. For an N-gon the facet centroids sit at
+    # the apothem R*cos(pi/N); measure the deficit and require it to match the
+    # side count implied by the normal steps. (A coarse F-facet circle IS a
+    # geometric F-gon at that resolution, so its apothem matches too — this alone
+    # can't separate them; the resolution test (c) below does.)
+    ideal_ratio = math.cos(math.pi / n_sides)
+    meas_ratio = fcent_radius_mean / fit_radius
+    if abs(meas_ratio - ideal_ratio) > config.polygon_apothem_tol * (1.0 - ideal_ratio):
+        return False
+    # (c) Facet-coarseness-vs-part-resolution — the decisive discriminator. A
+    # DESIGNED polygon keeps its FIXED small side count however finely the PART is
+    # meshed, so its facets are far coarser than the part tessellates genuine
+    # curves. ``curve_step_deg`` is how finely this part steps across real curved
+    # surfaces (the median smooth-dihedral step): a hexagon steps 60 deg where the
+    # part's real curves step a few. A polygon step well above that marks a
+    # designed feature; a step comparable to it is just a coarsely-tessellated
+    # curve and is left as an analytic fit.
+    #
+    # Only trust ``curve_step_deg`` as a genuine-curve reference when it is itself
+    # SMALL (a fine tessellated curve steps a few degrees). When it is large — an
+    # all-polygon part (an all-hexagon panel) whose only "smooth"-band steps are
+    # the polygons' own chamfer edges — there is no real curve to confuse the
+    # polygon with, so (a)+(b) carry the decision and (c) is skipped.
+    if 1e-6 < curve_step_deg < config.polygon_min_facet_step_deg:
+        if median_step < config.polygon_coarseness_factor * curve_step_deg:
+            return False  # facets as fine as the part's curves -> real curve
+    return True
+
+
 def _fit_circle_for_facets(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -470,6 +599,17 @@ def _fit_circle_for_facets(
     # still pass an algebraic circle fit but is not a real cylinder.
     coverage = _angular_coverage(fcent, axis, axis_point)
     if coverage < config.min_cylinder_coverage:
+        return None
+
+    # Designed-polygon guard (P0): a hexagonal/pentagonal/... bore fits a circle
+    # perfectly (vertices on the circumscribed circle, RMS ~ 0) and passes the
+    # resolution-scaled centroid guard, but it is already ideal as N flat planes
+    # and must stay planar — never become an analytic cylinder (a shape-changing
+    # correctness bug: a hex hole shipped as a round hole). Reject it here.
+    curve_step_deg = resolution.median_dihedral_deg if resolution is not None else 0.0
+    if _looks_like_designed_polygon(
+        float(radial_dist.mean()), radius, normals[facet_ids], axis, curve_step_deg, config
+    ):
         return None
 
     # Boss vs hole: do the mesh's outward normals point away from the axis

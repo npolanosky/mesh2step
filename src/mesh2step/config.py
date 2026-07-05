@@ -264,6 +264,49 @@ class ConversionConfig:
     # size (radius = size/2), while rejecting shallow-arc mega-circles.
     max_cylinder_radius: float | None = None
 
+    # Designed-polygon guard (P0: hexagonal bores must NOT become circular holes).
+    # A regular polygon bore (hex/pentagon/octagon...) is a handful of FLAT facet
+    # panels meeting at exact, uniform, SHARP dihedral steps (a hexagon: 6 distinct
+    # normals 60 deg apart), and its vertices lie exactly on the circumscribed
+    # circle (RMS ~ 0) — so the algebraic circle fit is *perfect* and the
+    # resolution-scaled centroid guard (sized for a coarse CURVED surface's chord
+    # error) admits it. But it is a designed feature that is ALREADY ideal (N flat
+    # planes); it must stay as planar faces, never be replaced by an analytic
+    # cylinder. This guard discriminates a designed polygon from a genuine coarse
+    # circle by two resolution-INDEPENDENT signals (a polygon's are fixed by its
+    # side count, a circle's shrink with mesh density):
+    #   (a) the median angular step between consecutive DISTINCT wall-facet normals
+    #       about the axis. A regular N-gon steps 360/N (hex = 60 deg) — far above
+    #       the smooth-curvature ceiling; a tessellated circle steps a few degrees.
+    #   (b) the facet-centroid-radius deficit: an N-gon's centroids sit at the
+    #       apothem = circumradius * cos(180/N) (hex = 0.866 r, a fixed ~13.4%
+    #       deficit); a circle's centroids sit at ~r * (1 - edge^2/8r^2), a small
+    #       deficit that tracks the sagitta. A large deficit that MATCHES a
+    #       low-N-gon apothem AND exceeds the plausible chord sagitta is a polygon.
+    # Detect polygons up to this many sides; above it a coarse regular polygon is
+    # indistinguishable from a circle and legitimately rounds (design intent).
+    detect_polygons: bool = True
+    polygon_max_sides: int = 12
+    # A wall-facet-normal step above this (deg) is a designed sharp edge, not a
+    # curvature step. Mirrors curve_max_deg; kept separate so the polygon guard can
+    # be tuned without moving the curvature band.
+    polygon_min_facet_step_deg: float = 24.0
+    # Distinct normals are merged when within this angle (deg): triangulation of a
+    # single flat panel yields ~coplanar normals that must collapse to one side.
+    polygon_normal_merge_deg: float = 8.0
+    # Accept the apothem-deficit corroboration when the measured centroid deficit
+    # is within this fraction of the ideal cos(180/N) for the detected side count.
+    polygon_apothem_tol: float = 0.25
+    # Decisive discriminator (c): a designed polygon's facets are far coarser than
+    # the local mesh would tessellate a real curve into. Treat the band as a real
+    # tessellated circle (keep the analytic fit) when the measured per-facet
+    # angular step is LESS than this factor times the circle-at-this-resolution
+    # step (degrees(local_edge / radius)). A designed hexagon steps 60 deg while a
+    # circle at the same mesh steps a few degrees, so this cleanly separates them;
+    # the factor leaves margin so a genuinely coarse circle is never called a
+    # polygon.
+    polygon_coarseness_factor: float = 2.5
+
     # Mesh preparation. Repair (FreeCAD mesh kernel) fixes duplicate
     # points/facets, degenerate facets, normals and non-manifold edges.
     repair_mesh: bool = False
